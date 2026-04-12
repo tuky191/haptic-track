@@ -21,7 +21,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     val cameraManager = CameraManager(application)
     private val recordingManager = RecordingManager(application)
-    private val objectTracker = ObjectTracker()
+    private val objectTracker = ObjectTracker(application)
     private val hapticManager = HapticFeedbackManager(application)
     private val zoomController = ZoomController()
 
@@ -34,7 +34,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             objectTracker.analyzer
         )
 
-        objectTracker.onDetectionResult = { allObjects, lockedObject ->
+        objectTracker.onDetectionResult = { allObjects, lockedObject, imgWidth, imgHeight ->
             val previousStatus = _uiState.value.status
 
             val status = when {
@@ -64,6 +64,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     status = status,
                     trackedObject = lockedObject ?: if (status == TrackingStatus.LOST) current.trackedObject else null,
                     detectedObjects = allObjects,
+                    sourceImageWidth = imgWidth,
+                    sourceImageHeight = imgHeight,
                     currentZoomRatio = lockedObject?.let {
                         zoomController.calculateZoom(
                             it.boundingBox,
@@ -82,9 +84,14 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     fun onTapToLock(normalizedX: Float, normalizedY: Float) {
         val objects = _uiState.value.detectedObjects
-        val tapped = objects.find { it.boundingBox.contains(normalizedX, normalizedY) }
 
-        if (tapped != null && tapped.id >= 0) {
+        // When multiple boxes overlap at the tap point, pick the smallest (most specific).
+        // This prevents tapping a cup and accidentally locking onto the table underneath.
+        val tapped = objects
+            .filter { it.id >= 0 && it.boundingBox.contains(normalizedX, normalizedY) }
+            .minByOrNull { it.boundingBox.width() * it.boundingBox.height() }
+
+        if (tapped != null) {
             objectTracker.lockOnObject(tapped.id, tapped.boundingBox, tapped.label)
             _uiState.update { it.copy(status = TrackingStatus.LOCKED, trackedObject = tapped) }
         }

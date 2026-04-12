@@ -1,5 +1,6 @@
 package com.haptictrack.ui
 
+import android.graphics.RectF
 import android.view.MotionEvent
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Canvas
@@ -26,6 +27,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInteropFilter
 import androidx.compose.ui.platform.LocalContext
@@ -44,6 +46,65 @@ import com.haptictrack.tracking.TrackingUiState
 import com.haptictrack.ui.theme.HapticAmber
 import com.haptictrack.ui.theme.HapticGreen
 import com.haptictrack.ui.theme.HapticRed
+
+/**
+ * Computes the FILL_CENTER transform: scale + offset to map normalized image
+ * coordinates (0..1) to screen pixel coordinates.
+ *
+ * FILL_CENTER scales the image so the shorter dimension fills the view,
+ * then crops the longer dimension equally on both sides.
+ */
+private data class FillCenterTransform(
+    val scale: Float,
+    val offsetX: Float,
+    val offsetY: Float,
+    val mappedWidth: Float,
+    val mappedHeight: Float
+)
+
+private fun computeFillCenterTransform(
+    viewWidth: Float,
+    viewHeight: Float,
+    imageWidth: Int,
+    imageHeight: Int
+): FillCenterTransform {
+    if (imageWidth <= 0 || imageHeight <= 0) {
+        return FillCenterTransform(1f, 0f, 0f, viewWidth, viewHeight)
+    }
+
+    val viewAspect = viewWidth / viewHeight
+    val imageAspect = imageWidth.toFloat() / imageHeight.toFloat()
+
+    // FILL_CENTER: scale so the image fully covers the view, then crop
+    val scale = if (imageAspect > viewAspect) {
+        // Image is wider than view → match heights, crop width
+        viewHeight / imageHeight
+    } else {
+        // Image is taller than view → match widths, crop height
+        viewWidth / imageWidth
+    }
+
+    val mappedWidth = imageWidth * scale
+    val mappedHeight = imageHeight * scale
+    val offsetX = (viewWidth - mappedWidth) / 2f
+    val offsetY = (viewHeight - mappedHeight) / 2f
+
+    return FillCenterTransform(scale, offsetX, offsetY, mappedWidth, mappedHeight)
+}
+
+/** Map a normalized image coordinate to screen pixel coordinate. */
+private fun FillCenterTransform.toScreenX(normalizedX: Float): Float =
+    offsetX + normalizedX * mappedWidth
+
+private fun FillCenterTransform.toScreenY(normalizedY: Float): Float =
+    offsetY + normalizedY * mappedHeight
+
+/** Map a screen pixel coordinate back to normalized image coordinate. */
+private fun FillCenterTransform.toNormalizedX(screenX: Float): Float =
+    (screenX - offsetX) / mappedWidth
+
+private fun FillCenterTransform.toNormalizedY(screenY: Float): Float =
+    (screenY - offsetY) / mappedHeight
 
 @OptIn(ExperimentalPermissionsApi::class, ExperimentalComposeUiApi::class)
 @Composable
@@ -78,8 +139,14 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                     .fillMaxSize()
                     .pointerInteropFilter { event ->
                         if (event.action == MotionEvent.ACTION_DOWN) {
-                            val normalizedX = event.x / previewView.width
-                            val normalizedY = event.y / previewView.height
+                            val transform = computeFillCenterTransform(
+                                previewView.width.toFloat(),
+                                previewView.height.toFloat(),
+                                uiState.sourceImageWidth,
+                                uiState.sourceImageHeight
+                            )
+                            val normalizedX = transform.toNormalizedX(event.x)
+                            val normalizedY = transform.toNormalizedY(event.y)
                             viewModel.onTapToLock(normalizedX, normalizedY)
                             true
                         } else false
@@ -136,50 +203,64 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
 private fun BoundingBoxOverlay(state: TrackingUiState) {
     val lockedId = state.trackedObject?.id
     Canvas(modifier = Modifier.fillMaxSize()) {
-        // Draw all detected objects
+        val transform = computeFillCenterTransform(
+            size.width, size.height,
+            state.sourceImageWidth, state.sourceImageHeight
+        )
+
         state.detectedObjects.forEach { obj ->
             val isLocked = obj.id == lockedId && state.status == TrackingStatus.LOCKED
-            val rect = obj.boundingBox
             val color = if (isLocked) HapticGreen else Color.White.copy(alpha = 0.5f)
             val strokeWidth = if (isLocked) 4f else 2f
 
-            drawRect(
-                color = color,
-                topLeft = Offset(rect.left * size.width, rect.top * size.height),
-                size = Size(rect.width() * size.width, rect.height() * size.height),
-                style = Stroke(width = strokeWidth)
-            )
+            drawMappedRect(obj.boundingBox, transform, color, strokeWidth)
 
-            // Corner accents for locked object
             if (isLocked) {
-                val cornerLen = minOf(rect.width() * size.width, rect.height() * size.height) * 0.2f
-                val left = rect.left * size.width
-                val top = rect.top * size.height
-                val right = rect.right * size.width
-                val bottom = rect.bottom * size.height
-
-                drawLine(HapticGreen, Offset(left, top), Offset(left + cornerLen, top), 6f)
-                drawLine(HapticGreen, Offset(left, top), Offset(left, top + cornerLen), 6f)
-                drawLine(HapticGreen, Offset(right, top), Offset(right - cornerLen, top), 6f)
-                drawLine(HapticGreen, Offset(right, top), Offset(right, top + cornerLen), 6f)
-                drawLine(HapticGreen, Offset(left, bottom), Offset(left + cornerLen, bottom), 6f)
-                drawLine(HapticGreen, Offset(left, bottom), Offset(left, bottom - cornerLen), 6f)
-                drawLine(HapticGreen, Offset(right, bottom), Offset(right - cornerLen, bottom), 6f)
-                drawLine(HapticGreen, Offset(right, bottom), Offset(right, bottom - cornerLen), 6f)
+                drawCornerAccents(obj.boundingBox, transform)
             }
         }
 
         // Draw last-known box for lost object
         if (state.status == TrackingStatus.LOST && state.trackedObject != null) {
-            val rect = state.trackedObject.boundingBox
-            drawRect(
-                color = HapticRed.copy(alpha = 0.5f),
-                topLeft = Offset(rect.left * size.width, rect.top * size.height),
-                size = Size(rect.width() * size.width, rect.height() * size.height),
-                style = Stroke(width = 3f)
-            )
+            drawMappedRect(state.trackedObject.boundingBox, transform, HapticRed.copy(alpha = 0.5f), 3f)
         }
     }
+}
+
+private fun DrawScope.drawMappedRect(
+    box: RectF,
+    transform: FillCenterTransform,
+    color: Color,
+    strokeWidth: Float
+) {
+    val left = transform.toScreenX(box.left)
+    val top = transform.toScreenY(box.top)
+    val right = transform.toScreenX(box.right)
+    val bottom = transform.toScreenY(box.bottom)
+
+    drawRect(
+        color = color,
+        topLeft = Offset(left, top),
+        size = Size(right - left, bottom - top),
+        style = Stroke(width = strokeWidth)
+    )
+}
+
+private fun DrawScope.drawCornerAccents(box: RectF, transform: FillCenterTransform) {
+    val left = transform.toScreenX(box.left)
+    val top = transform.toScreenY(box.top)
+    val right = transform.toScreenX(box.right)
+    val bottom = transform.toScreenY(box.bottom)
+    val cornerLen = minOf(right - left, bottom - top) * 0.2f
+
+    drawLine(HapticGreen, Offset(left, top), Offset(left + cornerLen, top), 6f)
+    drawLine(HapticGreen, Offset(left, top), Offset(left, top + cornerLen), 6f)
+    drawLine(HapticGreen, Offset(right, top), Offset(right - cornerLen, top), 6f)
+    drawLine(HapticGreen, Offset(right, top), Offset(right, top + cornerLen), 6f)
+    drawLine(HapticGreen, Offset(left, bottom), Offset(left + cornerLen, bottom), 6f)
+    drawLine(HapticGreen, Offset(left, bottom), Offset(left, bottom - cornerLen), 6f)
+    drawLine(HapticGreen, Offset(right, bottom), Offset(right - cornerLen, bottom), 6f)
+    drawLine(HapticGreen, Offset(right, bottom), Offset(right, bottom - cornerLen), 6f)
 }
 
 @Composable
@@ -190,19 +271,22 @@ private fun ObjectLabelOverlay(state: TrackingUiState) {
         val parentWidth = constraints.maxWidth.toFloat()
         val parentHeight = constraints.maxHeight.toFloat()
         val density = LocalDensity.current
+        val transform = computeFillCenterTransform(
+            parentWidth, parentHeight,
+            state.sourceImageWidth, state.sourceImageHeight
+        )
 
         state.detectedObjects.forEach { obj ->
             val labelText = formatObjectLabel(obj)
             val isLocked = obj.id == lockedId && state.status == TrackingStatus.LOCKED
             val bgColor = if (isLocked) HapticGreen else Color.Black.copy(alpha = 0.6f)
-            val textColor = Color.White
 
-            val xPx = obj.boundingBox.left * parentWidth
-            val yPx = (obj.boundingBox.top * parentHeight) - with(density) { 20.dp.toPx() }
+            val xPx = transform.toScreenX(obj.boundingBox.left)
+            val yPx = transform.toScreenY(obj.boundingBox.top) - with(density) { 20.dp.toPx() }
 
             Text(
                 text = labelText,
-                color = textColor,
+                color = Color.White,
                 fontSize = 11.sp,
                 modifier = Modifier
                     .offset(
@@ -217,8 +301,8 @@ private fun ObjectLabelOverlay(state: TrackingUiState) {
         // Label for lost object
         if (state.status == TrackingStatus.LOST && state.trackedObject != null) {
             val obj = state.trackedObject
-            val xPx = obj.boundingBox.left * parentWidth
-            val yPx = (obj.boundingBox.top * parentHeight) - with(density) { 20.dp.toPx() }
+            val xPx = transform.toScreenX(obj.boundingBox.left)
+            val yPx = transform.toScreenY(obj.boundingBox.top) - with(density) { 20.dp.toPx() }
 
             Text(
                 text = "Lost: ${obj.label ?: "Object"}",
@@ -237,8 +321,7 @@ private fun ObjectLabelOverlay(state: TrackingUiState) {
 }
 
 private fun formatObjectLabel(obj: TrackedObject): String {
-    val label = obj.label
-    if (label == null) return "Object #${obj.id}"
+    val label = obj.label ?: return "Object #${obj.id}"
     val pct = (obj.confidence * 100).toInt()
     return if (pct > 0) "$label $pct%" else label
 }

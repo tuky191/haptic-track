@@ -1,25 +1,36 @@
 package com.haptictrack.tracking
 
 import android.graphics.RectF
+import android.util.Log
 
 /**
  * Pure logic for re-acquiring a lost tracking target.
- * No ML Kit or Android dependencies — fully unit-testable.
  *
- * When the locked object's tracking ID disappears (object left frame or ML Kit
- * reassigned IDs), this engine scores visible candidates against the last-known
- * appearance to find the most likely match.
+ * When the locked object's tracking ID disappears, this engine scores visible
+ * candidates against the last-known appearance to find the most likely match.
+ *
+ * Key design: position weight decays over time because a handheld camera moves.
+ * After many lost frames, label + size dominate the score since the object will
+ * reappear at a completely different screen position.
+ *
+ * All decisions are logged to Android logcat under tag "Reacq" for debugging.
  */
 class ReacquisitionEngine(
-    val maxFramesLost: Int = 60,
-    val positionThreshold: Float = 0.25f,
-    val sizeRatioThreshold: Float = 1.8f,
-    val labelWeight: Float = 0.3f,
-    val sizeWeight: Float = 0.25f,
-    val minScoreThreshold: Float = 0.7f
+    val maxFramesLost: Int = 90,
+    val initialPositionThreshold: Float = 0.25f,
+    val maxPositionThreshold: Float = 1.5f,
+    val sizeRatioThreshold: Float = 2.0f,
+    val minScoreThreshold: Float = 0.35f,
+    val positionDecayFrames: Int = 30
 ) {
 
+    companion object {
+        private const val TAG = "Reacq"
+    }
+
     var lockedId: Int? = null
+        private set
+    var lockedLabel: String? = null
         private set
     var lastKnownBox: RectF? = null
         private set
@@ -36,42 +47,60 @@ class ReacquisitionEngine(
 
     fun lock(trackingId: Int, boundingBox: RectF, label: String?) {
         lockedId = trackingId
+        lockedLabel = label
         lastKnownBox = RectF(boundingBox)
         lastKnownLabel = label
         lastKnownSize = boundingBox.width() * boundingBox.height()
         framesLost = 0
+        Log.i(TAG, "LOCK id=$trackingId label=\"$label\" box=${fmtBox(boundingBox)} size=${fmtF(lastKnownSize)}")
     }
 
     fun clear() {
+        Log.i(TAG, "CLEAR (was id=$lockedId label=\"$lockedLabel\")")
         lockedId = null
+        lockedLabel = null
         lastKnownBox = null
         lastKnownLabel = null
         lastKnownSize = 0f
         framesLost = 0
     }
 
-    /**
-     * Process a new frame of detections. Returns the matched locked object, or null.
-     *
-     * If the original tracking ID is still present, returns it directly.
-     * If not, attempts re-acquisition from candidates.
-     */
     fun processFrame(detections: List<TrackedObject>): TrackedObject? {
         val lockId = lockedId ?: return null
 
         // Direct match by tracking ID
         val directMatch = detections.find { it.id == lockId }
         if (directMatch != null) {
+            if (framesLost > 0) {
+                Log.d(TAG, "DIRECT_MATCH id=$lockId recovered after $framesLost lost frames, label=\"${directMatch.label}\"")
+            }
             updateFromMatch(directMatch)
             return directMatch
         }
 
-        // Object lost — attempt re-acquisition
+        // Object lost
         framesLost++
-        if (framesLost > maxFramesLost) return null
+        if (framesLost == 1) {
+            Log.w(TAG, "LOST id=$lockId (lockedLabel=\"$lockedLabel\") — starting search. ${detections.size} candidates in frame")
+        }
+        if (framesLost > maxFramesLost) {
+            if (framesLost == maxFramesLost + 1) {
+                Log.w(TAG, "TIMEOUT after $maxFramesLost frames. Giving up on lockedLabel=\"$lockedLabel\"")
+            }
+            return null
+        }
+
+        // Log candidates periodically (every 10 frames to avoid spam)
+        if (framesLost % 10 == 1) {
+            Log.d(TAG, "SEARCH frame=$framesLost posConf=${fmtF(positionConfidence())} posThresh=${fmtF(effectivePositionThreshold())} candidates=${detections.size}")
+            detections.forEach { d ->
+                Log.d(TAG, "  candidate id=${d.id} label=\"${d.label}\" conf=${fmtF(d.confidence)} box=${fmtBox(d.boundingBox)}")
+            }
+        }
 
         val reacquired = findBestCandidate(detections)
         if (reacquired != null) {
+            Log.i(TAG, "REACQUIRE id=${reacquired.id} label=\"${reacquired.label}\" after $framesLost frames (lockedLabel=\"$lockedLabel\") box=${fmtBox(reacquired.boundingBox)}")
             lockedId = reacquired.id
             updateFromMatch(reacquired)
             return reacquired
@@ -87,55 +116,104 @@ class ReacquisitionEngine(
         framesLost = 0
     }
 
-    /**
-     * Find the best re-acquisition candidate. Returns null if no candidate is good enough.
-     */
+    internal fun positionConfidence(): Float {
+        if (framesLost <= 0) return 1f
+        return (1f - framesLost.toFloat() / positionDecayFrames).coerceIn(0f, 1f)
+    }
+
+    internal fun effectivePositionThreshold(): Float {
+        val t = (framesLost.toFloat() / positionDecayFrames).coerceIn(0f, 1f)
+        return initialPositionThreshold + t * (maxPositionThreshold - initialPositionThreshold)
+    }
+
     internal fun findBestCandidate(candidates: List<TrackedObject>): TrackedObject? {
         val refBox = lastKnownBox ?: return null
         if (candidates.isEmpty()) return null
 
-        return candidates
+        val posConf = positionConfidence()
+        val posThreshold = effectivePositionThreshold()
+
+        val labelFiltered = candidates
             .filter { it.id >= 0 }
-            .mapNotNull { candidate ->
-                val score = scoreCandidate(candidate, refBox)
-                if (score != null) Pair(candidate, score) else null
+            .filter { candidate ->
+                if (lockedLabel != null && candidate.label != null) {
+                    candidate.label == lockedLabel
+                } else true
             }
-            .maxByOrNull { it.second } // Higher score = better match
+
+        val rejected = candidates.size - labelFiltered.size
+        if (rejected > 0 && framesLost % 10 == 1) {
+            Log.d(TAG, "  label filter: $rejected/${candidates.size} rejected (require \"$lockedLabel\")")
+        }
+
+        val scored = labelFiltered.mapNotNull { candidate ->
+            val score = scoreCandidate(candidate, refBox, posConf, posThreshold)
+            if (score != null) {
+                if (framesLost % 10 == 1) {
+                    Log.d(TAG, "  scored id=${candidate.id} label=\"${candidate.label}\" score=${fmtF(score)} (min=${fmtF(minScoreThreshold)})")
+                }
+                Pair(candidate, score)
+            } else {
+                if (framesLost % 10 == 1) {
+                    Log.d(TAG, "  rejected id=${candidate.id} label=\"${candidate.label}\" (hard threshold)")
+                }
+                null
+            }
+        }
+
+        return scored
+            .maxByOrNull { it.second }
             ?.takeIf { it.second >= minScoreThreshold }
             ?.first
     }
 
     /**
-     * Score a candidate for re-acquisition. Higher is better. Returns null if hard thresholds fail.
-     *
-     * Score components (each 0..1, weighted):
-     * - Position similarity: inverse of distance between centers
-     * - Size similarity: inverse of size ratio difference
-     * - Label match: binary bonus
+     * Effective size ratio threshold expands as frames are lost (camera moving closer/farther).
      */
-    internal fun scoreCandidate(candidate: TrackedObject, refBox: RectF): Float? {
+    internal fun effectiveSizeRatioThreshold(): Float {
+        val t = (framesLost.toFloat() / positionDecayFrames).coerceIn(0f, 1f)
+        return sizeRatioThreshold + t * (sizeRatioThreshold * 2f)
+    }
+
+    internal fun scoreCandidate(
+        candidate: TrackedObject,
+        refBox: RectF,
+        positionConfidence: Float = positionConfidence(),
+        posThreshold: Float = effectivePositionThreshold()
+    ): Float? {
         val candBox = candidate.boundingBox
 
-        // Hard threshold: distance between centers
         val dx = candBox.centerX() - refBox.centerX()
         val dy = candBox.centerY() - refBox.centerY()
         val distance = kotlin.math.sqrt(dx * dx + dy * dy)
-        if (distance > positionThreshold) return null
 
-        // Hard threshold: size ratio
+        if (distance > posThreshold) return null
+
         val candSize = candBox.width() * candBox.height()
         val sizeRatio = if (lastKnownSize > 0f && candSize > 0f) {
             if (candSize > lastKnownSize) candSize / lastKnownSize else lastKnownSize / candSize
         } else 1f
-        if (sizeRatio > sizeRatioThreshold) return null
+        val effectiveSizeThreshold = effectiveSizeRatioThreshold()
+        if (sizeRatio > effectiveSizeThreshold) return null
 
-        // Soft scores
-        val positionScore = 1f - (distance / positionThreshold)
-        val sizeScore = 1f - ((sizeRatio - 1f) / (sizeRatioThreshold - 1f))
+        val positionScore = if (posThreshold > 0f) 1f - (distance / posThreshold) else 1f
+        val sizeScore = 1f - ((sizeRatio - 1f) / (effectiveSizeThreshold - 1f))
         val labelScore = if (lastKnownLabel != null && candidate.label == lastKnownLabel) 1f else 0f
 
-        // Weighted combination — position is king, size and label are supporting
-        val positionWeight = 1f - labelWeight - sizeWeight
-        return (positionScore * positionWeight) + (sizeScore * sizeWeight) + (labelScore * labelWeight)
+        val basePositionWeight = 0.45f
+        val baseSizeWeight = 0.25f
+        val baseLabelWeight = 0.30f
+
+        val effectivePositionWeight = basePositionWeight * positionConfidence
+        val redistributed = basePositionWeight * (1f - positionConfidence)
+        val effectiveSizeWeight = baseSizeWeight + redistributed * 0.4f
+        val effectiveLabelWeight = baseLabelWeight + redistributed * 0.6f
+
+        return (positionScore * effectivePositionWeight) +
+               (sizeScore * effectiveSizeWeight) +
+               (labelScore * effectiveLabelWeight)
     }
+
+    private fun fmtF(f: Float) = "%.3f".format(f)
+    private fun fmtBox(b: RectF) = "[%.2f,%.2f,%.2f,%.2f]".format(b.left, b.top, b.right, b.bottom)
 }

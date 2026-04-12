@@ -21,5 +21,9 @@ data class TrackingUiState(
     val trackedObject: TrackedObject? = null,
     val isRecording: Boolean = false,
     val currentZoomRatio: Float = 1f,
-    val detectedObjects: List<TrackedObject> = emptyList()
+    val detectedObjects: List<TrackedObject> = emptyList(),
+    /** Source image width (post-rotation, i.e. portrait width). */
+    val sourceImageWidth: Int = 0,
+    /** Source image height (post-rotation, i.e. portrait height). */
+    val sourceImageHeight: Int = 0
 )

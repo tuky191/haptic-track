@@ -1,28 +1,40 @@
 package com.haptictrack.tracking
 
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Matrix
 import android.graphics.RectF
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.objects.ObjectDetection
-import com.google.mlkit.vision.objects.ObjectDetector
-import com.google.mlkit.vision.objects.defaults.ObjectDetectorOptions
+import com.google.mediapipe.framework.image.BitmapImageBuilder
+import com.google.mediapipe.tasks.core.BaseOptions
+import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetector
+import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetectorResult
 
 class ObjectTracker(
-    val reacquisition: ReacquisitionEngine = ReacquisitionEngine()
+    context: Context,
+    val reacquisition: ReacquisitionEngine = ReacquisitionEngine(),
+    val filter: DetectionFilter = DetectionFilter(),
+    private val frameTracker: FrameToFrameTracker = FrameToFrameTracker()
 ) {
 
     private val detector: ObjectDetector
 
-    var onDetectionResult: ((List<TrackedObject>, TrackedObject?) -> Unit)? = null
+    /** Callback: (displayObjects, lockedObject, imageWidth, imageHeight) */
+    var onDetectionResult: ((List<TrackedObject>, TrackedObject?, Int, Int) -> Unit)? = null
 
     init {
-        val options = ObjectDetectorOptions.Builder()
-            .setDetectorMode(ObjectDetectorOptions.STREAM_MODE)
-            .enableMultipleObjects()
-            .enableClassification()
+        val baseOptions = BaseOptions.builder()
+            .setModelAssetPath("efficientdet-lite0.tflite")
             .build()
-        detector = ObjectDetection.getClient(options)
+
+        val options = ObjectDetector.ObjectDetectorOptions.builder()
+            .setBaseOptions(baseOptions)
+            .setScoreThreshold(0.5f)
+            .setMaxResults(5)
+            .build()
+
+        detector = ObjectDetector.createFromOptions(context, options)
     }
 
     fun lockOnObject(trackingId: Int, boundingBox: RectF, label: String?) {
@@ -37,39 +49,60 @@ class ObjectTracker(
         processImage(imageProxy)
     }
 
-    @androidx.camera.core.ExperimentalGetImage
     private fun processImage(imageProxy: ImageProxy) {
-        val mediaImage = imageProxy.image ?: run {
+        val bitmap = imageProxyToBitmap(imageProxy)
+        if (bitmap == null) {
             imageProxy.close()
             return
         }
 
-        val inputImage = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
-        val imageWidth = inputImage.width.toFloat()
-        val imageHeight = inputImage.height.toFloat()
+        val frameWidth = bitmap.width
+        val frameHeight = bitmap.height
 
-        detector.process(inputImage)
-            .addOnSuccessListener { detectedObjects ->
-                val tracked = detectedObjects.map { obj ->
-                    TrackedObject(
-                        id = obj.trackingId ?: -1,
-                        boundingBox = RectF(
-                            obj.boundingBox.left / imageWidth,
-                            obj.boundingBox.top / imageHeight,
-                            obj.boundingBox.right / imageWidth,
-                            obj.boundingBox.bottom / imageHeight
-                        ),
-                        label = obj.labels.firstOrNull()?.text,
-                        confidence = obj.labels.firstOrNull()?.confidence ?: 0f
-                    )
-                }
+        try {
+            val mpImage = BitmapImageBuilder(bitmap).build()
+            val result: ObjectDetectorResult = detector.detect(mpImage)
 
-                val lockedObject = reacquisition.processFrame(tracked)
-                onDetectionResult?.invoke(tracked, lockedObject)
+            val rawDetections = result.detections().map { detection ->
+                val box = detection.boundingBox()
+                TrackedObject(
+                    id = -1, // MediaPipe doesn't provide tracking IDs
+                    boundingBox = RectF(
+                        box.left / frameWidth.toFloat(),
+                        box.top / frameHeight.toFloat(),
+                        box.right / frameWidth.toFloat(),
+                        box.bottom / frameHeight.toFloat()
+                    ),
+                    label = detection.categories().firstOrNull()?.categoryName(),
+                    confidence = detection.categories().firstOrNull()?.score() ?: 0f
+                )
             }
-            .addOnCompleteListener {
-                imageProxy.close()
-            }
+
+            // Assign stable tracking IDs via frame-to-frame IoU matching
+            val tracked = frameTracker.assignIds(rawDetections)
+
+            // Re-acquisition
+            val lockedObject = reacquisition.processFrame(tracked)
+
+            // Filter for display
+            val displayObjects = filter.filter(tracked)
+
+            onDetectionResult?.invoke(displayObjects, lockedObject, frameWidth, frameHeight)
+        } finally {
+            imageProxy.close()
+            bitmap.recycle()
+        }
+    }
+
+    private fun imageProxyToBitmap(imageProxy: ImageProxy): Bitmap? {
+        val bitmap = imageProxy.toBitmap()
+        val rotation = imageProxy.imageInfo.rotationDegrees
+        if (rotation == 0) return bitmap
+
+        val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
+        val rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+        if (rotated !== bitmap) bitmap.recycle()
+        return rotated
     }
 
     fun shutdown() {

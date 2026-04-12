@@ -6,7 +6,7 @@ lifecycleRuntime = "2.8.7"
 activityCompose = "1.9.3"
 composeBom = "2024.12.01"
 camerax = "1.4.1"
-mlkitObjectDetection = "17.0.2"
+mediapipeVision = "0.10.21"
 accompanistPermissions = "0.36.0"
 junit = "4.13.2"
 robolectric = "4.14.1"
@@ -33,8 +33,8 @@ camerax-lifecycle = { group = "androidx.camera", name = "camera-lifecycle", vers
 camerax-video = { group = "androidx.camera", name = "camera-video", version.ref = "camerax" }
 camerax-view = { group = "androidx.camera", name = "camera-view", version.ref = "camerax" }
 
-# ML Kit
-mlkit-objectdetection = { group = "com.google.mlkit", name = "object-detection", version.ref = "mlkitObjectDetection" }
+# MediaPipe
+mediapipe-tasksvision = { group = "com.google.mediapipe", name = "tasks-vision", version.ref = "mediapipeVision" }
 
 # Testing
 junit = { group = "junit", name = "junit", version.ref = "junit" }

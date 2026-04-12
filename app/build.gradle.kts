@@ -69,7 +69,7 @@ dependencies {
     implementation(libs.camerax.view)
 
     // ML Kit Object Detection
-    implementation(libs.mlkit.objectdetection)
+    implementation(libs.mediapipe.tasksvision)
 
     // Permissions
     implementation(libs.accompanist.permissions)
