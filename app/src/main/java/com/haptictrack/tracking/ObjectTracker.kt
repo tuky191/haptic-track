@@ -15,10 +15,15 @@ class ObjectTracker(
     context: Context,
     val reacquisition: ReacquisitionEngine = ReacquisitionEngine(),
     val filter: DetectionFilter = DetectionFilter(),
-    private val frameTracker: FrameToFrameTracker = FrameToFrameTracker()
+    private val frameTracker: FrameToFrameTracker = FrameToFrameTracker(),
+    private val appearanceEmbedder: AppearanceEmbedder = AppearanceEmbedder(context)
 ) {
 
     private val detector: ObjectDetector
+
+    // Keep last frame for computing embedding when user taps to lock
+    private val lastFrameLock = Any()
+    private var lastFrameBitmap: Bitmap? = null
 
     /** Callback: (displayObjects, lockedObject, imageWidth, imageHeight) */
     var onDetectionResult: ((List<TrackedObject>, TrackedObject?, Int, Int) -> Unit)? = null
@@ -37,8 +42,17 @@ class ObjectTracker(
         detector = ObjectDetector.createFromOptions(context, options)
     }
 
+    /**
+     * Lock onto an object. If a frame bitmap is available, computes and stores
+     * the visual embedding for identity-aware re-acquisition.
+     */
     fun lockOnObject(trackingId: Int, boundingBox: RectF, label: String?) {
-        reacquisition.lock(trackingId, boundingBox, label)
+        val embedding = synchronized(lastFrameLock) {
+            lastFrameBitmap?.let { bmp ->
+                appearanceEmbedder.embed(bmp, boundingBox)
+            }
+        }
+        reacquisition.lock(trackingId, boundingBox, label, embedding)
     }
 
     fun clearLock() {
@@ -81,13 +95,27 @@ class ObjectTracker(
             // Assign stable tracking IDs via frame-to-frame IoU matching
             val tracked = frameTracker.assignIds(rawDetections)
 
+            // Compute embeddings when re-acquiring (not every frame — only when searching)
+            val withEmbeddings = if (reacquisition.isSearching && reacquisition.lockedEmbedding != null) {
+                tracked.map { obj ->
+                    val emb = appearanceEmbedder.embed(bitmap, obj.boundingBox)
+                    if (emb != null) obj.copy(embedding = emb) else obj
+                }
+            } else tracked
+
             // Re-acquisition
-            val lockedObject = reacquisition.processFrame(tracked)
+            val lockedObject = reacquisition.processFrame(withEmbeddings)
 
             // Filter for display
-            val displayObjects = filter.filter(tracked)
+            val displayObjects = filter.filter(withEmbeddings)
 
             onDetectionResult?.invoke(displayObjects, lockedObject, frameWidth, frameHeight)
+
+            // Keep a copy of the frame for embedding on tap-to-lock
+            synchronized(lastFrameLock) {
+                lastFrameBitmap?.recycle()
+                lastFrameBitmap = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
+            }
         } finally {
             imageProxy.close()
             bitmap.recycle()
@@ -107,5 +135,10 @@ class ObjectTracker(
 
     fun shutdown() {
         detector.close()
+        appearanceEmbedder.shutdown()
+        synchronized(lastFrameLock) {
+            lastFrameBitmap?.recycle()
+            lastFrameBitmap = null
+        }
     }
 }

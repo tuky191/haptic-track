@@ -32,6 +32,8 @@ class ReacquisitionEngine(
         private set
     var lockedLabel: String? = null
         private set
+    var lockedEmbedding: FloatArray? = null
+        private set
     var lastKnownBox: RectF? = null
         private set
     var lastKnownLabel: String? = null
@@ -45,20 +47,22 @@ class ReacquisitionEngine(
     val isSearching: Boolean get() = lockedId != null && framesLost > 0 && framesLost <= maxFramesLost
     val hasTimedOut: Boolean get() = framesLost > maxFramesLost
 
-    fun lock(trackingId: Int, boundingBox: RectF, label: String?) {
+    fun lock(trackingId: Int, boundingBox: RectF, label: String?, embedding: FloatArray? = null) {
         lockedId = trackingId
         lockedLabel = label
+        lockedEmbedding = embedding?.copyOf()
         lastKnownBox = RectF(boundingBox)
         lastKnownLabel = label
         lastKnownSize = boundingBox.width() * boundingBox.height()
         framesLost = 0
-        Log.i(TAG, "LOCK id=$trackingId label=\"$label\" box=${fmtBox(boundingBox)} size=${fmtF(lastKnownSize)}")
+        Log.i(TAG, "LOCK id=$trackingId label=\"$label\" box=${fmtBox(boundingBox)} size=${fmtF(lastKnownSize)} hasEmbedding=${embedding != null}")
     }
 
     fun clear() {
         Log.i(TAG, "CLEAR (was id=$lockedId label=\"$lockedLabel\")")
         lockedId = null
         lockedLabel = null
+        lockedEmbedding = null
         lastKnownBox = null
         lastKnownLabel = null
         lastKnownSize = 0f
@@ -92,9 +96,12 @@ class ReacquisitionEngine(
 
         // Log candidates periodically (every 10 frames to avoid spam)
         if (framesLost % 10 == 1) {
-            Log.d(TAG, "SEARCH frame=$framesLost posConf=${fmtF(positionConfidence())} posThresh=${fmtF(effectivePositionThreshold())} candidates=${detections.size}")
+            Log.d(TAG, "SEARCH frame=$framesLost posConf=${fmtF(positionConfidence())} posThresh=${fmtF(effectivePositionThreshold())} hasEmbed=${lockedEmbedding != null} candidates=${detections.size}")
             detections.forEach { d ->
-                Log.d(TAG, "  candidate id=${d.id} label=\"${d.label}\" conf=${fmtF(d.confidence)} box=${fmtBox(d.boundingBox)}")
+                val simStr = if (lockedEmbedding != null && d.embedding != null) {
+                    " sim=${fmtF(cosineSimilarity(lockedEmbedding!!, d.embedding!!))}"
+                } else ""
+                Log.d(TAG, "  candidate id=${d.id} label=\"${d.label}\" conf=${fmtF(d.confidence)}$simStr box=${fmtBox(d.boundingBox)}")
             }
         }
 
@@ -200,18 +207,54 @@ class ReacquisitionEngine(
         val sizeScore = 1f - ((sizeRatio - 1f) / (effectiveSizeThreshold - 1f))
         val labelScore = if (lastKnownLabel != null && candidate.label == lastKnownLabel) 1f else 0f
 
-        val basePositionWeight = 0.45f
-        val baseSizeWeight = 0.25f
-        val baseLabelWeight = 0.30f
+        // Appearance score: cosine similarity between locked and candidate embeddings
+        val hasAppearance = lockedEmbedding != null && candidate.embedding != null
+        val appearanceScore = if (hasAppearance) {
+            cosineSimilarity(lockedEmbedding!!, candidate.embedding!!)
+                .coerceIn(0f, 1f)  // clamp negatives to 0
+        } else 0f
 
-        val effectivePositionWeight = basePositionWeight * positionConfidence
-        val redistributed = basePositionWeight * (1f - positionConfidence)
-        val effectiveSizeWeight = baseSizeWeight + redistributed * 0.4f
-        val effectiveLabelWeight = baseLabelWeight + redistributed * 0.6f
+        // Weight distribution depends on whether we have appearance data.
+        // With appearance: it gets the dominant share (replaces most of label weight
+        // since visual identity is strictly more informative than category label).
+        if (hasAppearance) {
+            val basePositionWeight = 0.30f
+            val baseSizeWeight = 0.15f
+            val baseLabelWeight = 0.10f
+            val baseAppearanceWeight = 0.45f
 
-        return (positionScore * effectivePositionWeight) +
-               (sizeScore * effectiveSizeWeight) +
-               (labelScore * effectiveLabelWeight)
+            val effectivePositionWeight = basePositionWeight * positionConfidence
+            val redistributed = basePositionWeight * (1f - positionConfidence)
+            val effectiveSizeWeight = baseSizeWeight + redistributed * 0.2f
+            val effectiveLabelWeight = baseLabelWeight + redistributed * 0.1f
+            val effectiveAppearanceWeight = baseAppearanceWeight + redistributed * 0.7f
+
+            return (positionScore * effectivePositionWeight) +
+                   (sizeScore * effectiveSizeWeight) +
+                   (labelScore * effectiveLabelWeight) +
+                   (appearanceScore * effectiveAppearanceWeight)
+        } else {
+            // Fallback: no embedding available, use original weights
+            val basePositionWeight = 0.45f
+            val baseSizeWeight = 0.25f
+            val baseLabelWeight = 0.30f
+
+            val effectivePositionWeight = basePositionWeight * positionConfidence
+            val redistributed = basePositionWeight * (1f - positionConfidence)
+            val effectiveSizeWeight = baseSizeWeight + redistributed * 0.4f
+            val effectiveLabelWeight = baseLabelWeight + redistributed * 0.6f
+
+            return (positionScore * effectivePositionWeight) +
+                   (sizeScore * effectiveSizeWeight) +
+                   (labelScore * effectiveLabelWeight)
+        }
+    }
+
+    private fun cosineSimilarity(a: FloatArray, b: FloatArray): Float {
+        if (a.size != b.size) return 0f
+        var dot = 0f
+        for (i in a.indices) dot += a[i] * b[i]
+        return dot
     }
 
     private fun fmtF(f: Float) = "%.3f".format(f)

@@ -377,6 +377,96 @@ class ReacquisitionEngineTest {
             lateGap > earlyGap)
     }
 
+    // --- Appearance embedding scoring ---
+
+    @Test
+    fun `lock stores embedding`() {
+        val embedding = floatArrayOf(0.1f, 0.2f, 0.3f)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", embedding)
+        assertNotNull(engine.lockedEmbedding)
+        assertArrayEquals(embedding, engine.lockedEmbedding!!, 0.001f)
+    }
+
+    @Test
+    fun `clear removes embedding`() {
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", floatArrayOf(0.1f, 0.2f))
+        engine.clear()
+        assertNull(engine.lockedEmbedding)
+    }
+
+    @Test
+    fun `appearance score boosts visually similar candidate`() {
+        val lockedEmb = floatArrayOf(1f, 0f, 0f)  // unit vector
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", lockedEmb)
+
+        val similar = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "cup")
+            .copy(embedding = floatArrayOf(0.9f, 0.1f, 0f))  // similar direction
+        val different = obj(id = 66, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "cup")
+            .copy(embedding = floatArrayOf(0f, 0f, 1f))  // orthogonal
+
+        val similarScore = engine.scoreCandidate(similar, engine.lastKnownBox!!)!!
+        val differentScore = engine.scoreCandidate(different, engine.lastKnownBox!!)!!
+
+        assertTrue("Visually similar ($similarScore) should score higher than different ($differentScore)",
+            similarScore > differentScore)
+    }
+
+    @Test
+    fun `appearance score distinguishes same-label objects`() {
+        // THE core scenario: two cups, only one looks like the locked one
+        val lockedEmb = floatArrayOf(0.7f, 0.7f, 0f)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", lockedEmb)
+
+        // Lose the object
+        engine.processFrame(emptyList())
+
+        val rightCup = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "cup")
+            .copy(embedding = floatArrayOf(0.6f, 0.8f, 0f))  // similar visual
+        val wrongCup = obj(id = 66, left = 0.38f, top = 0.38f, right = 0.58f, bottom = 0.58f, label = "cup")
+            .copy(embedding = floatArrayOf(0f, 0.1f, 0.9f))  // different visual
+
+        val result = engine.processFrame(listOf(wrongCup, rightCup))
+        assertNotNull(result)
+        assertEquals("Should pick visually similar cup", 55, result!!.id)
+    }
+
+    @Test
+    fun `scoring falls back gracefully when no embedding available`() {
+        // Lock without embedding
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup")
+        assertNull(engine.lockedEmbedding)
+
+        // Candidate without embedding — should still score via position/size/label
+        val candidate = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "cup")
+        val score = engine.scoreCandidate(candidate, engine.lastKnownBox!!)
+        assertNotNull("Should still score without embeddings", score)
+        assertTrue(score!! > 0f)
+    }
+
+    @Test
+    fun `appearance weight increases after position decay`() {
+        val lockedEmb = floatArrayOf(1f, 0f, 0f)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", lockedEmb)
+
+        val similar = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "cup")
+            .copy(embedding = floatArrayOf(0.9f, 0.1f, 0f))
+        val different = obj(id = 66, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "cup")
+            .copy(embedding = floatArrayOf(0f, 0f, 1f))
+
+        // Early gap between similar vs different
+        val earlyGap = engine.scoreCandidate(similar, engine.lastKnownBox!!)!! -
+                       engine.scoreCandidate(different, engine.lastKnownBox!!)!!
+
+        // Decay position
+        repeat(engine.positionDecayFrames) { engine.processFrame(emptyList()) }
+
+        val lateGap = engine.scoreCandidate(similar, engine.lastKnownBox!!)!! -
+                      engine.scoreCandidate(different, engine.lastKnownBox!!)!!
+
+        assertTrue("Appearance should matter more after position decay: early=$earlyGap, late=$lateGap",
+            lateGap > earlyGap)
+    }
+
     // --- Edge cases ---
 
     @Test

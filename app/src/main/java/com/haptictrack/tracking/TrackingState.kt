@@ -13,8 +13,25 @@ data class TrackedObject(
     val id: Int,
     val boundingBox: RectF,
     val label: String? = null,
-    val confidence: Float = 0f
-)
+    val confidence: Float = 0f,
+    val embedding: FloatArray? = null
+) {
+    // equals/hashCode excluding embedding (large array) for performance
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is TrackedObject) return false
+        return id == other.id && boundingBox == other.boundingBox &&
+               label == other.label && confidence == other.confidence
+    }
+
+    override fun hashCode(): Int {
+        var result = id
+        result = 31 * result + boundingBox.hashCode()
+        result = 31 * result + (label?.hashCode() ?: 0)
+        result = 31 * result + confidence.hashCode()
+        return result
+    }
+}
 
 data class TrackingUiState(
     val status: TrackingStatus = TrackingStatus.IDLE,
