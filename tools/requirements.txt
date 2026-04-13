@@ -1,0 +1,7 @@
+numpy
+Pillow
+tflite-runtime
+open-clip-torch
+torch
+torchvision
+pytest
