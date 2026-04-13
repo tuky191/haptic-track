@@ -467,6 +467,54 @@ class ReacquisitionEngineTest {
             lateGap > earlyGap)
     }
 
+    // --- Appearance override of geometric hard filters ---
+
+    @Test
+    fun `strong embedding bypasses size threshold`() {
+        // Lock on small object (e.g. mouse at edge of frame)
+        val lockedEmb = floatArrayOf(0.8f, 0.6f, 0f)
+        engine.lock(42, RectF(0.9f, 0.5f, 1.0f, 0.7f), "mouse", lockedEmb)
+
+        // Lose it, then candidate reappears MUCH larger (phone was flipped)
+        engine.processFrame(emptyList())
+
+        val bigMouse = obj(id = 55, left = 0.1f, top = 0.2f, right = 0.7f, bottom = 0.8f, label = "mouse")
+            .copy(embedding = floatArrayOf(0.7f, 0.7f, 0f))  // similar visual (sim ~0.95)
+
+        val score = engine.scoreCandidate(bigMouse, engine.lastKnownBox!!)
+        assertNotNull("Strong embedding should bypass size hard threshold", score)
+    }
+
+    @Test
+    fun `strong embedding bypasses position threshold`() {
+        val lockedEmb = floatArrayOf(0.8f, 0.6f, 0f)
+        engine.lock(42, RectF(0.9f, 0.9f, 1.0f, 1.0f), "mouse", lockedEmb)
+
+        engine.processFrame(emptyList())
+
+        // Same object appears at opposite corner — way beyond position threshold
+        val farMouse = obj(id = 55, left = 0.0f, top = 0.0f, right = 0.1f, bottom = 0.1f, label = "mouse")
+            .copy(embedding = floatArrayOf(0.7f, 0.7f, 0f))
+
+        val score = engine.scoreCandidate(farMouse, engine.lastKnownBox!!)
+        assertNotNull("Strong embedding should bypass position hard threshold", score)
+    }
+
+    @Test
+    fun `weak embedding does not bypass size threshold`() {
+        val lockedEmb = floatArrayOf(1f, 0f, 0f)
+        engine.lock(42, RectF(0.9f, 0.5f, 1.0f, 0.7f), "mouse", lockedEmb)
+
+        engine.processFrame(emptyList())
+
+        // Much larger, and visually different
+        val wrongObj = obj(id = 55, left = 0.1f, top = 0.2f, right = 0.7f, bottom = 0.8f, label = "mouse")
+            .copy(embedding = floatArrayOf(0f, 0f, 1f))  // orthogonal = sim 0.0
+
+        val score = engine.scoreCandidate(wrongObj, engine.lastKnownBox!!)
+        assertNull("Weak embedding should NOT bypass size hard threshold", score)
+    }
+
     // --- Edge cases ---
 
     @Test

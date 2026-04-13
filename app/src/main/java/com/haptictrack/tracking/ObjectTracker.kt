@@ -16,7 +16,10 @@ class ObjectTracker(
     val reacquisition: ReacquisitionEngine = ReacquisitionEngine(),
     val filter: DetectionFilter = DetectionFilter(),
     private val frameTracker: FrameToFrameTracker = FrameToFrameTracker(),
-    private val appearanceEmbedder: AppearanceEmbedder = AppearanceEmbedder(context)
+    private val appearanceEmbedder: AppearanceEmbedder = AppearanceEmbedder(context),
+    val debugCapture: DebugFrameCapture = DebugFrameCapture(context),
+    /** Provides physical device orientation; set from ViewModel. */
+    var deviceRotationProvider: (() -> Int)? = null
 ) {
 
     private val detector: ObjectDetector
@@ -24,6 +27,10 @@ class ObjectTracker(
     // Keep last frame for computing embedding when user taps to lock
     private val lastFrameLock = Any()
     private var lastFrameBitmap: Bitmap? = null
+
+    // Track previous state to detect transitions
+    private var previouslyLocked: Boolean = false
+    private var previousFramesLost: Int = 0
 
     /** Callback: (displayObjects, lockedObject, imageWidth, imageHeight) */
     var onDetectionResult: ((List<TrackedObject>, TrackedObject?, Int, Int) -> Unit)? = null
@@ -53,6 +60,15 @@ class ObjectTracker(
             }
         }
         reacquisition.lock(trackingId, boundingBox, label, embedding)
+
+        // Capture debug frame on lock
+        synchronized(lastFrameLock) {
+            lastFrameBitmap?.let { bmp ->
+                val locked = TrackedObject(trackingId, boundingBox, label)
+                debugCapture.capture("LOCK", bmp, listOf(locked), lockedObject = locked,
+                    extraInfo = "id=$trackingId label=$label hasEmbed=${embedding != null}")
+            }
+        }
     }
 
     fun clearLock() {
@@ -77,16 +93,23 @@ class ObjectTracker(
             val mpImage = BitmapImageBuilder(bitmap).build()
             val result: ObjectDetectorResult = detector.detect(mpImage)
 
+            val deviceRot = deviceRotationProvider?.invoke() ?: 0
+
             val rawDetections = result.detections().map { detection ->
                 val box = detection.boundingBox()
+                val normLeft = box.left / frameWidth.toFloat()
+                val normTop = box.top / frameHeight.toFloat()
+                val normRight = box.right / frameWidth.toFloat()
+                val normBottom = box.bottom / frameHeight.toFloat()
+
+                // Detection ran on a rotated bitmap. Map coordinates back
+                // to the original screen orientation by applying the inverse
+                // of the device rotation we added.
+                val screenBox = unmapRotation(normLeft, normTop, normRight, normBottom, deviceRot)
+
                 TrackedObject(
-                    id = -1, // MediaPipe doesn't provide tracking IDs
-                    boundingBox = RectF(
-                        box.left / frameWidth.toFloat(),
-                        box.top / frameHeight.toFloat(),
-                        box.right / frameWidth.toFloat(),
-                        box.bottom / frameHeight.toFloat()
-                    ),
+                    id = -1,
+                    boundingBox = screenBox,
                     label = detection.categories().firstOrNull()?.categoryName(),
                     confidence = detection.categories().firstOrNull()?.score() ?: 0f
                 )
@@ -103,8 +126,15 @@ class ObjectTracker(
                 }
             } else tracked
 
+            // Snapshot state before processing
+            val wasSearching = reacquisition.isSearching
+            val prevLost = reacquisition.framesLost
+
             // Re-acquisition
             val lockedObject = reacquisition.processFrame(withEmbeddings)
+
+            // Debug frame capture on tracking events
+            captureDebugFrame(bitmap, withEmbeddings, lockedObject, wasSearching, prevLost)
 
             // Filter for display
             val displayObjects = filter.filter(withEmbeddings)
@@ -124,13 +154,76 @@ class ObjectTracker(
 
     private fun imageProxyToBitmap(imageProxy: ImageProxy): Bitmap? {
         val bitmap = imageProxy.toBitmap()
-        val rotation = imageProxy.imageInfo.rotationDegrees
+
+        // CameraX rotationDegrees assumes the display matches the activity's
+        // declared orientation (portrait). It does NOT account for the user
+        // physically holding the phone in landscape or upside down.
+        // We add the physical device rotation so the image fed to the detector
+        // is always upright relative to the real world.
+        val cameraRotation = imageProxy.imageInfo.rotationDegrees
+        val deviceRot = deviceRotationProvider?.invoke() ?: 0
+        val rotation = (cameraRotation + deviceRot) % 360
+
         if (rotation == 0) return bitmap
 
         val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
         val rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
         if (rotated !== bitmap) bitmap.recycle()
         return rotated
+    }
+
+    private fun captureDebugFrame(
+        bitmap: Bitmap,
+        detections: List<TrackedObject>,
+        lockedObject: TrackedObject?,
+        wasSearching: Boolean,
+        prevFramesLost: Int
+    ) {
+        val nowLost = reacquisition.framesLost
+
+        when {
+            // Just re-acquired
+            wasSearching && lockedObject != null && nowLost == 0 -> {
+                debugCapture.capture(
+                    "REACQUIRE", bitmap, detections,
+                    lockedObject = lockedObject,
+                    extraInfo = "after $prevFramesLost frames, id=${lockedObject.id} label=${lockedObject.label}"
+                )
+            }
+            // Just lost (first frame)
+            nowLost == 1 && prevFramesLost == 0 -> {
+                debugCapture.capture(
+                    "LOST", bitmap, detections,
+                    lastKnownBox = reacquisition.lastKnownBox,
+                    extraInfo = "label=${reacquisition.lockedLabel}"
+                )
+            }
+            // Searching: capture every 10th frame, or whenever a same-label candidate exists
+            // but didn't match — this is the key diagnostic frame
+            wasSearching && lockedObject == null && nowLost > 0 -> {
+                val hasSameLabelCandidate = detections.any { d ->
+                    d.label != null && d.label == reacquisition.lockedLabel
+                }
+                if (hasSameLabelCandidate || nowLost % 10 == 0) {
+                    val candidateInfo = detections
+                        .filter { it.label == reacquisition.lockedLabel }
+                        .joinToString(", ") { "#${it.id} ${it.confidence.times(100).toInt()}%" }
+                    debugCapture.capture(
+                        "SEARCH", bitmap, detections,
+                        lastKnownBox = reacquisition.lastKnownBox,
+                        extraInfo = "frame=$nowLost match=[${candidateInfo.ifEmpty { "none" }}]"
+                    )
+                }
+            }
+            // Timed out
+            nowLost == reacquisition.maxFramesLost + 1 -> {
+                debugCapture.capture(
+                    "TIMEOUT", bitmap, detections,
+                    lastKnownBox = reacquisition.lastKnownBox,
+                    extraInfo = "gave up on ${reacquisition.lockedLabel}"
+                )
+            }
+        }
     }
 
     fun shutdown() {
@@ -140,5 +233,32 @@ class ObjectTracker(
             lastFrameBitmap?.recycle()
             lastFrameBitmap = null
         }
+    }
+}
+
+/**
+ * Reverse-maps normalized bounding box coordinates from the rotated
+ * detection image back to the original screen coordinate space.
+ *
+ * After rotating the bitmap by [deviceRot] degrees for detection,
+ * we apply the inverse rotation to the detected box coordinates.
+ */
+internal fun unmapRotation(
+    left: Float, top: Float, right: Float, bottom: Float, deviceRot: Int
+): RectF {
+    return when (deviceRot) {
+        0 -> RectF(left, top, right, bottom)
+        180 -> RectF(1f - right, 1f - bottom, 1f - left, 1f - top)
+        90 -> {
+            // Detection image was rotated 90° CW extra.
+            // Inverse: rotate 90° CCW → (x,y) → (y, 1-x)
+            RectF(top, 1f - right, bottom, 1f - left)
+        }
+        270 -> {
+            // Detection image was rotated 270° CW (= 90° CCW) extra.
+            // Inverse: rotate 90° CW → (x,y) → (1-y, x)
+            RectF(1f - bottom, left, 1f - top, right)
+        }
+        else -> RectF(left, top, right, bottom)
     }
 }

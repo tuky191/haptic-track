@@ -26,6 +26,8 @@ class ReacquisitionEngine(
 
     companion object {
         private const val TAG = "Reacq"
+        /** Embedding similarity above this bypasses position/size hard filters. */
+        const val APPEARANCE_OVERRIDE_THRESHOLD = 0.4f
     }
 
     var lockedId: Int? = null
@@ -190,29 +192,38 @@ class ReacquisitionEngine(
     ): Float? {
         val candBox = candidate.boundingBox
 
+        // Compute appearance similarity early — a strong visual match can
+        // override geometric hard filters (position, size). This handles
+        // scenarios like phone rotation where the last-known box is meaningless.
+        val hasAppearance = lockedEmbedding != null && candidate.embedding != null
+        val appearanceScore = if (hasAppearance) {
+            cosineSimilarity(lockedEmbedding!!, candidate.embedding!!)
+                .coerceIn(0f, 1f)
+        } else 0f
+        val strongVisualMatch = hasAppearance && appearanceScore > APPEARANCE_OVERRIDE_THRESHOLD
+
         val dx = candBox.centerX() - refBox.centerX()
         val dy = candBox.centerY() - refBox.centerY()
         val distance = kotlin.math.sqrt(dx * dx + dy * dy)
 
-        if (distance > posThreshold) return null
+        if (distance > posThreshold && !strongVisualMatch) return null
+        if (distance > posThreshold && strongVisualMatch) {
+            Log.d(TAG, "  OVERRIDE position: dist=${fmtF(distance)} > thresh=${fmtF(posThreshold)}, but sim=${fmtF(appearanceScore)}")
+        }
 
         val candSize = candBox.width() * candBox.height()
         val sizeRatio = if (lastKnownSize > 0f && candSize > 0f) {
             if (candSize > lastKnownSize) candSize / lastKnownSize else lastKnownSize / candSize
         } else 1f
         val effectiveSizeThreshold = effectiveSizeRatioThreshold()
-        if (sizeRatio > effectiveSizeThreshold) return null
+        if (sizeRatio > effectiveSizeThreshold && !strongVisualMatch) return null
+        if (sizeRatio > effectiveSizeThreshold && strongVisualMatch) {
+            Log.d(TAG, "  OVERRIDE size: ratio=${fmtF(sizeRatio)} > thresh=${fmtF(effectiveSizeThreshold)}, but sim=${fmtF(appearanceScore)}")
+        }
 
-        val positionScore = if (posThreshold > 0f) 1f - (distance / posThreshold) else 1f
-        val sizeScore = 1f - ((sizeRatio - 1f) / (effectiveSizeThreshold - 1f))
+        val positionScore = if (posThreshold > 0f) (1f - (distance / posThreshold)).coerceIn(0f, 1f) else 1f
+        val sizeScore = (1f - ((sizeRatio - 1f) / (effectiveSizeThreshold - 1f).coerceAtLeast(0.01f))).coerceIn(0f, 1f)
         val labelScore = if (lastKnownLabel != null && candidate.label == lastKnownLabel) 1f else 0f
-
-        // Appearance score: cosine similarity between locked and candidate embeddings
-        val hasAppearance = lockedEmbedding != null && candidate.embedding != null
-        val appearanceScore = if (hasAppearance) {
-            cosineSimilarity(lockedEmbedding!!, candidate.embedding!!)
-                .coerceIn(0f, 1f)  // clamp negatives to 0
-        } else 0f
 
         // Weight distribution depends on whether we have appearance data.
         // With appearance: it gets the dominant share (replaces most of label weight

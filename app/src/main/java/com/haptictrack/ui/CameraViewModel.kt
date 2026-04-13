@@ -6,6 +6,7 @@ import androidx.camera.view.PreviewView
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.LifecycleOwner
 import com.haptictrack.camera.CameraManager
+import com.haptictrack.camera.DeviceOrientationListener
 import com.haptictrack.camera.RecordingManager
 import com.haptictrack.haptics.HapticFeedbackManager
 import com.haptictrack.tracking.ObjectTracker
@@ -24,11 +25,15 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private val objectTracker = ObjectTracker(application)
     private val hapticManager = HapticFeedbackManager(application)
     private val zoomController = ZoomController()
+    private val orientationListener = DeviceOrientationListener(application)
 
     private val _uiState = MutableStateFlow(TrackingUiState())
     val uiState: StateFlow<TrackingUiState> = _uiState.asStateFlow()
 
     init {
+        orientationListener.start()
+        objectTracker.deviceRotationProvider = { orientationListener.deviceRotation }
+
         cameraManager.imageAnalysis.setAnalyzer(
             java.util.concurrent.Executors.newSingleThreadExecutor(),
             objectTracker.analyzer
@@ -123,6 +128,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     override fun onCleared() {
         super.onCleared()
+        orientationListener.stop()
         objectTracker.shutdown()
         hapticManager.shutdown()
         cameraManager.shutdown()
