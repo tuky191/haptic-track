@@ -71,6 +71,9 @@ dependencies {
     // ML Kit Object Detection
     implementation(libs.mediapipe.tasksvision)
 
+    // OpenCV (visual tracking)
+    implementation(libs.opencv)
+
     // Permissions
     implementation(libs.accompanist.permissions)
 

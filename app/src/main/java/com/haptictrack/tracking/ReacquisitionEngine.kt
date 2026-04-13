@@ -125,6 +125,13 @@ class ReacquisitionEngine(
         framesLost = 0
     }
 
+    /** Called by VisualTracker to keep last-known box in sync without full processFrame. */
+    fun updateFromVisualTracker(boundingBox: RectF) {
+        lastKnownBox = RectF(boundingBox)
+        lastKnownSize = boundingBox.width() * boundingBox.height()
+        framesLost = 0
+    }
+
     internal fun positionConfidence(): Float {
         if (framesLost <= 0) return 1f
         return (1f - framesLost.toFloat() / positionDecayFrames).coerceIn(0f, 1f)
@@ -155,16 +162,21 @@ class ReacquisitionEngine(
             Log.d(TAG, "  label filter: $rejected/${candidates.size} rejected (require \"$lockedLabel\")")
         }
 
+        val logThis = framesLost % 10 == 1 || labelFiltered.isNotEmpty()
+
         val scored = labelFiltered.mapNotNull { candidate ->
             val score = scoreCandidate(candidate, refBox, posConf, posThreshold)
+            val sim = if (lockedEmbedding != null && candidate.embedding != null) {
+                cosineSimilarity(lockedEmbedding!!, candidate.embedding!!)
+            } else null
             if (score != null) {
-                if (framesLost % 10 == 1) {
-                    Log.d(TAG, "  scored id=${candidate.id} label=\"${candidate.label}\" score=${fmtF(score)} (min=${fmtF(minScoreThreshold)})")
+                if (logThis) {
+                    Log.d(TAG, "  scored id=${candidate.id} label=\"${candidate.label}\" score=${fmtF(score)} sim=${sim?.let { fmtF(it) } ?: "n/a"} (min=${fmtF(minScoreThreshold)})")
                 }
                 Pair(candidate, score)
             } else {
-                if (framesLost % 10 == 1) {
-                    Log.d(TAG, "  rejected id=${candidate.id} label=\"${candidate.label}\" (hard threshold)")
+                if (logThis) {
+                    Log.d(TAG, "  rejected id=${candidate.id} label=\"${candidate.label}\" sim=${sim?.let { fmtF(it) } ?: "n/a"} (hard threshold)")
                 }
                 null
             }
