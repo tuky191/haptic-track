@@ -515,6 +515,89 @@ class ReacquisitionEngineTest {
         assertNull("Weak embedding should NOT bypass size hard threshold", score)
     }
 
+    // --- Two same-label objects: embedding must discriminate ---
+
+    @Test
+    fun `two trucks - embedding picks the correct one`() {
+        // Lock on orange truck
+        val orangeEmb = floatArrayOf(0.9f, 0.3f, 0.1f)
+        engine.lock(42, RectF(0.3f, 0.4f, 0.6f, 0.6f), "truck", orangeEmb)
+
+        // Lose it
+        engine.processFrame(emptyList())
+
+        // Both trucks appear — same label, similar size/position
+        val orangeTruck = obj(id = 55, left = 0.32f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "truck")
+            .copy(embedding = floatArrayOf(0.85f, 0.35f, 0.1f))  // similar to lock
+        val blueTruck = obj(id = 66, left = 0.25f, top = 0.38f, right = 0.55f, bottom = 0.58f, label = "truck")
+            .copy(embedding = floatArrayOf(0.1f, 0.2f, 0.9f))  // different appearance
+
+        val result = engine.processFrame(listOf(blueTruck, orangeTruck))
+        assertNotNull(result)
+        assertEquals("Should pick orange truck", 55, result!!.id)
+    }
+
+    @Test
+    fun `two trucks - blue truck scores lower than orange`() {
+        val orangeEmb = floatArrayOf(0.9f, 0.3f, 0.1f)
+        engine.lock(42, RectF(0.3f, 0.4f, 0.6f, 0.6f), "truck", orangeEmb)
+        engine.processFrame(emptyList())
+
+        val orangeTruck = obj(id = 55, left = 0.32f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "truck")
+            .copy(embedding = floatArrayOf(0.85f, 0.35f, 0.1f))
+        val blueTruck = obj(id = 66, left = 0.32f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "truck")
+            .copy(embedding = floatArrayOf(0.1f, 0.2f, 0.9f))
+
+        val orangeScore = engine.scoreCandidate(orangeTruck, engine.lastKnownBox!!)!!
+        val blueScore = engine.scoreCandidate(blueTruck, engine.lastKnownBox!!)!!
+
+        assertTrue("Orange ($orangeScore) should score higher than blue ($blueScore)",
+            orangeScore > blueScore)
+    }
+
+    // --- Visual tracker handoff: updateFromVisualTracker ---
+
+    @Test
+    fun `updateFromVisualTracker keeps lastKnownBox in sync`() {
+        engine.lock(42, RectF(0.3f, 0.3f, 0.6f, 0.6f), "truck")
+        val newBox = RectF(0.35f, 0.35f, 0.65f, 0.65f)
+
+        engine.updateFromVisualTracker(newBox)
+
+        assertEquals(newBox, engine.lastKnownBox)
+        assertEquals(0, engine.framesLost)
+    }
+
+    @Test
+    fun `updateFromVisualTracker does not change lockedLabel`() {
+        engine.lock(42, RectF(0.3f, 0.3f, 0.6f, 0.6f), "truck")
+        engine.updateFromVisualTracker(RectF(0.5f, 0.5f, 0.8f, 0.8f))
+
+        assertEquals("truck", engine.lockedLabel)
+        assertEquals("truck", engine.lastKnownLabel)
+    }
+
+    @Test
+    fun `drifted lastKnownBox causes re-acquisition to search wrong area`() {
+        // Simulates the bug: visual tracker drifts, updates lastKnownBox
+        // to a wrong position, then re-acquisition can't find the object
+        val orangeEmb = floatArrayOf(0.9f, 0.3f, 0.1f)
+        engine.lock(42, RectF(0.3f, 0.4f, 0.6f, 0.6f), "truck", orangeEmb)
+
+        // Simulate drift: VT moved lastKnownBox to bottom-right
+        engine.updateFromVisualTracker(RectF(0.8f, 0.8f, 0.95f, 0.95f))
+
+        // Object lost, candidate is near ORIGINAL position
+        engine.processFrame(emptyList())
+        val candidate = obj(id = 55, left = 0.32f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "truck")
+            .copy(embedding = floatArrayOf(0.85f, 0.35f, 0.1f))
+
+        // With drifted lastKnownBox, position distance is huge (0.8 vs 0.3)
+        // but strong embedding should override
+        val result = engine.processFrame(listOf(candidate))
+        assertNotNull("Strong embedding should still re-acquire despite drifted lastKnownBox", result)
+    }
+
     // --- Edge cases ---
 
     @Test
