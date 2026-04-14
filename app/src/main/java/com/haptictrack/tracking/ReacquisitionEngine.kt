@@ -27,15 +27,24 @@ class ReacquisitionEngine(
     companion object {
         private const val TAG = "Reacq"
         /** Embedding similarity above this bypasses position/size hard filters. */
-        const val APPEARANCE_OVERRIDE_THRESHOLD = 0.4f
+        const val APPEARANCE_OVERRIDE_THRESHOLD = 0.5f
+        /** Maximum embeddings to keep in gallery. */
+        const val MAX_GALLERY_SIZE = 12
     }
 
     var lockedId: Int? = null
         private set
     var lockedLabel: String? = null
         private set
-    var lockedEmbedding: FloatArray? = null
+    /** Gallery of reference embeddings — augmented at lock time, accumulated during tracking. */
+    var embeddingGallery: MutableList<FloatArray> = mutableListOf()
         private set
+
+    /** Convenience: true if we have any reference embeddings. */
+    val hasEmbeddings: Boolean get() = embeddingGallery.isNotEmpty()
+
+    @Deprecated("Use embeddingGallery", ReplaceWith("embeddingGallery.firstOrNull()"))
+    val lockedEmbedding: FloatArray? get() = embeddingGallery.firstOrNull()
     var lastKnownBox: RectF? = null
         private set
     var lastKnownLabel: String? = null
@@ -50,21 +59,39 @@ class ReacquisitionEngine(
     val hasTimedOut: Boolean get() = framesLost > maxFramesLost
 
     fun lock(trackingId: Int, boundingBox: RectF, label: String?, embedding: FloatArray? = null) {
+        lock(trackingId, boundingBox, label, if (embedding != null) listOf(embedding) else emptyList())
+    }
+
+    fun lock(trackingId: Int, boundingBox: RectF, label: String?, embeddings: List<FloatArray>) {
         lockedId = trackingId
         lockedLabel = label
-        lockedEmbedding = embedding?.copyOf()
+        embeddingGallery = embeddings.map { it.copyOf() }.toMutableList()
         lastKnownBox = RectF(boundingBox)
         lastKnownLabel = label
         lastKnownSize = boundingBox.width() * boundingBox.height()
         framesLost = 0
-        Log.i(TAG, "LOCK id=$trackingId label=\"$label\" box=${fmtBox(boundingBox)} size=${fmtF(lastKnownSize)} hasEmbedding=${embedding != null}")
+        Log.i(TAG, "LOCK id=$trackingId label=\"$label\" box=${fmtBox(boundingBox)} size=${fmtF(lastKnownSize)} gallery=${embeddingGallery.size}")
+    }
+
+    /** Add a new embedding to the gallery (e.g. from a confirmed visual tracker frame). */
+    fun addEmbedding(embedding: FloatArray) {
+        if (embeddingGallery.size >= MAX_GALLERY_SIZE) {
+            // Keep first (lock-time augmented) and remove oldest accumulated
+            val augmentedCount = 5  // original + 3 rotations + 1 flip
+            if (embeddingGallery.size > augmentedCount) {
+                embeddingGallery.removeAt(augmentedCount)
+            } else {
+                embeddingGallery.removeAt(embeddingGallery.size - 1)
+            }
+        }
+        embeddingGallery.add(embedding.copyOf())
     }
 
     fun clear() {
         Log.i(TAG, "CLEAR (was id=$lockedId label=\"$lockedLabel\")")
         lockedId = null
         lockedLabel = null
-        lockedEmbedding = null
+        embeddingGallery.clear()
         lastKnownBox = null
         lastKnownLabel = null
         lastKnownSize = 0f
@@ -98,10 +125,10 @@ class ReacquisitionEngine(
 
         // Log candidates periodically (every 10 frames to avoid spam)
         if (framesLost % 10 == 1) {
-            Log.d(TAG, "SEARCH frame=$framesLost posConf=${fmtF(positionConfidence())} posThresh=${fmtF(effectivePositionThreshold())} hasEmbed=${lockedEmbedding != null} candidates=${detections.size}")
+            Log.d(TAG, "SEARCH frame=$framesLost posConf=${fmtF(positionConfidence())} posThresh=${fmtF(effectivePositionThreshold())} gallery=${embeddingGallery.size} candidates=${detections.size}")
             detections.forEach { d ->
-                val simStr = if (lockedEmbedding != null && d.embedding != null) {
-                    " sim=${fmtF(cosineSimilarity(lockedEmbedding!!, d.embedding!!))}"
+                val simStr = if (hasEmbeddings && d.embedding != null) {
+                    " sim=${fmtF(bestGallerySimilarity(d.embedding!!))}"
                 } else ""
                 Log.d(TAG, "  candidate id=${d.id} label=\"${d.label}\" conf=${fmtF(d.confidence)}$simStr box=${fmtBox(d.boundingBox)}")
             }
@@ -149,25 +176,18 @@ class ReacquisitionEngine(
         val posConf = positionConfidence()
         val posThreshold = effectivePositionThreshold()
 
-        val labelFiltered = candidates
-            .filter { it.id >= 0 }
-            .filter { candidate ->
-                if (lockedLabel != null && candidate.label != null) {
-                    candidate.label == lockedLabel
-                } else true
-            }
+        // No hard label filter — label is a scoring factor, not a gate.
+        // EfficientDet-Lite0 labels flicker (bowl↔potted plant↔toilet) so
+        // blocking by label causes more harm than good. The embedding handles
+        // identity; the label just adds a bonus to the score.
+        val validCandidates = candidates.filter { it.id >= 0 }
 
-        val rejected = candidates.size - labelFiltered.size
-        if (rejected > 0 && framesLost % 10 == 1) {
-            Log.d(TAG, "  label filter: $rejected/${candidates.size} rejected (require \"$lockedLabel\")")
-        }
+        val logThis = framesLost % 10 == 1 || validCandidates.isNotEmpty()
 
-        val logThis = framesLost % 10 == 1 || labelFiltered.isNotEmpty()
-
-        val scored = labelFiltered.mapNotNull { candidate ->
+        val scored = validCandidates.mapNotNull { candidate ->
             val score = scoreCandidate(candidate, refBox, posConf, posThreshold)
-            val sim = if (lockedEmbedding != null && candidate.embedding != null) {
-                cosineSimilarity(lockedEmbedding!!, candidate.embedding!!)
+            val sim = if (hasEmbeddings && candidate.embedding != null) {
+                bestGallerySimilarity(candidate.embedding!!)
             } else null
             if (score != null) {
                 if (logThis) {
@@ -207,9 +227,9 @@ class ReacquisitionEngine(
         // Compute appearance similarity early — a strong visual match can
         // override geometric hard filters (position, size). This handles
         // scenarios like phone rotation where the last-known box is meaningless.
-        val hasAppearance = lockedEmbedding != null && candidate.embedding != null
+        val hasAppearance = hasEmbeddings && candidate.embedding != null
         val appearanceScore = if (hasAppearance) {
-            cosineSimilarity(lockedEmbedding!!, candidate.embedding!!)
+            bestGallerySimilarity(candidate.embedding!!)
                 .coerceIn(0f, 1f)
         } else 0f
         val strongVisualMatch = hasAppearance && appearanceScore > APPEARANCE_OVERRIDE_THRESHOLD
@@ -241,15 +261,15 @@ class ReacquisitionEngine(
         // With appearance: it gets the dominant share (replaces most of label weight
         // since visual identity is strictly more informative than category label).
         if (hasAppearance) {
-            val basePositionWeight = 0.30f
+            val basePositionWeight = 0.20f
             val baseSizeWeight = 0.15f
-            val baseLabelWeight = 0.10f
+            val baseLabelWeight = 0.20f
             val baseAppearanceWeight = 0.45f
 
             val effectivePositionWeight = basePositionWeight * positionConfidence
             val redistributed = basePositionWeight * (1f - positionConfidence)
-            val effectiveSizeWeight = baseSizeWeight + redistributed * 0.2f
-            val effectiveLabelWeight = baseLabelWeight + redistributed * 0.1f
+            val effectiveSizeWeight = baseSizeWeight + redistributed * 0.15f
+            val effectiveLabelWeight = baseLabelWeight + redistributed * 0.15f
             val effectiveAppearanceWeight = baseAppearanceWeight + redistributed * 0.7f
 
             return (positionScore * effectivePositionWeight) +
@@ -271,6 +291,12 @@ class ReacquisitionEngine(
                    (sizeScore * effectiveSizeWeight) +
                    (labelScore * effectiveLabelWeight)
         }
+    }
+
+    /** Best cosine similarity between a candidate and any embedding in the gallery. */
+    internal fun bestGallerySimilarity(candidateEmbedding: FloatArray): Float {
+        if (embeddingGallery.isEmpty()) return 0f
+        return embeddingGallery.maxOf { cosineSimilarity(it, candidateEmbedding) }
     }
 
     private fun cosineSimilarity(a: FloatArray, b: FloatArray): Float {

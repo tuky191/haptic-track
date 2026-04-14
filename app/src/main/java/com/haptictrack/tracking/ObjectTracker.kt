@@ -35,6 +35,7 @@ class ObjectTracker(
 
     // Count frames where visual tracker has no detector confirmation
     private var vtUnconfirmedFrames = 0
+    private var vtConfirmedFrames = 0
     private val VT_MAX_UNCONFIRMED = 10  // ~0.3s at 30fps
 
     /** Callback: (displayObjects, lockedObject, imageWidth, imageHeight) */
@@ -59,12 +60,13 @@ class ObjectTracker(
      * the visual embedding for identity-aware re-acquisition.
      */
     fun lockOnObject(trackingId: Int, boundingBox: RectF, label: String?) {
-        val embedding = synchronized(lastFrameLock) {
+        // Generate augmented embeddings at lock time for multi-angle coverage
+        val embeddings = synchronized(lastFrameLock) {
             lastFrameBitmap?.let { bmp ->
-                appearanceEmbedder.embed(bmp, boundingBox)
-            }
+                appearanceEmbedder.embedWithAugmentations(bmp, boundingBox)
+            } ?: emptyList()
         }
-        reacquisition.lock(trackingId, boundingBox, label, embedding)
+        reacquisition.lock(trackingId, boundingBox, label, embeddings)
 
         // Initialize visual tracker on the locked region
         synchronized(lastFrameLock) {
@@ -78,7 +80,7 @@ class ObjectTracker(
             lastFrameBitmap?.let { bmp ->
                 val locked = TrackedObject(trackingId, boundingBox, label)
                 debugCapture.capture("LOCK", bmp, listOf(locked), lockedObject = locked,
-                    extraInfo = "id=$trackingId label=$label hasEmbed=${embedding != null}")
+                    extraInfo = "id=$trackingId label=$label gallery=${embeddings.size}")
             }
         }
     }
@@ -87,6 +89,7 @@ class ObjectTracker(
         reacquisition.clear()
         visualTracker.stop()
         vtUnconfirmedFrames = 0
+        vtConfirmedFrames = 0
     }
 
     val analyzer = ImageAnalysis.Analyzer { imageProxy ->
@@ -124,9 +127,18 @@ class ObjectTracker(
 
                     if (confirmed) {
                         vtUnconfirmedFrames = 0
-                        // Only sync lastKnownBox when detector confirms — prevents
-                        // drifted position from poisoning re-acquisition search
+                        // Only sync lastKnownBox when detector confirms
                         reacquisition.updateFromVisualTracker(vtResult.boundingBox)
+
+                        // Accumulate embedding from current angle (every 30 confirmed frames ≈ 1s)
+                        vtConfirmedFrames++
+                        if (vtConfirmedFrames % 30 == 0) {
+                            val emb = appearanceEmbedder.embed(bitmap, vtResult.boundingBox)
+                            if (emb != null) {
+                                reacquisition.addEmbedding(emb)
+                                android.util.Log.d("AppearEmbed", "Gallery +1 → ${reacquisition.embeddingGallery.size} (accumulated)")
+                            }
+                        }
                     } else {
                         vtUnconfirmedFrames++
                     }
@@ -168,7 +180,7 @@ class ObjectTracker(
             // Compute embeddings when searching OR when the direct ID match might
             // fail (framesLost==0 but tracking ID likely changed after visual tracker
             // handoff). Without embeddings, two same-label objects are indistinguishable.
-            val needEmbeddings = reacquisition.lockedEmbedding != null &&
+            val needEmbeddings = reacquisition.hasEmbeddings &&
                 (reacquisition.isSearching || (reacquisition.isLocked && reacquisition.framesLost == 0))
             val withEmbeddings = if (needEmbeddings) {
                 tracked.map { obj ->

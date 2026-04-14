@@ -2,6 +2,7 @@ package com.haptictrack.tracking
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Matrix
 import android.graphics.RectF
 import android.util.Log
 import com.google.mediapipe.framework.image.BitmapImageBuilder
@@ -59,6 +60,69 @@ class AppearanceEmbedder(context: Context) {
         } finally {
             crop.recycle()
         }
+    }
+
+    /**
+     * Embed the crop plus augmented variants (rotated 90°/180°/270°, flipped).
+     * Returns a list of embeddings covering multiple orientations.
+     */
+    fun embedWithAugmentations(bitmap: Bitmap, normalizedBox: RectF): List<FloatArray> {
+        val crop = cropBitmap(bitmap, normalizedBox) ?: return emptyList()
+        val results = mutableListOf<FloatArray>()
+
+        try {
+            // Original
+            embedBitmap(crop)?.let { results.add(it) }
+
+            // Rotated 90°, 180°, 270°
+            for (degrees in listOf(90f, 180f, 270f)) {
+                val rotated = rotateBitmap(crop, degrees)
+                embedBitmap(rotated)?.let { results.add(it) }
+                if (rotated !== crop) rotated.recycle()
+            }
+
+            // Horizontal flip
+            val flipped = flipBitmap(crop)
+            embedBitmap(flipped)?.let { results.add(it) }
+            flipped.recycle()
+        } catch (e: Exception) {
+            Log.w(TAG, "Augmented embedding failed: ${e.message}")
+        } finally {
+            crop.recycle()
+        }
+
+        Log.d(TAG, "Generated ${results.size} augmented embeddings")
+        return results
+    }
+
+    private fun embedBitmap(bitmap: Bitmap): FloatArray? {
+        return try {
+            val mpImage = BitmapImageBuilder(bitmap).build()
+            val result = embedder.embed(mpImage)
+            val embedding = result.embeddingResult().embeddings().firstOrNull()
+            val raw = embedding?.floatEmbedding()
+            if (raw != null && raw.isNotEmpty()) raw else null
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun rotateBitmap(bitmap: Bitmap, degrees: Float): Bitmap {
+        val matrix = Matrix().apply { postRotate(degrees) }
+        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+    }
+
+    private fun flipBitmap(bitmap: Bitmap): Bitmap {
+        val matrix = Matrix().apply { preScale(-1f, 1f) }
+        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+    }
+
+    /**
+     * Best cosine similarity between a candidate embedding and a gallery of reference embeddings.
+     */
+    fun bestSimilarity(candidate: FloatArray, gallery: List<FloatArray>): Float {
+        if (gallery.isEmpty()) return 0f
+        return gallery.maxOf { cosineSimilarity(candidate, it) }
     }
 
     /**

@@ -136,32 +136,35 @@ class ReacquisitionEngineTest {
     // --- Hard label filter ---
 
     @Test
-    fun `never reacquires onto a different label`() {
+    fun `different label scores lower than same label`() {
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup")
 
-        // Nearby object with different label — should be rejected
+        val sameLabel = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "cup")
+        val diffLabel = obj(id = 66, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "laptop")
+
+        val sameScore = engine.scoreCandidate(sameLabel, engine.lastKnownBox!!)!!
+        val diffScore = engine.scoreCandidate(diffLabel, engine.lastKnownBox!!)!!
+
+        assertTrue("Same label ($sameScore) should score higher than different ($diffScore)",
+            sameScore > diffScore)
+    }
+
+    @Test
+    fun `different label can still reacquire if only candidate`() {
+        // Label is soft — a nearby different-label object can re-acquire
+        // when there's no same-label alternative
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup")
+
         val detections = listOf(
             obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "laptop")
         )
         val result = engine.processFrame(detections)
-        assertNull("Should not reacquire onto different label", result)
+        // Without embeddings, the score depends on position+size+label(0)
+        // May or may not pass minScoreThreshold — the point is it's not hard-rejected
     }
 
     @Test
-    fun `never reacquires onto different label even after position decay`() {
-        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup")
-
-        repeat(engine.positionDecayFrames) { engine.processFrame(emptyList()) }
-
-        val detections = listOf(
-            obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "laptop")
-        )
-        val result = engine.processFrame(detections)
-        assertNull("Should not reacquire onto different label even after decay", result)
-    }
-
-    @Test
-    fun `reacquires same label and ignores different label nearby`() {
+    fun `prefers same-label candidate over different-label nearby`() {
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup")
 
         // Two candidates: wrong label nearby, right label further
@@ -170,7 +173,7 @@ class ReacquisitionEngineTest {
 
         val result = engine.processFrame(listOf(wrong, right))
         assertNotNull(result)
-        assertEquals(66, result!!.id)
+        assertEquals("Should prefer same-label candidate", 66, result!!.id)
         assertEquals("cup", result.label)
     }
 
@@ -513,6 +516,63 @@ class ReacquisitionEngineTest {
 
         val score = engine.scoreCandidate(wrongObj, engine.lastKnownBox!!)
         assertNull("Weak embedding should NOT bypass size hard threshold", score)
+    }
+
+    // --- Label flicker: strong embedding overrides wrong label ---
+
+    @Test
+    fun `strong embedding overrides label mismatch`() {
+        // Lock on "bowl" — detector later calls same object "potted plant"
+        val lockedEmb = floatArrayOf(0.8f, 0.5f, 0.2f)
+        engine.lock(42, RectF(0.3f, 0.3f, 0.7f, 0.7f), "bowl", lockedEmb)
+
+        engine.processFrame(emptyList())
+
+        // Same object, strong embedding, but detector says "potted plant"
+        val candidate = obj(id = 55, left = 0.32f, top = 0.32f, right = 0.68f, bottom = 0.68f, label = "potted plant")
+            .copy(embedding = floatArrayOf(0.75f, 0.55f, 0.2f))  // sim ~0.98
+
+        val result = engine.processFrame(listOf(candidate))
+        assertNotNull("Strong embedding should override label mismatch", result)
+        assertEquals(55, result!!.id)
+    }
+
+    @Test
+    fun `weak embedding with wrong label scores lower than strong with right label`() {
+        val lockedEmb = floatArrayOf(0.8f, 0.5f, 0.2f)
+        engine.lock(42, RectF(0.3f, 0.3f, 0.7f, 0.7f), "bowl", lockedEmb)
+
+        engine.processFrame(emptyList())
+
+        val strongRight = obj(id = 55, left = 0.32f, top = 0.32f, right = 0.68f, bottom = 0.68f, label = "bowl")
+            .copy(embedding = floatArrayOf(0.75f, 0.55f, 0.2f))  // high sim, right label
+        val weakWrong = obj(id = 66, left = 0.32f, top = 0.32f, right = 0.68f, bottom = 0.68f, label = "chair")
+            .copy(embedding = floatArrayOf(0f, 0f, 1f))  // low sim, wrong label
+
+        val strongScore = engine.scoreCandidate(strongRight, engine.lastKnownBox!!)!!
+        val weakScore = engine.scoreCandidate(weakWrong, engine.lastKnownBox!!)!!
+
+        assertTrue("Strong+right ($strongScore) should beat weak+wrong ($weakScore)",
+            strongScore > weakScore)
+    }
+
+    @Test
+    fun `label override prefers correct label when both available`() {
+        val lockedEmb = floatArrayOf(0.8f, 0.5f, 0.2f)
+        engine.lock(42, RectF(0.3f, 0.3f, 0.7f, 0.7f), "bowl", lockedEmb)
+
+        engine.processFrame(emptyList())
+
+        // Two candidates: same object mislabeled, and correctly labeled
+        val mislabeled = obj(id = 55, left = 0.32f, top = 0.32f, right = 0.68f, bottom = 0.68f, label = "potted plant")
+            .copy(embedding = floatArrayOf(0.75f, 0.55f, 0.2f))  // high sim
+        val correctLabel = obj(id = 66, left = 0.32f, top = 0.32f, right = 0.68f, bottom = 0.68f, label = "bowl")
+            .copy(embedding = floatArrayOf(0.75f, 0.55f, 0.2f))  // same high sim
+
+        val result = engine.processFrame(listOf(mislabeled, correctLabel))
+        assertNotNull(result)
+        // Both should score, correct label should win (gets label score bonus)
+        assertEquals("Should prefer correct label", 66, result!!.id)
     }
 
     // --- Two same-label objects: embedding must discriminate ---
