@@ -150,13 +150,15 @@ class ObjectTracker(
                         vtUnconfirmedFrames = 0
                         // Fall through to detector path below
                     } else {
-                        val displayObjects = filter.filter(tracked)
                         val lockedObj = TrackedObject(
                             id = reacquisition.lockedId ?: -1,
                             boundingBox = vtResult.boundingBox,
                             label = reacquisition.lastKnownLabel,
                             confidence = vtResult.confidence
                         )
+                        // Include the visual tracker's box in display objects so
+                        // the UI can draw it green. Detector objects use different IDs.
+                        val displayObjects = filter.filter(tracked) + lockedObj
 
                         onDetectionResult?.invoke(displayObjects, lockedObj, frameWidth, frameHeight)
 
