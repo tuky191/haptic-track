@@ -71,7 +71,7 @@ class ObjectTracker(
             visualTracker.init(bmp, boundingBox)
 
             val locked = TrackedObject(trackingId, boundingBox, label)
-            debugCapture.capture("LOCK", bmp, listOf(locked), lockedObject = locked,
+            debugCapture.capture(DebugEvent.LOCK, bmp, listOf(locked), lockedObject = locked,
                 extraInfo = "id=$trackingId label=$label gallery=${embeddings.size}")
         }
     }
@@ -271,7 +271,7 @@ class ObjectTracker(
             // Just re-acquired
             wasSearching && lockedObject != null && nowLost == 0 -> {
                 debugCapture.capture(
-                    "REACQUIRE", bitmap, detections,
+                    DebugEvent.REACQUIRE, bitmap, detections,
                     lockedObject = lockedObject,
                     extraInfo = "after $prevFramesLost frames, id=${lockedObject.id} label=${lockedObject.label}"
                 )
@@ -279,7 +279,7 @@ class ObjectTracker(
             // Just lost (first frame)
             nowLost == 1 && prevFramesLost == 0 -> {
                 debugCapture.capture(
-                    "LOST", bitmap, detections,
+                    DebugEvent.LOST, bitmap, detections,
                     lastKnownBox = reacquisition.lastKnownBox,
                     extraInfo = "label=${reacquisition.lockedLabel}"
                 )
@@ -295,7 +295,7 @@ class ObjectTracker(
                         .filter { it.label == reacquisition.lockedLabel }
                         .joinToString(", ") { "#${it.id} ${it.confidence.times(100).toInt()}%" }
                     debugCapture.capture(
-                        "SEARCH", bitmap, detections,
+                        DebugEvent.SEARCH, bitmap, detections,
                         lastKnownBox = reacquisition.lastKnownBox,
                         extraInfo = "frame=$nowLost match=[${candidateInfo.ifEmpty { "none" }}]"
                     )
@@ -304,7 +304,7 @@ class ObjectTracker(
             // Timed out
             nowLost == reacquisition.maxFramesLost + 1 -> {
                 debugCapture.capture(
-                    "TIMEOUT", bitmap, detections,
+                    DebugEvent.TIMEOUT, bitmap, detections,
                     lastKnownBox = reacquisition.lastKnownBox,
                     extraInfo = "gave up on ${reacquisition.lockedLabel}"
                 )

@@ -1,7 +1,5 @@
-numpy
-Pillow
-tflite-runtime
-open-clip-torch
-torch
-torchvision
-pytest
+mediapipe==0.10.21
+numpy>=1.24,<2
+opencv-python>=4.8,<5
+Pillow>=10.0,<11
+pytest>=7.0,<9

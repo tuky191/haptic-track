@@ -20,7 +20,7 @@ import kotlinx.coroutines.flow.update
 
 class CameraViewModel(application: Application) : AndroidViewModel(application) {
 
-    val cameraManager = CameraManager(application)
+    internal val cameraManager = CameraManager(application)
     private val recordingManager = RecordingManager(application)
     private val objectTracker = ObjectTracker(application)
     private val hapticManager = HapticFeedbackManager(application)
@@ -117,11 +117,13 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             _uiState.update { it.copy(isRecording = false) }
         } else {
             recordingManager.startRecording(cameraManager.videoCapture) { event ->
-                if (event is VideoRecordEvent.Finalize) {
-                    _uiState.update { it.copy(isRecording = false) }
+                when (event) {
+                    is VideoRecordEvent.Start ->
+                        _uiState.update { it.copy(isRecording = true) }
+                    is VideoRecordEvent.Finalize ->
+                        _uiState.update { it.copy(isRecording = false) }
                 }
             }
-            _uiState.update { it.copy(isRecording = true) }
         }
     }
 

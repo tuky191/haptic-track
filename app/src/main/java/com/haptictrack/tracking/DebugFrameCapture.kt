@@ -16,6 +16,10 @@ import java.time.format.DateTimeFormatter
  *
  * Pull with: adb pull /sdcard/Android/data/com.haptictrack/files/debug_frames/
  */
+enum class DebugEvent {
+    LOCK, LOST, SEARCH, REACQUIRE, TIMEOUT
+}
+
 class DebugFrameCapture(context: Context) {
 
     companion object {
@@ -90,7 +94,7 @@ class DebugFrameCapture(context: Context) {
      * @param extraInfo Additional text to overlay (e.g. similarity scores)
      */
     fun capture(
-        event: String,
+        event: DebugEvent,
         bitmap: Bitmap,
         detections: List<TrackedObject>,
         lockedObject: TrackedObject? = null,
@@ -107,7 +111,7 @@ class DebugFrameCapture(context: Context) {
         // Draw all detections
         for (obj in detections) {
             val paint = when {
-                lockedObject != null && obj.id == lockedObject.id && event == "REACQUIRE" -> reacquiredPaint
+                lockedObject != null && obj.id == lockedObject.id && event == DebugEvent.REACQUIRE -> reacquiredPaint
                 lockedObject != null && obj.id == lockedObject.id -> lockedPaint
                 else -> candidatePaint
             }
@@ -117,7 +121,7 @@ class DebugFrameCapture(context: Context) {
         }
 
         // Draw last known box if searching
-        if (lastKnownBox != null && (event == "LOST" || event == "SEARCH")) {
+        if (lastKnownBox != null && (event == DebugEvent.LOST || event == DebugEvent.SEARCH)) {
             canvas.drawRect(toPixelRect(lastKnownBox, w, h), lostPaint)
         }
 
