@@ -13,8 +13,28 @@ data class TrackedObject(
     val id: Int,
     val boundingBox: RectF,
     val label: String? = null,
-    val confidence: Float = 0f
-)
+    val confidence: Float = 0f,
+    val embedding: FloatArray? = null
+) {
+    // INVARIANT: embedding is excluded from equals/hashCode. Two TrackedObjects
+    // differing only in embedding are considered equal. This is intentional —
+    // embedding is transient ML output, not part of the object's identity for
+    // UI diffing and collection operations.
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is TrackedObject) return false
+        return id == other.id && boundingBox == other.boundingBox &&
+               label == other.label && confidence == other.confidence
+    }
+
+    override fun hashCode(): Int {
+        var result = id
+        result = 31 * result + boundingBox.hashCode()
+        result = 31 * result + (label?.hashCode() ?: 0)
+        result = 31 * result + confidence.hashCode()
+        return result
+    }
+}
 
 data class TrackingUiState(
     val status: TrackingStatus = TrackingStatus.IDLE,

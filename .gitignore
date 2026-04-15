@@ -9,3 +9,13 @@
 .cxx
 local.properties
 /app/build
+
+# Python tools
+tools/.venv/
+tools/__pycache__/
+tools/.pytest_cache/
+
+# Test video/frames (large, not tracked)
+tools/test_fixtures/*/frames/
+*.mp4
+*.logcat

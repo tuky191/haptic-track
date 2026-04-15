@@ -7,6 +7,7 @@ activityCompose = "1.9.3"
 composeBom = "2024.12.01"
 camerax = "1.4.1"
 mediapipeVision = "0.10.21"
+opencv = "4.13.0"
 accompanistPermissions = "0.36.0"
 junit = "4.13.2"
 robolectric = "4.14.1"
@@ -35,6 +36,9 @@ camerax-view = { group = "androidx.camera", name = "camera-view", version.ref = 
 
 # MediaPipe
 mediapipe-tasksvision = { group = "com.google.mediapipe", name = "tasks-vision", version.ref = "mediapipeVision" }
+
+# OpenCV
+opencv = { group = "org.opencv", name = "opencv", version.ref = "opencv" }
 
 # Testing
 junit = { group = "junit", name = "junit", version.ref = "junit" }

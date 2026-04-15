@@ -1,0 +1,76 @@
+{
+  "description": "Two red apples + red toy car: lock on apple_a (with sticker), pan past apple_b and toy car, return",
+  "object_ids": ["apple_a", "apple_b", "toy_car"],
+  "frames": [
+    {
+      "frame": "frame_0001.png",
+      "objects": [
+        {"object_id": "apple_a", "box": [0.25, 0.20, 0.75, 0.70]}
+      ]
+    },
+    {
+      "frame": "frame_0012.png",
+      "objects": [
+        {"object_id": "apple_a", "box": [0.25, 0.18, 0.72, 0.68]}
+      ]
+    },
+    {
+      "frame": "frame_0018.png",
+      "objects": [
+        {"object_id": "apple_a", "box": [0.0, 0.35, 0.35, 0.80]},
+        {"object_id": "apple_b", "box": [0.62, 0.30, 0.97, 0.72]}
+      ]
+    },
+    {
+      "frame": "frame_0030.png",
+      "objects": [
+        {"object_id": "apple_a", "box": [0.25, 0.30, 0.65, 0.75]}
+      ]
+    },
+    {
+      "frame": "frame_0036.png",
+      "objects": [
+        {"object_id": "toy_car", "box": [0.22, 0.38, 0.72, 0.72]}
+      ]
+    },
+    {
+      "frame": "frame_0040.png",
+      "objects": [
+        {"object_id": "apple_a", "box": [0.22, 0.28, 0.72, 0.78]}
+      ]
+    },
+    {
+      "frame": "frame_0046.png",
+      "objects": [
+        {"object_id": "apple_a", "box": [0.23, 0.22, 0.73, 0.72]}
+      ]
+    }
+  ],
+  "expected_reacquisitions": [
+    {
+      "description": "Apple A re-acquired over apple B (both red apples, different identity)",
+      "lock_on": {"object_id": "apple_a", "frame": "frame_0001.png"},
+      "should_reacquire": {"object_id": "apple_a", "frame": "frame_0018.png"},
+      "should_not_reacquire": [
+        {"object_id": "apple_b", "frame": "frame_0018.png"}
+      ]
+    },
+    {
+      "description": "Apple A re-acquired after pan past toy car",
+      "lock_on": {"object_id": "apple_a", "frame": "frame_0001.png"},
+      "should_reacquire": {"object_id": "apple_a", "frame": "frame_0040.png"},
+      "should_not_reacquire": [
+        {"object_id": "toy_car", "frame": "frame_0036.png"}
+      ]
+    },
+    {
+      "description": "Apple A from different angle beats all distractors",
+      "lock_on": {"object_id": "apple_a", "frame": "frame_0001.png"},
+      "should_reacquire": {"object_id": "apple_a", "frame": "frame_0030.png"},
+      "should_not_reacquire": [
+        {"object_id": "apple_b", "frame": "frame_0018.png"},
+        {"object_id": "toy_car", "frame": "frame_0036.png"}
+      ]
+    }
+  ]
+}

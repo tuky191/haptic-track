@@ -136,32 +136,36 @@ class ReacquisitionEngineTest {
     // --- Hard label filter ---
 
     @Test
-    fun `never reacquires onto a different label`() {
+    fun `different label scores lower than same label`() {
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup")
 
-        // Nearby object with different label — should be rejected
-        val detections = listOf(
-            obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "laptop")
-        )
-        val result = engine.processFrame(detections)
-        assertNull("Should not reacquire onto different label", result)
+        val sameLabel = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "cup")
+        val diffLabel = obj(id = 66, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "laptop")
+
+        val sameScore = engine.scoreCandidate(sameLabel, engine.lastKnownBox!!)!!
+        val diffScore = engine.scoreCandidate(diffLabel, engine.lastKnownBox!!)!!
+
+        assertTrue("Same label ($sameScore) should score higher than different ($diffScore)",
+            sameScore > diffScore)
     }
 
     @Test
-    fun `never reacquires onto different label even after position decay`() {
+    fun `different label can still reacquire if only candidate`() {
+        // Label is soft — a nearby different-label object should not be hard-rejected
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup")
-
-        repeat(engine.positionDecayFrames) { engine.processFrame(emptyList()) }
 
         val detections = listOf(
             obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "laptop")
         )
-        val result = engine.processFrame(detections)
-        assertNull("Should not reacquire onto different label even after decay", result)
+        // Lose the locked id first
+        engine.processFrame(emptyList())
+        val score = engine.scoreCandidate(detections[0], engine.lastKnownBox!!)
+        // Score may be low, but the candidate was not hard-rejected (score != null)
+        assertNotNull("Different-label candidate should not be hard-rejected", score)
     }
 
     @Test
-    fun `reacquires same label and ignores different label nearby`() {
+    fun `prefers same-label candidate over different-label nearby`() {
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup")
 
         // Two candidates: wrong label nearby, right label further
@@ -170,7 +174,7 @@ class ReacquisitionEngineTest {
 
         val result = engine.processFrame(listOf(wrong, right))
         assertNotNull(result)
-        assertEquals(66, result!!.id)
+        assertEquals("Should prefer same-label candidate", 66, result!!.id)
         assertEquals("cup", result.label)
     }
 
@@ -251,9 +255,7 @@ class ReacquisitionEngineTest {
         )
 
         val result = engine.processFrame(detections)
-        // With no label match and no position match, score should be too low
-        // This depends on thresholds — the point is label should matter more now
-        // If it does match, label weight wasn't high enough
+        assertNull("Distant wrong-label object should not reacquire", result)
     }
 
     @Test
@@ -377,6 +379,284 @@ class ReacquisitionEngineTest {
             lateGap > earlyGap)
     }
 
+    // --- Appearance embedding scoring ---
+
+    @Test
+    fun `lock stores embedding in gallery`() {
+        val embedding = floatArrayOf(0.1f, 0.2f, 0.3f)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", embedding)
+        assertEquals(1, engine.embeddingGallery.size)
+        assertArrayEquals(embedding, engine.embeddingGallery[0], 0.001f)
+    }
+
+    @Test
+    fun `clear removes embeddings`() {
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", floatArrayOf(0.1f, 0.2f))
+        engine.clear()
+        assertTrue(engine.embeddingGallery.isEmpty())
+    }
+
+    @Test
+    fun `appearance score boosts visually similar candidate`() {
+        val lockedEmb = floatArrayOf(1f, 0f, 0f)  // unit vector
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", lockedEmb)
+
+        val similar = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "cup")
+            .copy(embedding = floatArrayOf(0.9f, 0.1f, 0f))  // similar direction
+        val different = obj(id = 66, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "cup")
+            .copy(embedding = floatArrayOf(0f, 0f, 1f))  // orthogonal
+
+        val similarScore = engine.scoreCandidate(similar, engine.lastKnownBox!!)!!
+        val differentScore = engine.scoreCandidate(different, engine.lastKnownBox!!)!!
+
+        assertTrue("Visually similar ($similarScore) should score higher than different ($differentScore)",
+            similarScore > differentScore)
+    }
+
+    @Test
+    fun `appearance score distinguishes same-label objects`() {
+        // THE core scenario: two cups, only one looks like the locked one
+        val lockedEmb = floatArrayOf(0.7f, 0.7f, 0f)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", lockedEmb)
+
+        // Lose the object
+        engine.processFrame(emptyList())
+
+        val rightCup = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "cup")
+            .copy(embedding = floatArrayOf(0.6f, 0.8f, 0f))  // similar visual
+        val wrongCup = obj(id = 66, left = 0.38f, top = 0.38f, right = 0.58f, bottom = 0.58f, label = "cup")
+            .copy(embedding = floatArrayOf(0f, 0.1f, 0.9f))  // different visual
+
+        val result = engine.processFrame(listOf(wrongCup, rightCup))
+        assertNotNull(result)
+        assertEquals("Should pick visually similar cup", 55, result!!.id)
+    }
+
+    @Test
+    fun `scoring falls back gracefully when no embedding available`() {
+        // Lock without embedding
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup")
+        assertTrue(engine.embeddingGallery.isEmpty())
+
+        // Candidate without embedding — should still score via position/size/label
+        val candidate = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "cup")
+        val score = engine.scoreCandidate(candidate, engine.lastKnownBox!!)
+        assertNotNull("Should still score without embeddings", score)
+        assertTrue(score!! > 0f)
+    }
+
+    @Test
+    fun `appearance weight increases after position decay`() {
+        val lockedEmb = floatArrayOf(1f, 0f, 0f)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", lockedEmb)
+
+        val similar = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "cup")
+            .copy(embedding = floatArrayOf(0.9f, 0.1f, 0f))
+        val different = obj(id = 66, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "cup")
+            .copy(embedding = floatArrayOf(0f, 0f, 1f))
+
+        // Early gap between similar vs different
+        val earlyGap = engine.scoreCandidate(similar, engine.lastKnownBox!!)!! -
+                       engine.scoreCandidate(different, engine.lastKnownBox!!)!!
+
+        // Decay position
+        repeat(engine.positionDecayFrames) { engine.processFrame(emptyList()) }
+
+        val lateGap = engine.scoreCandidate(similar, engine.lastKnownBox!!)!! -
+                      engine.scoreCandidate(different, engine.lastKnownBox!!)!!
+
+        assertTrue("Appearance should matter more after position decay: early=$earlyGap, late=$lateGap",
+            lateGap > earlyGap)
+    }
+
+    // --- Appearance override of geometric hard filters ---
+
+    @Test
+    fun `strong embedding bypasses size threshold`() {
+        // Lock on small object (e.g. mouse at edge of frame)
+        val lockedEmb = floatArrayOf(0.8f, 0.6f, 0f)
+        engine.lock(42, RectF(0.9f, 0.5f, 1.0f, 0.7f), "mouse", lockedEmb)
+
+        // Lose it, then candidate reappears MUCH larger (phone was flipped)
+        engine.processFrame(emptyList())
+
+        val bigMouse = obj(id = 55, left = 0.1f, top = 0.2f, right = 0.7f, bottom = 0.8f, label = "mouse")
+            .copy(embedding = floatArrayOf(0.7f, 0.7f, 0f))  // similar visual (sim ~0.95)
+
+        val score = engine.scoreCandidate(bigMouse, engine.lastKnownBox!!)
+        assertNotNull("Strong embedding should bypass size hard threshold", score)
+    }
+
+    @Test
+    fun `strong embedding bypasses position threshold`() {
+        val lockedEmb = floatArrayOf(0.8f, 0.6f, 0f)
+        engine.lock(42, RectF(0.9f, 0.9f, 1.0f, 1.0f), "mouse", lockedEmb)
+
+        engine.processFrame(emptyList())
+
+        // Same object appears at opposite corner — way beyond position threshold
+        val farMouse = obj(id = 55, left = 0.0f, top = 0.0f, right = 0.1f, bottom = 0.1f, label = "mouse")
+            .copy(embedding = floatArrayOf(0.7f, 0.7f, 0f))
+
+        val score = engine.scoreCandidate(farMouse, engine.lastKnownBox!!)
+        assertNotNull("Strong embedding should bypass position hard threshold", score)
+    }
+
+    @Test
+    fun `weak embedding does not bypass size threshold`() {
+        val lockedEmb = floatArrayOf(1f, 0f, 0f)
+        engine.lock(42, RectF(0.9f, 0.5f, 1.0f, 0.7f), "mouse", lockedEmb)
+
+        engine.processFrame(emptyList())
+
+        // Much larger, and visually different
+        val wrongObj = obj(id = 55, left = 0.1f, top = 0.2f, right = 0.7f, bottom = 0.8f, label = "mouse")
+            .copy(embedding = floatArrayOf(0f, 0f, 1f))  // orthogonal = sim 0.0
+
+        val score = engine.scoreCandidate(wrongObj, engine.lastKnownBox!!)
+        assertNull("Weak embedding should NOT bypass size hard threshold", score)
+    }
+
+    // --- Label flicker: strong embedding overrides wrong label ---
+
+    @Test
+    fun `strong embedding overrides label mismatch`() {
+        // Lock on "bowl" — detector later calls same object "potted plant"
+        val lockedEmb = floatArrayOf(0.8f, 0.5f, 0.2f)
+        engine.lock(42, RectF(0.3f, 0.3f, 0.7f, 0.7f), "bowl", lockedEmb)
+
+        engine.processFrame(emptyList())
+
+        // Same object, strong embedding, but detector says "potted plant"
+        val candidate = obj(id = 55, left = 0.32f, top = 0.32f, right = 0.68f, bottom = 0.68f, label = "potted plant")
+            .copy(embedding = floatArrayOf(0.75f, 0.55f, 0.2f))  // sim ~0.98
+
+        val result = engine.processFrame(listOf(candidate))
+        assertNotNull("Strong embedding should override label mismatch", result)
+        assertEquals(55, result!!.id)
+    }
+
+    @Test
+    fun `weak embedding with wrong label scores lower than strong with right label`() {
+        val lockedEmb = floatArrayOf(0.8f, 0.5f, 0.2f)
+        engine.lock(42, RectF(0.3f, 0.3f, 0.7f, 0.7f), "bowl", lockedEmb)
+
+        engine.processFrame(emptyList())
+
+        val strongRight = obj(id = 55, left = 0.32f, top = 0.32f, right = 0.68f, bottom = 0.68f, label = "bowl")
+            .copy(embedding = floatArrayOf(0.75f, 0.55f, 0.2f))  // high sim, right label
+        val weakWrong = obj(id = 66, left = 0.32f, top = 0.32f, right = 0.68f, bottom = 0.68f, label = "chair")
+            .copy(embedding = floatArrayOf(0f, 0f, 1f))  // low sim, wrong label
+
+        val strongScore = engine.scoreCandidate(strongRight, engine.lastKnownBox!!)!!
+        val weakScore = engine.scoreCandidate(weakWrong, engine.lastKnownBox!!)!!
+
+        assertTrue("Strong+right ($strongScore) should beat weak+wrong ($weakScore)",
+            strongScore > weakScore)
+    }
+
+    @Test
+    fun `label override prefers correct label when both available`() {
+        val lockedEmb = floatArrayOf(0.8f, 0.5f, 0.2f)
+        engine.lock(42, RectF(0.3f, 0.3f, 0.7f, 0.7f), "bowl", lockedEmb)
+
+        engine.processFrame(emptyList())
+
+        // Two candidates: same object mislabeled, and correctly labeled
+        val mislabeled = obj(id = 55, left = 0.32f, top = 0.32f, right = 0.68f, bottom = 0.68f, label = "potted plant")
+            .copy(embedding = floatArrayOf(0.75f, 0.55f, 0.2f))  // high sim
+        val correctLabel = obj(id = 66, left = 0.32f, top = 0.32f, right = 0.68f, bottom = 0.68f, label = "bowl")
+            .copy(embedding = floatArrayOf(0.75f, 0.55f, 0.2f))  // same high sim
+
+        val result = engine.processFrame(listOf(mislabeled, correctLabel))
+        assertNotNull(result)
+        // Both should score, correct label should win (gets label score bonus)
+        assertEquals("Should prefer correct label", 66, result!!.id)
+    }
+
+    // --- Two same-label objects: embedding must discriminate ---
+
+    @Test
+    fun `two trucks - embedding picks the correct one`() {
+        // Lock on orange truck
+        val orangeEmb = floatArrayOf(0.9f, 0.3f, 0.1f)
+        engine.lock(42, RectF(0.3f, 0.4f, 0.6f, 0.6f), "truck", orangeEmb)
+
+        // Lose it
+        engine.processFrame(emptyList())
+
+        // Both trucks appear — same label, similar size/position
+        val orangeTruck = obj(id = 55, left = 0.32f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "truck")
+            .copy(embedding = floatArrayOf(0.85f, 0.35f, 0.1f))  // similar to lock
+        val blueTruck = obj(id = 66, left = 0.25f, top = 0.38f, right = 0.55f, bottom = 0.58f, label = "truck")
+            .copy(embedding = floatArrayOf(0.1f, 0.2f, 0.9f))  // different appearance
+
+        val result = engine.processFrame(listOf(blueTruck, orangeTruck))
+        assertNotNull(result)
+        assertEquals("Should pick orange truck", 55, result!!.id)
+    }
+
+    @Test
+    fun `two trucks - blue truck scores lower than orange`() {
+        val orangeEmb = floatArrayOf(0.9f, 0.3f, 0.1f)
+        engine.lock(42, RectF(0.3f, 0.4f, 0.6f, 0.6f), "truck", orangeEmb)
+        engine.processFrame(emptyList())
+
+        val orangeTruck = obj(id = 55, left = 0.32f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "truck")
+            .copy(embedding = floatArrayOf(0.85f, 0.35f, 0.1f))
+        val blueTruck = obj(id = 66, left = 0.32f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "truck")
+            .copy(embedding = floatArrayOf(0.1f, 0.2f, 0.9f))
+
+        val orangeScore = engine.scoreCandidate(orangeTruck, engine.lastKnownBox!!)!!
+        val blueScore = engine.scoreCandidate(blueTruck, engine.lastKnownBox!!)!!
+
+        assertTrue("Orange ($orangeScore) should score higher than blue ($blueScore)",
+            orangeScore > blueScore)
+    }
+
+    // --- Visual tracker handoff: updateFromVisualTracker ---
+
+    @Test
+    fun `updateFromVisualTracker keeps lastKnownBox in sync`() {
+        engine.lock(42, RectF(0.3f, 0.3f, 0.6f, 0.6f), "truck")
+        val newBox = RectF(0.35f, 0.35f, 0.65f, 0.65f)
+
+        engine.updateFromVisualTracker(newBox)
+
+        assertEquals(newBox, engine.lastKnownBox)
+        assertEquals(0, engine.framesLost)
+    }
+
+    @Test
+    fun `updateFromVisualTracker does not change lockedLabel`() {
+        engine.lock(42, RectF(0.3f, 0.3f, 0.6f, 0.6f), "truck")
+        engine.updateFromVisualTracker(RectF(0.5f, 0.5f, 0.8f, 0.8f))
+
+        assertEquals("truck", engine.lockedLabel)
+        assertEquals("truck", engine.lastKnownLabel)
+    }
+
+    @Test
+    fun `drifted lastKnownBox causes re-acquisition to search wrong area`() {
+        // Simulates the bug: visual tracker drifts, updates lastKnownBox
+        // to a wrong position, then re-acquisition can't find the object
+        val orangeEmb = floatArrayOf(0.9f, 0.3f, 0.1f)
+        engine.lock(42, RectF(0.3f, 0.4f, 0.6f, 0.6f), "truck", orangeEmb)
+
+        // Simulate drift: VT moved lastKnownBox to bottom-right
+        engine.updateFromVisualTracker(RectF(0.8f, 0.8f, 0.95f, 0.95f))
+
+        // Object lost, candidate is near ORIGINAL position
+        engine.processFrame(emptyList())
+        val candidate = obj(id = 55, left = 0.32f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "truck")
+            .copy(embedding = floatArrayOf(0.85f, 0.35f, 0.1f))
+
+        // With drifted lastKnownBox, position distance is huge (0.8 vs 0.3)
+        // but strong embedding should override
+        val result = engine.processFrame(listOf(candidate))
+        assertNotNull("Strong embedding should still re-acquire despite drifted lastKnownBox", result)
+    }
+
     // --- Edge cases ---
 
     @Test
@@ -396,6 +676,34 @@ class ReacquisitionEngineTest {
         )
         engine.processFrame(detections)
         assertEquals("Food", engine.lastKnownLabel)
+    }
+
+    @Test
+    fun `label flicker during tracking does not corrupt re-acquisition scoring`() {
+        // Lock on a bowl
+        engine.lock(1, RectF(0.4f, 0.4f, 0.6f, 0.6f), "bowl")
+        assertEquals("bowl", engine.lockedLabel)
+
+        // Direct match with flickered label — updates lastKnownLabel
+        val flickered = listOf(
+            obj(id = 1, left = 0.41f, top = 0.41f, right = 0.61f, bottom = 0.61f, label = "potted plant")
+        )
+        engine.processFrame(flickered)
+        assertEquals("potted plant", engine.lastKnownLabel)
+        assertEquals("bowl", engine.lockedLabel) // lockedLabel unchanged
+
+        // Object lost — re-acquisition should prefer "bowl", not "potted plant"
+        engine.lock(1, RectF(0.4f, 0.4f, 0.6f, 0.6f), "bowl")
+        // Simulate loss
+        val noMatch = listOf(
+            obj(id = 99, left = 0.4f, top = 0.4f, right = 0.6f, bottom = 0.6f, label = "potted plant"),
+            obj(id = 100, left = 0.41f, top = 0.41f, right = 0.61f, bottom = 0.61f, label = "bowl")
+        )
+        // Lose the locked id
+        repeat(2) { engine.processFrame(emptyList()) }
+
+        val result = engine.findBestCandidate(noMatch)
+        assertEquals("bowl", result?.label)
     }
 
     // --- Helpers ---

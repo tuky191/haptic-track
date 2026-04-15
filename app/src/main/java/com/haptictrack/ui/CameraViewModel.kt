@@ -6,6 +6,7 @@ import androidx.camera.view.PreviewView
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.LifecycleOwner
 import com.haptictrack.camera.CameraManager
+import com.haptictrack.camera.DeviceOrientationListener
 import com.haptictrack.camera.RecordingManager
 import com.haptictrack.haptics.HapticFeedbackManager
 import com.haptictrack.tracking.ObjectTracker
@@ -19,16 +20,20 @@ import kotlinx.coroutines.flow.update
 
 class CameraViewModel(application: Application) : AndroidViewModel(application) {
 
-    val cameraManager = CameraManager(application)
+    internal val cameraManager = CameraManager(application)
     private val recordingManager = RecordingManager(application)
     private val objectTracker = ObjectTracker(application)
     private val hapticManager = HapticFeedbackManager(application)
     private val zoomController = ZoomController()
+    private val orientationListener = DeviceOrientationListener(application)
 
     private val _uiState = MutableStateFlow(TrackingUiState())
     val uiState: StateFlow<TrackingUiState> = _uiState.asStateFlow()
 
     init {
+        orientationListener.start()
+        objectTracker.deviceRotationProvider = { orientationListener.deviceRotation }
+
         cameraManager.imageAnalysis.setAnalyzer(
             java.util.concurrent.Executors.newSingleThreadExecutor(),
             objectTracker.analyzer
@@ -48,14 +53,19 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 zoomController.calculateEdgeProximity(it.boundingBox)
             } ?: 0f
 
-            if (lockedObject != null) {
-                val targetZoom = zoomController.calculateZoom(
+            val targetZoom = if (lockedObject != null) {
+                zoomController.calculateZoom(
                     lockedObject.boundingBox,
                     cameraManager.getMinZoom(),
                     cameraManager.getMaxZoom()
-                )
-                cameraManager.setZoomRatio(targetZoom)
-            }
+                ).also { cameraManager.setZoomRatio(it) }
+            } else if (status == TrackingStatus.LOST && previousStatus == TrackingStatus.LOCKED) {
+                // Just lost — zoom out partially to widen field of view for re-acquisition
+                zoomController.zoomOutForSearch(
+                    cameraManager.getMinZoom(),
+                    cameraManager.getMaxZoom()
+                ).also { cameraManager.setZoomRatio(it) }
+            } else null
 
             hapticManager.updateTrackingStatus(status, edgeProximity)
 
@@ -66,13 +76,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     detectedObjects = allObjects,
                     sourceImageWidth = imgWidth,
                     sourceImageHeight = imgHeight,
-                    currentZoomRatio = lockedObject?.let {
-                        zoomController.calculateZoom(
-                            it.boundingBox,
-                            cameraManager.getMinZoom(),
-                            cameraManager.getMaxZoom()
-                        )
-                    } ?: current.currentZoomRatio
+                    currentZoomRatio = targetZoom ?: current.currentZoomRatio
                 )
             }
         }
@@ -113,16 +117,19 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             _uiState.update { it.copy(isRecording = false) }
         } else {
             recordingManager.startRecording(cameraManager.videoCapture) { event ->
-                if (event is VideoRecordEvent.Finalize) {
-                    _uiState.update { it.copy(isRecording = false) }
+                when (event) {
+                    is VideoRecordEvent.Start ->
+                        _uiState.update { it.copy(isRecording = true) }
+                    is VideoRecordEvent.Finalize ->
+                        _uiState.update { it.copy(isRecording = false) }
                 }
             }
-            _uiState.update { it.copy(isRecording = true) }
         }
     }
 
     override fun onCleared() {
         super.onCleared()
+        orientationListener.stop()
         objectTracker.shutdown()
         hapticManager.shutdown()
         cameraManager.shutdown()

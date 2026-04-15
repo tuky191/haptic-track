@@ -15,10 +15,28 @@ class ObjectTracker(
     context: Context,
     val reacquisition: ReacquisitionEngine = ReacquisitionEngine(),
     val filter: DetectionFilter = DetectionFilter(),
-    private val frameTracker: FrameToFrameTracker = FrameToFrameTracker()
+    private val frameTracker: FrameToFrameTracker = FrameToFrameTracker(),
+    private val appearanceEmbedder: AppearanceEmbedder = AppearanceEmbedder(context),
+    val debugCapture: DebugFrameCapture = DebugFrameCapture(context),
+    private val visualTracker: VisualTracker = VisualTracker(context),
+    /** Provides physical device orientation; set from ViewModel. */
+    var deviceRotationProvider: (() -> Int)? = null
 ) {
 
     private val detector: ObjectDetector
+
+    // Keep last frame for computing embedding when user taps to lock
+    private val lastFrameLock = Any()
+    private var lastFrameBitmap: Bitmap? = null
+
+    // Track previous state to detect transitions
+    private var previouslyLocked: Boolean = false
+    private var previousFramesLost: Int = 0
+
+    // Count frames where visual tracker has no detector confirmation
+    private var vtUnconfirmedFrames = 0
+    private var vtConfirmedFrames = 0
+    private val VT_MAX_UNCONFIRMED = 10  // ~0.3s at 30fps
 
     /** Callback: (displayObjects, lockedObject, imageWidth, imageHeight) */
     var onDetectionResult: ((List<TrackedObject>, TrackedObject?, Int, Int) -> Unit)? = null
@@ -37,12 +55,32 @@ class ObjectTracker(
         detector = ObjectDetector.createFromOptions(context, options)
     }
 
+    /**
+     * Lock onto an object. If a frame bitmap is available, computes and stores
+     * the visual embedding for identity-aware re-acquisition.
+     */
     fun lockOnObject(trackingId: Int, boundingBox: RectF, label: String?) {
-        reacquisition.lock(trackingId, boundingBox, label)
+        synchronized(lastFrameLock) {
+            val bmp = lastFrameBitmap ?: run {
+                reacquisition.lock(trackingId, boundingBox, label, emptyList())
+                return
+            }
+
+            val embeddings = appearanceEmbedder.embedWithAugmentations(bmp, boundingBox)
+            reacquisition.lock(trackingId, boundingBox, label, embeddings)
+            visualTracker.init(bmp, boundingBox)
+
+            val locked = TrackedObject(trackingId, boundingBox, label)
+            debugCapture.capture(DebugEvent.LOCK, bmp, listOf(locked), lockedObject = locked,
+                extraInfo = "id=$trackingId label=$label gallery=${embeddings.size}")
+        }
     }
 
     fun clearLock() {
         reacquisition.clear()
+        visualTracker.stop()
+        vtUnconfirmedFrames = 0
+        vtConfirmedFrames = 0
     }
 
     val analyzer = ImageAnalysis.Analyzer { imageProxy ->
@@ -60,43 +98,158 @@ class ObjectTracker(
         val frameHeight = bitmap.height
 
         try {
-            val mpImage = BitmapImageBuilder(bitmap).build()
-            val result: ObjectDetectorResult = detector.detect(mpImage)
+            // --- Visual tracker: primary frame-to-frame tracking ---
+            // When active, it tracks the locked object by pixel correlation.
+            // Cross-checked against the detector to prevent drift.
+            if (visualTracker.isActive && reacquisition.isLocked && reacquisition.framesLost == 0) {
+                val vtResult = visualTracker.update(bitmap)
+                if (vtResult != null) {
+                    // Run detector anyway to validate and for display
+                    val detections = runDetector(bitmap, frameWidth, frameHeight)
+                    val tracked = frameTracker.assignIds(detections)
 
-            val rawDetections = result.detections().map { detection ->
-                val box = detection.boundingBox()
-                TrackedObject(
-                    id = -1, // MediaPipe doesn't provide tracking IDs
-                    boundingBox = RectF(
-                        box.left / frameWidth.toFloat(),
-                        box.top / frameHeight.toFloat(),
-                        box.right / frameWidth.toFloat(),
-                        box.bottom / frameHeight.toFloat()
-                    ),
-                    label = detection.categories().firstOrNull()?.categoryName(),
-                    confidence = detection.categories().firstOrNull()?.score() ?: 0f
-                )
+                    // Cross-check: does any detection with the locked label
+                    // overlap the visual tracker's box?
+                    val vtBox = vtResult.boundingBox
+                    val confirmed = tracked.any { det ->
+                        det.label == reacquisition.lockedLabel &&
+                        FrameToFrameTracker.computeIou(det.boundingBox, vtBox) > 0.15f
+                    }
+
+                    if (confirmed) {
+                        vtUnconfirmedFrames = 0
+                        // Only sync lastKnownBox when detector confirms
+                        reacquisition.updateFromVisualTracker(vtResult.boundingBox)
+
+                        // Accumulate embedding from current angle (every 30 confirmed frames ≈ 1s)
+                        vtConfirmedFrames++
+                        if (vtConfirmedFrames % 30 == 0) {
+                            val emb = appearanceEmbedder.embed(bitmap, vtResult.boundingBox)
+                            if (emb != null) {
+                                reacquisition.addEmbedding(emb)
+                                android.util.Log.d("AppearEmbed", "Gallery +1 → ${reacquisition.embeddingGallery.size} (accumulated)")
+                            }
+                        }
+                    } else {
+                        vtUnconfirmedFrames++
+                    }
+
+                    // If too many frames without detector confirmation, tracker is drifting
+                    if (vtUnconfirmedFrames > VT_MAX_UNCONFIRMED) {
+                        android.util.Log.w("VisualTracker", "DRIFT detected — $vtUnconfirmedFrames unconfirmed frames, stopping")
+                        visualTracker.stop()
+                        vtUnconfirmedFrames = 0
+                        // Fall through to detector path below
+                    } else {
+                        val lockedObj = TrackedObject(
+                            id = reacquisition.lockedId ?: -1,
+                            boundingBox = vtResult.boundingBox,
+                            label = reacquisition.lastKnownLabel,
+                            confidence = vtResult.confidence
+                        )
+                        // Include the visual tracker's box, but remove detector
+                        // boxes that overlap it to avoid duplicate rectangles.
+                        val vtBox = vtResult.boundingBox
+                        val displayObjects = filter.filter(tracked)
+                            .filter { FrameToFrameTracker.computeIou(it.boundingBox, vtBox) < 0.3f } + lockedObj
+
+                        onDetectionResult?.invoke(displayObjects, lockedObj, frameWidth, frameHeight)
+
+                        synchronized(lastFrameLock) {
+                            lastFrameBitmap?.recycle()
+                            lastFrameBitmap = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
+                        }
+                        return
+                    }
+                } else {
+                    // Visual tracker lost the object — fall through to detector
+                    visualTracker.stop()
+                    vtUnconfirmedFrames = 0
+                }
             }
 
-            // Assign stable tracking IDs via frame-to-frame IoU matching
-            val tracked = frameTracker.assignIds(rawDetections)
+            // --- Detector path: detection + re-acquisition ---
+            val detections = runDetector(bitmap, frameWidth, frameHeight)
+            val tracked = frameTracker.assignIds(detections)
+
+            // Compute embeddings when searching OR when the direct ID match might
+            // fail (framesLost==0 but tracking ID likely changed after visual tracker
+            // handoff). Without embeddings, two same-label objects are indistinguishable.
+            val needEmbeddings = reacquisition.hasEmbeddings &&
+                (reacquisition.isSearching || (reacquisition.isLocked && reacquisition.framesLost == 0))
+            val withEmbeddings = if (needEmbeddings) {
+                tracked.map { obj ->
+                    val emb = appearanceEmbedder.embed(bitmap, obj.boundingBox)
+                    if (emb != null) obj.copy(embedding = emb) else obj
+                }
+            } else tracked
+
+            // Snapshot state before processing
+            val wasSearching = reacquisition.isSearching
+            val prevLost = reacquisition.framesLost
 
             // Re-acquisition
-            val lockedObject = reacquisition.processFrame(tracked)
+            val lockedObject = reacquisition.processFrame(withEmbeddings)
+
+            // If re-acquired, re-initialize visual tracker
+            if (wasSearching && lockedObject != null && reacquisition.framesLost == 0) {
+                visualTracker.init(bitmap, lockedObject.boundingBox)
+            }
+
+            // Debug frame capture on tracking events
+            captureDebugFrame(bitmap, withEmbeddings, lockedObject, wasSearching, prevLost)
 
             // Filter for display
-            val displayObjects = filter.filter(tracked)
+            val displayObjects = filter.filter(withEmbeddings)
 
             onDetectionResult?.invoke(displayObjects, lockedObject, frameWidth, frameHeight)
+
+            // Keep a copy of the frame for embedding on tap-to-lock
+            synchronized(lastFrameLock) {
+                lastFrameBitmap?.recycle()
+                lastFrameBitmap = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
+            }
         } finally {
             imageProxy.close()
             bitmap.recycle()
         }
     }
 
+    private fun runDetector(bitmap: Bitmap, frameWidth: Int, frameHeight: Int): List<TrackedObject> {
+        val mpImage = BitmapImageBuilder(bitmap).build()
+        val result: ObjectDetectorResult = detector.detect(mpImage)
+        val deviceRot = deviceRotationProvider?.invoke() ?: 0
+
+        return result.detections().map { detection ->
+            val box = detection.boundingBox()
+            val normLeft = box.left / frameWidth.toFloat()
+            val normTop = box.top / frameHeight.toFloat()
+            val normRight = box.right / frameWidth.toFloat()
+            val normBottom = box.bottom / frameHeight.toFloat()
+
+            val screenBox = unmapRotation(normLeft, normTop, normRight, normBottom, deviceRot)
+
+            TrackedObject(
+                id = -1,
+                boundingBox = screenBox,
+                label = detection.categories().firstOrNull()?.categoryName(),
+                confidence = detection.categories().firstOrNull()?.score() ?: 0f
+            )
+        }
+    }
+
     private fun imageProxyToBitmap(imageProxy: ImageProxy): Bitmap? {
         val bitmap = imageProxy.toBitmap()
-        val rotation = imageProxy.imageInfo.rotationDegrees
+
+        // CameraX rotationDegrees assumes the display matches the activity's
+        // declared orientation (portrait). It does NOT account for the user
+        // physically holding the phone in landscape or upside down.
+        // We add the physical device rotation so the image fed to the detector
+        // is always upright relative to the real world.
+        val cameraRotation = imageProxy.imageInfo.rotationDegrees
+        val deviceRot = deviceRotationProvider?.invoke() ?: 0
+        val rotation = (cameraRotation + deviceRot) % 360
+
         if (rotation == 0) return bitmap
 
         val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
@@ -105,7 +258,94 @@ class ObjectTracker(
         return rotated
     }
 
+    private fun captureDebugFrame(
+        bitmap: Bitmap,
+        detections: List<TrackedObject>,
+        lockedObject: TrackedObject?,
+        wasSearching: Boolean,
+        prevFramesLost: Int
+    ) {
+        val nowLost = reacquisition.framesLost
+
+        when {
+            // Just re-acquired
+            wasSearching && lockedObject != null && nowLost == 0 -> {
+                debugCapture.capture(
+                    DebugEvent.REACQUIRE, bitmap, detections,
+                    lockedObject = lockedObject,
+                    extraInfo = "after $prevFramesLost frames, id=${lockedObject.id} label=${lockedObject.label}"
+                )
+            }
+            // Just lost (first frame)
+            nowLost == 1 && prevFramesLost == 0 -> {
+                debugCapture.capture(
+                    DebugEvent.LOST, bitmap, detections,
+                    lastKnownBox = reacquisition.lastKnownBox,
+                    extraInfo = "label=${reacquisition.lockedLabel}"
+                )
+            }
+            // Searching: capture every 10th frame, or whenever a same-label candidate exists
+            // but didn't match — this is the key diagnostic frame
+            wasSearching && lockedObject == null && nowLost > 0 -> {
+                val hasSameLabelCandidate = detections.any { d ->
+                    d.label != null && d.label == reacquisition.lockedLabel
+                }
+                if (hasSameLabelCandidate || nowLost % 10 == 0) {
+                    val candidateInfo = detections
+                        .filter { it.label == reacquisition.lockedLabel }
+                        .joinToString(", ") { "#${it.id} ${it.confidence.times(100).toInt()}%" }
+                    debugCapture.capture(
+                        DebugEvent.SEARCH, bitmap, detections,
+                        lastKnownBox = reacquisition.lastKnownBox,
+                        extraInfo = "frame=$nowLost match=[${candidateInfo.ifEmpty { "none" }}]"
+                    )
+                }
+            }
+            // Timed out
+            nowLost == reacquisition.maxFramesLost + 1 -> {
+                debugCapture.capture(
+                    DebugEvent.TIMEOUT, bitmap, detections,
+                    lastKnownBox = reacquisition.lastKnownBox,
+                    extraInfo = "gave up on ${reacquisition.lockedLabel}"
+                )
+            }
+        }
+    }
+
     fun shutdown() {
         detector.close()
+        appearanceEmbedder.shutdown()
+        visualTracker.stop()
+        synchronized(lastFrameLock) {
+            lastFrameBitmap?.recycle()
+            lastFrameBitmap = null
+        }
+    }
+}
+
+/**
+ * Reverse-maps normalized bounding box coordinates from the rotated
+ * detection image back to the original screen coordinate space.
+ *
+ * After rotating the bitmap by [deviceRot] degrees for detection,
+ * we apply the inverse rotation to the detected box coordinates.
+ */
+internal fun unmapRotation(
+    left: Float, top: Float, right: Float, bottom: Float, deviceRot: Int
+): RectF {
+    return when (deviceRot) {
+        0 -> RectF(left, top, right, bottom)
+        180 -> RectF(1f - right, 1f - bottom, 1f - left, 1f - top)
+        90 -> {
+            // Detection image was rotated 90° CW extra.
+            // Inverse: rotate 90° CCW → (x,y) → (y, 1-x)
+            RectF(top, 1f - right, bottom, 1f - left)
+        }
+        270 -> {
+            // Detection image was rotated 270° CW (= 90° CCW) extra.
+            // Inverse: rotate 90° CW → (x,y) → (1-y, x)
+            RectF(1f - bottom, left, 1f - top, right)
+        }
+        else -> RectF(left, top, right, bottom)
     }
 }

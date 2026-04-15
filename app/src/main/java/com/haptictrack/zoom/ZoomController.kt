@@ -21,7 +21,7 @@ class ZoomController(
         val boxWidth = boundingBox.width()
         val boxHeight = boundingBox.height()
         val boxArea = boxWidth * boxHeight
-        val targetArea = targetFrameOccupancy * targetFrameOccupancy
+        val targetArea = targetFrameOccupancy
 
         val zoomAdjustment = if (boxArea < targetArea * 0.5f) {
             // Subject too small — zoom in
@@ -49,6 +49,16 @@ class ZoomController(
         val distFromCenterX = kotlin.math.abs(centerX - 0.5f) * 2f
         val distFromCenterY = kotlin.math.abs(centerY - 0.5f) * 2f
         return maxOf(distFromCenterX, distFromCenterY).coerceIn(0f, 1f)
+    }
+
+    /**
+     * Zoom out partially when the target is lost to widen the field of view.
+     * Pulls back 45% of the way between current zoom and minZoom.
+     */
+    fun zoomOutForSearch(minZoom: Float, maxZoom: Float): Float {
+        val pullback = 0.45f
+        currentZoom = (currentZoom - (currentZoom - minZoom) * pullback).coerceIn(minZoom, maxZoom)
+        return currentZoom
     }
 
     fun reset() {
