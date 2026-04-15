@@ -108,9 +108,11 @@ class ObjectTracker(
                     val detections = runDetector(bitmap, frameWidth, frameHeight)
                     val tracked = frameTracker.assignIds(detections)
 
-                    // Cross-check: does any detection with the locked label
-                    // overlap the visual tracker's box?
-                    val vtBox = vtResult.boundingBox
+                    // VT returns coords in rotated-image space; unmap to screen space
+                    // to match detector boxes (which are already unmapped).
+                    val deviceRot = deviceRotationProvider?.invoke() ?: 0
+                    val rawBox = vtResult.boundingBox
+                    val vtBox = unmapRotation(rawBox.left, rawBox.top, rawBox.right, rawBox.bottom, deviceRot)
                     val confirmed = tracked.any { det ->
                         det.label == reacquisition.lockedLabel &&
                         FrameToFrameTracker.computeIou(det.boundingBox, vtBox) > 0.15f
@@ -118,13 +120,14 @@ class ObjectTracker(
 
                     if (confirmed) {
                         vtUnconfirmedFrames = 0
-                        // Only sync lastKnownBox when detector confirms
-                        reacquisition.updateFromVisualTracker(vtResult.boundingBox)
+                        // Sync lastKnownBox in screen coords when detector confirms
+                        reacquisition.updateFromVisualTracker(vtBox)
 
                         // Accumulate embedding from current angle (every 30 confirmed frames ≈ 1s)
+                        // Use raw rotated-image coords for embedding (embedder works on rotated bitmap)
                         vtConfirmedFrames++
                         if (vtConfirmedFrames % 30 == 0) {
-                            val emb = appearanceEmbedder.embed(bitmap, vtResult.boundingBox)
+                            val emb = appearanceEmbedder.embed(bitmap, rawBox)
                             if (emb != null) {
                                 reacquisition.addEmbedding(emb)
                                 android.util.Log.d("AppearEmbed", "Gallery +1 → ${reacquisition.embeddingGallery.size} (accumulated)")
@@ -143,13 +146,12 @@ class ObjectTracker(
                     } else {
                         val lockedObj = TrackedObject(
                             id = reacquisition.lockedId ?: -1,
-                            boundingBox = vtResult.boundingBox,
+                            boundingBox = vtBox,
                             label = reacquisition.lastKnownLabel,
                             confidence = vtResult.confidence
                         )
                         // Include the visual tracker's box, but remove detector
                         // boxes that overlap it to avoid duplicate rectangles.
-                        val vtBox = vtResult.boundingBox
                         val displayObjects = filter.filter(tracked)
                             .filter { FrameToFrameTracker.computeIou(it.boundingBox, vtBox) < 0.3f } + lockedObj
 

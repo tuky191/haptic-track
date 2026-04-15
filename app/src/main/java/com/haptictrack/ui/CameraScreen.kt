@@ -244,18 +244,14 @@ private fun BoundingBoxOverlay(state: TrackingUiState, reacquireFlash: Boolean) 
         )
 
         if (isIdle) {
-            // Idle: show subtle corner dots on all detections
+            // Idle: show thin corner brackets so user knows what's tappable
             state.detectedObjects.forEach { obj ->
-                drawCornerDots(obj.boundingBox, transform)
+                drawIdleBrackets(obj.boundingBox, transform)
             }
-        } else if (isLocked) {
-            // Locked: show only the locked object's brackets, hide everything else
-            state.detectedObjects.forEach { obj ->
-                if (obj.id == lockedId) {
-                    val color = if (reacquireFlash) HapticCyan else HapticGreen
-                    drawBrackets(obj.boundingBox, transform, color)
-                }
-            }
+        } else if (isLocked && state.trackedObject != null) {
+            // Locked: draw brackets on the single tracked object only
+            val color = if (reacquireFlash) HapticCyan else HapticGreen
+            drawBrackets(state.trackedObject.boundingBox, transform, color)
         } else if (isLost && state.trackedObject != null) {
             // Lost: pulsing dashed brackets at last known position
             drawDashedBrackets(
@@ -271,16 +267,16 @@ private fun scaledStroke(boxWidthPx: Float, boxHeightPx: Float): Float {
     return (minOf(boxWidthPx, boxHeightPx) * 0.008f).coerceIn(2f, 6f)
 }
 
-/** Map a normalized box to screen pixel coordinates. */
-private fun mapBox(
+/** Map a normalized box to screen pixel coordinates, clamped to canvas bounds. */
+private fun DrawScope.mapBox(
     box: RectF,
     transform: FillCenterTransform
 ): FloatArray {
     return floatArrayOf(
-        transform.toScreenX(box.left),
-        transform.toScreenY(box.top),
-        transform.toScreenX(box.right),
-        transform.toScreenY(box.bottom)
+        transform.toScreenX(box.left).coerceIn(0f, size.width),
+        transform.toScreenY(box.top).coerceIn(0f, size.height),
+        transform.toScreenX(box.right).coerceIn(0f, size.width),
+        transform.toScreenY(box.bottom).coerceIn(0f, size.height)
     )
 }
 
@@ -349,19 +345,17 @@ private fun DrawScope.drawBracketLines(
 }
 
 /**
- * Draw subtle corner dots for untracked detections (idle state only).
+ * Draw thin corner brackets for idle detections — shows what's tappable.
  */
-private fun DrawScope.drawCornerDots(box: RectF, transform: FillCenterTransform) {
+private fun DrawScope.drawIdleBrackets(box: RectF, transform: FillCenterTransform) {
     val (left, top, right, bottom) = mapBox(box, transform)
     val w = right - left
     val h = bottom - top
-    val radius = (minOf(w, h) * 0.012f).coerceIn(2f, 5f)
-    val color = Color.White.copy(alpha = 0.4f)
+    val cornerLen = minOf(w, h) * 0.15f
+    val stroke = scaledStroke(w, h) * 0.6f
+    val color = Color.White.copy(alpha = 0.6f)
 
-    drawCircle(color, radius, Offset(left, top))
-    drawCircle(color, radius, Offset(right, top))
-    drawCircle(color, radius, Offset(left, bottom))
-    drawCircle(color, radius, Offset(right, bottom))
+    drawBracketLines(left, top, right, bottom, cornerLen, color, stroke)
 }
 
 // ---------------------------------------------------------------------------
