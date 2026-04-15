@@ -3,7 +3,7 @@ package com.haptictrack.zoom
 import android.graphics.RectF
 
 class ZoomController(
-    private val targetFrameOccupancy: Float = 0.3f,
+    private val targetFrameOccupancy: Float = 0.15f,
     private val zoomSpeed: Float = 0.05f
 ) {
 
@@ -18,23 +18,35 @@ class ZoomController(
      * @return Target zoom ratio
      */
     fun calculateZoom(boundingBox: RectF, minZoom: Float, maxZoom: Float): Float {
-        val boxWidth = boundingBox.width()
-        val boxHeight = boundingBox.height()
-        val boxArea = boxWidth * boxHeight
+        val boxArea = boundingBox.width() * boundingBox.height()
         val targetArea = targetFrameOccupancy
 
-        val zoomAdjustment = if (boxArea < targetArea * 0.5f) {
-            // Subject too small — zoom in
-            zoomSpeed
-        } else if (boxArea > targetArea * 1.5f) {
-            // Subject too large — zoom out
-            -zoomSpeed
-        } else {
-            0f
+        // Check if the object is clipped or near the edge of the frame
+        val clipped = boundingBox.left <= CLIP_THRESHOLD || boundingBox.top <= CLIP_THRESHOLD ||
+                      boundingBox.right >= 1f - CLIP_THRESHOLD || boundingBox.bottom >= 1f - CLIP_THRESHOLD
+        val nearEdge = boundingBox.left < EDGE_MARGIN || boundingBox.top < EDGE_MARGIN ||
+                       boundingBox.right > 1f - EDGE_MARGIN || boundingBox.bottom > 1f - EDGE_MARGIN
+
+        val zoomAdjustment = when {
+            // Object is being cropped — zoom out immediately
+            clipped -> -zoomSpeed
+            // Object near edge — don't zoom in, hold steady or zoom out if too large
+            nearEdge -> if (boxArea > targetArea * 1.5f) -zoomSpeed else 0f
+            // Normal: adjust based on area
+            boxArea < targetArea * 0.5f -> zoomSpeed
+            boxArea > targetArea * 1.5f -> -zoomSpeed
+            else -> 0f
         }
 
         currentZoom = (currentZoom + zoomAdjustment).coerceIn(minZoom, maxZoom)
         return currentZoom
+    }
+
+    companion object {
+        /** Object touching frame edge — actively zoom out. */
+        private const val CLIP_THRESHOLD = 0.02f
+        /** Object near frame edge — stop zooming in. */
+        private const val EDGE_MARGIN = 0.08f
     }
 
     /**
