@@ -47,11 +47,15 @@ class VisualTracker(private val context: Context) {
 
     init {
         if (!opencvInitialized) {
-            opencvInitialized = OpenCVLoader.initLocal()
-            if (opencvInitialized) {
-                Log.i(TAG, "OpenCV initialized successfully")
-            } else {
-                Log.e(TAG, "OpenCV initialization failed")
+            synchronized(VisualTracker::class.java) {
+                if (!opencvInitialized) {
+                    opencvInitialized = OpenCVLoader.initLocal()
+                    if (opencvInitialized) {
+                        Log.i(TAG, "OpenCV initialized successfully")
+                    } else {
+                        Log.e(TAG, "OpenCV initialization failed")
+                    }
+                }
             }
         }
     }
@@ -134,6 +138,8 @@ class VisualTracker(private val context: Context) {
 
     fun stop() {
         isTracking = false
+        // TrackerNano has no explicit release/close. Setting to null lets GC
+        // finalize the native resources. We don't hold a reference longer than needed.
         tracker = null
         lastConfidence = 0f
     }

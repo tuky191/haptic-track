@@ -37,14 +37,11 @@ class ReacquisitionEngine(
     var lockedLabel: String? = null
         private set
     /** Gallery of reference embeddings — augmented at lock time, accumulated during tracking. */
-    var embeddingGallery: MutableList<FloatArray> = mutableListOf()
-        private set
+    private var _embeddingGallery: MutableList<FloatArray> = mutableListOf()
+    val embeddingGallery: List<FloatArray> get() = _embeddingGallery
 
     /** Convenience: true if we have any reference embeddings. */
-    val hasEmbeddings: Boolean get() = embeddingGallery.isNotEmpty()
-
-    @Deprecated("Use embeddingGallery", ReplaceWith("embeddingGallery.firstOrNull()"))
-    val lockedEmbedding: FloatArray? get() = embeddingGallery.firstOrNull()
+    val hasEmbeddings: Boolean get() = _embeddingGallery.isNotEmpty()
     var lastKnownBox: RectF? = null
         private set
     var lastKnownLabel: String? = null
@@ -65,7 +62,7 @@ class ReacquisitionEngine(
     fun lock(trackingId: Int, boundingBox: RectF, label: String?, embeddings: List<FloatArray>) {
         lockedId = trackingId
         lockedLabel = label
-        embeddingGallery = embeddings.map { it.copyOf() }.toMutableList()
+        _embeddingGallery = embeddings.map { it.copyOf() }.toMutableList()
         lastKnownBox = RectF(boundingBox)
         lastKnownLabel = label
         lastKnownSize = boundingBox.width() * boundingBox.height()
@@ -75,23 +72,22 @@ class ReacquisitionEngine(
 
     /** Add a new embedding to the gallery (e.g. from a confirmed visual tracker frame). */
     fun addEmbedding(embedding: FloatArray) {
-        if (embeddingGallery.size >= MAX_GALLERY_SIZE) {
+        if (_embeddingGallery.size >= MAX_GALLERY_SIZE) {
             // Keep first (lock-time augmented) and remove oldest accumulated
-            val augmentedCount = 5  // original + 3 rotations + 1 flip
-            if (embeddingGallery.size > augmentedCount) {
-                embeddingGallery.removeAt(augmentedCount)
+            if (_embeddingGallery.size > LOCK_AUGMENTATION_COUNT) {
+                _embeddingGallery.removeAt(LOCK_AUGMENTATION_COUNT)
             } else {
-                embeddingGallery.removeAt(embeddingGallery.size - 1)
+                _embeddingGallery.removeAt(_embeddingGallery.size - 1)
             }
         }
-        embeddingGallery.add(embedding.copyOf())
+        _embeddingGallery.add(embedding.copyOf())
     }
 
     fun clear() {
         Log.i(TAG, "CLEAR (was id=$lockedId label=\"$lockedLabel\")")
         lockedId = null
         lockedLabel = null
-        embeddingGallery.clear()
+        _embeddingGallery.clear()
         lastKnownBox = null
         lastKnownLabel = null
         lastKnownSize = 0f
@@ -295,15 +291,7 @@ class ReacquisitionEngine(
 
     /** Best cosine similarity between a candidate and any embedding in the gallery. */
     internal fun bestGallerySimilarity(candidateEmbedding: FloatArray): Float {
-        if (embeddingGallery.isEmpty()) return 0f
-        return embeddingGallery.maxOf { cosineSimilarity(it, candidateEmbedding) }
-    }
-
-    private fun cosineSimilarity(a: FloatArray, b: FloatArray): Float {
-        if (a.size != b.size) return 0f
-        var dot = 0f
-        for (i in a.indices) dot += a[i] * b[i]
-        return dot
+        return bestGallerySimilarity(candidateEmbedding, _embeddingGallery)
     }
 
     private fun fmtF(f: Float) = "%.3f".format(f)

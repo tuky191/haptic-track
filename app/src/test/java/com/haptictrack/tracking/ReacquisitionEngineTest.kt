@@ -151,16 +151,17 @@ class ReacquisitionEngineTest {
 
     @Test
     fun `different label can still reacquire if only candidate`() {
-        // Label is soft — a nearby different-label object can re-acquire
-        // when there's no same-label alternative
+        // Label is soft — a nearby different-label object should not be hard-rejected
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup")
 
         val detections = listOf(
             obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "laptop")
         )
-        val result = engine.processFrame(detections)
-        // Without embeddings, the score depends on position+size+label(0)
-        // May or may not pass minScoreThreshold — the point is it's not hard-rejected
+        // Lose the locked id first
+        engine.processFrame(emptyList())
+        val score = engine.scoreCandidate(detections[0], engine.lastKnownBox!!)
+        // Score may be low, but the candidate was not hard-rejected (score != null)
+        assertNotNull("Different-label candidate should not be hard-rejected", score)
     }
 
     @Test
@@ -254,9 +255,7 @@ class ReacquisitionEngineTest {
         )
 
         val result = engine.processFrame(detections)
-        // With no label match and no position match, score should be too low
-        // This depends on thresholds — the point is label should matter more now
-        // If it does match, label weight wasn't high enough
+        assertNull("Distant wrong-label object should not reacquire", result)
     }
 
     @Test
@@ -383,18 +382,18 @@ class ReacquisitionEngineTest {
     // --- Appearance embedding scoring ---
 
     @Test
-    fun `lock stores embedding`() {
+    fun `lock stores embedding in gallery`() {
         val embedding = floatArrayOf(0.1f, 0.2f, 0.3f)
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", embedding)
-        assertNotNull(engine.lockedEmbedding)
-        assertArrayEquals(embedding, engine.lockedEmbedding!!, 0.001f)
+        assertEquals(1, engine.embeddingGallery.size)
+        assertArrayEquals(embedding, engine.embeddingGallery[0], 0.001f)
     }
 
     @Test
-    fun `clear removes embedding`() {
+    fun `clear removes embeddings`() {
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", floatArrayOf(0.1f, 0.2f))
         engine.clear()
-        assertNull(engine.lockedEmbedding)
+        assertTrue(engine.embeddingGallery.isEmpty())
     }
 
     @Test
@@ -437,7 +436,7 @@ class ReacquisitionEngineTest {
     fun `scoring falls back gracefully when no embedding available`() {
         // Lock without embedding
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup")
-        assertNull(engine.lockedEmbedding)
+        assertTrue(engine.embeddingGallery.isEmpty())
 
         // Candidate without embedding — should still score via position/size/label
         val candidate = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "cup")

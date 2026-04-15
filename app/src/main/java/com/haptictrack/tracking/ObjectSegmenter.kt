@@ -53,10 +53,11 @@ class ObjectSegmenter(context: Context) {
      * The crop region matches [normalizedBox] (same as AppearanceEmbedder.cropBitmap).
      */
     fun segmentAndCrop(bitmap: Bitmap, normalizedBox: RectF): Bitmap? {
+        var convertedBitmap: Bitmap? = null
         return try {
             // Ensure ARGB_8888 for MediaPipe
             val inputBitmap = if (bitmap.config != Bitmap.Config.ARGB_8888) {
-                bitmap.copy(Bitmap.Config.ARGB_8888, false)
+                bitmap.copy(Bitmap.Config.ARGB_8888, false).also { convertedBitmap = it }
             } else bitmap
 
             val mpImage = BitmapImageBuilder(inputBitmap).build()
@@ -70,8 +71,6 @@ class ObjectSegmenter(context: Context) {
 
             val result = segmenter.segment(mpImage, roi)
 
-            if (inputBitmap !== bitmap) inputBitmap.recycle()
-
             // Try confidence masks first, fall back to category mask
             val maskPixels = extractConfidenceMask(result)
                 ?: extractCategoryMask(result)
@@ -83,38 +82,31 @@ class ObjectSegmenter(context: Context) {
 
             val maskWidth = maskPixels.first
             val maskHeight = maskPixels.second
-            val pixels = maskPixels.third
+            val mask = maskPixels.third
 
-            // Crop coordinates (same logic as AppearanceEmbedder.cropBitmap)
             val imgW = bitmap.width
             val imgH = bitmap.height
-            val left = (normalizedBox.left * imgW).toInt().coerceIn(0, imgW - 1)
-            val top = (normalizedBox.top * imgH).toInt().coerceIn(0, imgH - 1)
-            val right = (normalizedBox.right * imgW).toInt().coerceIn(left + 1, imgW)
-            val bottom = (normalizedBox.bottom * imgH).toInt().coerceIn(top + 1, imgH)
+            val coords = cropCoordinates(normalizedBox, imgW, imgH) ?: return null
+            val left = coords[0]; val top = coords[1]; val right = coords[2]; val bottom = coords[3]
             val cropW = right - left
             val cropH = bottom - top
-            if (cropW <= 0 || cropH <= 0) return null
 
-            // Create masked crop: only foreground pixels survive
-            val maskedCrop = Bitmap.createBitmap(cropW, cropH, Bitmap.Config.ARGB_8888)
+            // Bulk read source pixels
+            val srcPixels = IntArray(cropW * cropH)
+            bitmap.getPixels(srcPixels, 0, cropW, left, top, cropW, cropH)
+
+            // Apply mask in bulk
             var fgCount = 0
             val totalPixels = cropW * cropH
+            val black = Color.BLACK
             for (y in 0 until cropH) {
                 for (x in 0 until cropW) {
-                    val srcX = left + x
-                    val srcY = top + y
-
-                    // Map source pixel to mask coordinates (mask may differ from bitmap size)
-                    val maskX = (srcX.toFloat() / imgW * maskWidth).toInt().coerceIn(0, maskWidth - 1)
-                    val maskY = (srcY.toFloat() / imgH * maskHeight).toInt().coerceIn(0, maskHeight - 1)
-                    val confidence = pixels[maskY * maskWidth + maskX]
-
-                    if (confidence >= MASK_THRESHOLD) {
-                        maskedCrop.setPixel(x, y, bitmap.getPixel(srcX, srcY))
+                    val maskX = ((left + x).toFloat() / imgW * maskWidth).toInt().coerceIn(0, maskWidth - 1)
+                    val maskY = ((top + y).toFloat() / imgH * maskHeight).toInt().coerceIn(0, maskHeight - 1)
+                    if (mask[maskY * maskWidth + maskX] >= MASK_THRESHOLD) {
                         fgCount++
                     } else {
-                        maskedCrop.setPixel(x, y, Color.BLACK)
+                        srcPixels[y * cropW + x] = black
                     }
                 }
             }
@@ -122,17 +114,20 @@ class ObjectSegmenter(context: Context) {
             val fgPct = if (totalPixels > 0) fgCount * 100 / totalPixels else 0
             Log.d(TAG, "Mask: ${fgCount}/${totalPixels} fg pixels (${fgPct}%) maskSize=${maskWidth}x${maskHeight} crop=${cropW}x${cropH}")
 
-            // If mask is nearly empty or nearly full, it's not useful — return null to fall back to raw crop
             if (fgPct < 5 || fgPct > 95) {
                 Log.d(TAG, "Mask not useful (${fgPct}%), falling back to raw crop")
-                maskedCrop.recycle()
                 return null
             }
 
+            // Bulk write masked pixels
+            val maskedCrop = Bitmap.createBitmap(cropW, cropH, Bitmap.Config.ARGB_8888)
+            maskedCrop.setPixels(srcPixels, 0, cropW, 0, 0, cropW, cropH)
             maskedCrop
         } catch (e: Exception) {
             Log.w(TAG, "Segmentation failed: ${e.message}")
             null
+        } finally {
+            convertedBitmap?.recycle()
         }
     }
 

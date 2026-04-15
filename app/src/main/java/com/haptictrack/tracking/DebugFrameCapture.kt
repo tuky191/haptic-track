@@ -5,9 +5,8 @@ import android.graphics.*
 import android.util.Log
 import java.io.File
 import java.io.FileOutputStream
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
+import java.time.LocalTime
+import java.time.format.DateTimeFormatter
 
 /**
  * Saves camera frames with bounding box overlays on tracking events.
@@ -29,7 +28,7 @@ class DebugFrameCapture(context: Context) {
         File(it, DIR_NAME).apply { mkdirs() }
     }
 
-    private val dateFormat = SimpleDateFormat("HHmmss_SSS", Locale.US)
+    private val dateFormat = DateTimeFormatter.ofPattern("HHmmss_SSS")
 
     private val lockedPaint = Paint().apply {
         color = Color.GREEN
@@ -66,6 +65,18 @@ class DebugFrameCapture(context: Context) {
     private val labelBgPaint = Paint().apply {
         color = Color.BLACK
         alpha = 160
+    }
+
+    private val bannerBgPaint = Paint().apply {
+        color = Color.BLACK
+        alpha = 200
+    }
+
+    private val bannerTextPaint = Paint().apply {
+        color = Color.YELLOW
+        textSize = 36f
+        isAntiAlias = true
+        typeface = Typeface.DEFAULT_BOLD
     }
 
     /**
@@ -115,7 +126,7 @@ class DebugFrameCapture(context: Context) {
         drawEventBanner(canvas, eventLabel, w)
 
         // Save
-        val timestamp = dateFormat.format(Date())
+        val timestamp = LocalTime.now().format(dateFormat)
         val filename = "${timestamp}_${event}.png"
         val file = File(dir, filename)
 
@@ -165,21 +176,10 @@ class DebugFrameCapture(context: Context) {
     }
 
     private fun drawEventBanner(canvas: Canvas, text: String, frameWidth: Float) {
-        val bannerPaint = Paint().apply {
-            color = Color.BLACK
-            alpha = 200
-        }
-        val textPaint = Paint().apply {
-            color = Color.YELLOW
-            textSize = 36f
-            isAntiAlias = true
-            typeface = Typeface.DEFAULT_BOLD
-        }
-
         val textBounds = Rect()
-        textPaint.getTextBounds(text, 0, text.length, textBounds)
-        canvas.drawRect(0f, 0f, frameWidth, textBounds.height() + 24f, bannerPaint)
-        canvas.drawText(text, 12f, textBounds.height() + 8f, textPaint)
+        bannerTextPaint.getTextBounds(text, 0, text.length, textBounds)
+        canvas.drawRect(0f, 0f, frameWidth, textBounds.height() + 24f, bannerBgPaint)
+        canvas.drawText(text, 12f, textBounds.height() + 8f, bannerTextPaint)
     }
 
     private fun pruneOldFiles(dir: File) {

@@ -60,28 +60,19 @@ class ObjectTracker(
      * the visual embedding for identity-aware re-acquisition.
      */
     fun lockOnObject(trackingId: Int, boundingBox: RectF, label: String?) {
-        // Generate augmented embeddings at lock time for multi-angle coverage
-        val embeddings = synchronized(lastFrameLock) {
-            lastFrameBitmap?.let { bmp ->
-                appearanceEmbedder.embedWithAugmentations(bmp, boundingBox)
-            } ?: emptyList()
-        }
-        reacquisition.lock(trackingId, boundingBox, label, embeddings)
-
-        // Initialize visual tracker on the locked region
         synchronized(lastFrameLock) {
-            lastFrameBitmap?.let { bmp ->
-                visualTracker.init(bmp, boundingBox)
+            val bmp = lastFrameBitmap ?: run {
+                reacquisition.lock(trackingId, boundingBox, label, emptyList())
+                return
             }
-        }
 
-        // Capture debug frame on lock
-        synchronized(lastFrameLock) {
-            lastFrameBitmap?.let { bmp ->
-                val locked = TrackedObject(trackingId, boundingBox, label)
-                debugCapture.capture("LOCK", bmp, listOf(locked), lockedObject = locked,
-                    extraInfo = "id=$trackingId label=$label gallery=${embeddings.size}")
-            }
+            val embeddings = appearanceEmbedder.embedWithAugmentations(bmp, boundingBox)
+            reacquisition.lock(trackingId, boundingBox, label, embeddings)
+            visualTracker.init(bmp, boundingBox)
+
+            val locked = TrackedObject(trackingId, boundingBox, label)
+            debugCapture.capture("LOCK", bmp, listOf(locked), lockedObject = locked,
+                extraInfo = "id=$trackingId label=$label gallery=${embeddings.size}")
         }
     }
 

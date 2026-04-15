@@ -53,7 +53,7 @@ class ZoomController(
 
     /**
      * Zoom out partially when the target is lost to widen the field of view.
-     * Pulls back 30% of the way between current zoom and minZoom.
+     * Pulls back 45% of the way between current zoom and minZoom.
      */
     fun zoomOutForSearch(minZoom: Float, maxZoom: Float): Float {
         val pullback = 0.45f
