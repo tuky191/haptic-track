@@ -6,7 +6,7 @@ Hands-free camera tracking Android app. Uses on-device object detection + haptic
 
 ```bash
 ./gradlew assembleDebug          # Build debug APK
-./gradlew testDebugUnitTest      # Run unit tests (~3s, 88 tests)
+./gradlew testDebugUnitTest      # Run unit tests (~3s, 91 tests)
 adb install -r app/build/outputs/apk/debug/app-debug.apk  # Deploy to device
 
 adb logcat -d -s "Reacq" -s "VisualTracker" -s "FTFTracker"  # Pull tracking logs
@@ -65,11 +65,14 @@ CameraViewModel
 ### Two-tier tracking: VisualTracker + Detector (decided 2026-04-13)
 TrackerNano (OpenCV) follows the locked object by pixel correlation — no classifier needed, very stable frame-to-frame. But it drifts when the object leaves frame. The detector + embedding pipeline handles re-acquisition. The visual tracker is cross-checked against the detector every frame; 10 consecutive unconfirmed frames triggers drift detection and handoff to re-acquisition.
 
-### Visual embedding for identity (decided 2026-04-13)
-At lock time, `AppearanceEmbedder` (MobileNetV3 via MediaPipe Image Embedder) computes a 1024-dim feature vector of the locked object's crop. During re-acquisition, candidates are scored by cosine similarity. This distinguishes "which cup" vs "a cup" — two red apples score 0.30 similarity, same apple across angles scores 0.71-0.95.
+### Embedding gallery: augmented + accumulated (decided 2026-04-14)
+At lock time, `AppearanceEmbedder` generates 5 embeddings (original + rotated 90°/180°/270° + horizontal flip) for immediate multi-angle coverage. During confirmed visual tracking, a new real-world embedding is captured every ~1s. Gallery holds up to 12 embeddings. Re-acquisition compares candidates against the best match in the gallery. This handles viewpoint changes (phone rotation, walking around the object).
 
 ### Appearance override of geometric filters (decided 2026-04-13)
-When embedding similarity > 0.4, position and size hard thresholds are bypassed. This handles phone rotation (tiny edge-of-frame lock → large centered detection after flip = 12x size ratio) and camera movement (object reappears at completely different screen position).
+When embedding similarity > 0.5, position and size hard thresholds are bypassed. This handles phone rotation (tiny edge-of-frame lock → large centered detection after flip = 12x size ratio) and camera movement (object reappears at completely different screen position).
+
+### Label is a scoring factor, not a gate (decided 2026-04-14)
+EfficientDet-Lite0 labels flicker across frames (bowl↔potted plant↔toilet for the same object). A hard label filter caused more harm than good — blocking correct re-acquisition when the detector misclassified. Label is now a 20% weight in scoring. Wrong label loses points but doesn't block. The embedding handles identity; the label is a bonus.
 
 ### Confirmed-only position sync (decided 2026-04-13)
 `lastKnownBox` only updates from visual tracker when the detector confirms the tracked position. Prevents drifted tracker coordinates from poisoning the re-acquisition search area.
@@ -125,11 +128,11 @@ Auto-prunes to 200 files max.
 
 ## Test Suite
 
-88 unit tests, all run via Robolectric (no device needed):
+91 unit tests, all run via Robolectric (no device needed):
 
 | Class | Tests | What it covers |
 |---|---|---|
-| `ReacquisitionEngineTest` | 42 | Lock/clear, direct match, re-acquisition scoring, position decay, label hard filter, size threshold decay, timeout, frame counters, appearance embedding (store/clear, similarity scoring, same-label discrimination, fallback without embeddings, weight after decay), appearance override of geometric filters (size, position, weak embedding), two-truck discrimination, visual tracker handoff |
+| `ReacquisitionEngineTest` | 45 | Lock/clear, direct match, re-acquisition scoring, position decay, label as soft scoring factor, size threshold decay, timeout, frame counters, appearance embedding (store/clear, similarity scoring, same-label discrimination, fallback without embeddings, weight after decay), appearance override of geometric filters (size, position, weak embedding), two-truck discrimination, visual tracker handoff, label flicker (strong/weak embedding with mislabeled objects) |
 | `DetectionFilterTest` | 15 | Confidence cutoff, label requirement, box area limits, aspect ratio limits, negative IDs, edge cases |
 | `FrameToFrameTrackerTest` | 10 | IoU computation, ID assignment, persistence across frames, new object detection, disappearance, reset |
 | `RotationRemapTest` | 11 | Coordinate remapping for all orientations (0°, 90°, 180°, 270°), center invariance, round-trip correctness |
@@ -178,11 +181,12 @@ All in constructor defaults — no settings UI yet:
 
 | Parameter | Location | Default | Purpose |
 |---|---|---|---|
-| `maxFramesLost` | ReacquisitionEngine | 90 | Frames before giving up (~3s at 30fps) |
+| `maxFramesLost` | ReacquisitionEngine | 450 | Frames before giving up (~15s at 30fps) |
 | `positionDecayFrames` | ReacquisitionEngine | 30 | Frames for position weight to reach zero |
 | `sizeRatioThreshold` | ReacquisitionEngine | 2.0 | Initial max size difference for candidates |
 | `minScoreThreshold` | ReacquisitionEngine | 0.35 | Minimum score to accept a candidate |
-| `APPEARANCE_OVERRIDE_THRESHOLD` | ReacquisitionEngine | 0.4 | Embedding similarity to bypass geometric filters |
+| `APPEARANCE_OVERRIDE_THRESHOLD` | ReacquisitionEngine | 0.5 | Embedding similarity to bypass geometric filters |
+| `MAX_GALLERY_SIZE` | ReacquisitionEngine | 12 | Maximum embeddings in the reference gallery |
 | `minConfidence` | DetectionFilter | 0.5 | Minimum ML confidence to show detection |
 | `minIou` | FrameToFrameTracker | 0.2 | Minimum IoU to match across frames |
 | `MIN_CONFIDENCE` | VisualTracker | 0.5 | TrackerNano confidence floor |
@@ -218,9 +222,10 @@ All in constructor defaults — no settings UI yet:
 - [ ] **iOS port** — Swift + AVFoundation + Vision framework + Core Haptics. Architecture transfers, APIs don't.
 
 ### Known issues
-- EfficientDet-Lite0 uses COCO categories (80 classes) — misclassifies unfamiliar objects to nearest match
+- EfficientDet-Lite0 uses COCO categories (80 classes) — misclassifies unfamiliar objects to nearest match. Labels flicker (bowl↔potted plant↔toilet). Mitigated by soft label scoring + embedding identity.
 - Visual tracker drift detection takes ~0.3s (10 frames) — brief green flash on wrong area before correction
-- Frequent brief LOST→REACQUIRE cycles when detector flickers between frames (mitigated but not eliminated by visual tracker)
+- Visually similar objects (bottle/vase) can confuse the embedder at sim ~0.5. Raising override threshold helps but doesn't eliminate.
+- Cross-angle re-acquisition weakened when the object looks very different from lock angle (top-down bowl vs side view). Gallery augmentation helps but synthetic rotation ≠ real 3D viewpoint change. Accumulated embeddings during tracking fill this gap over time.
 - OpenCV adds ~10MB to APK (arm64). Could be replaced with pure Kotlin correlation tracker to reduce size.
 
 ## Device Testing
