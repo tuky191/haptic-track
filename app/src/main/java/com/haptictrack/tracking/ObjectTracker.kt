@@ -38,8 +38,14 @@ class ObjectTracker(
     private var vtConfirmedFrames = 0
     private val VT_MAX_UNCONFIRMED = 10  // ~0.3s at 30fps
 
-    /** Callback: (displayObjects, lockedObject, imageWidth, imageHeight) */
-    var onDetectionResult: ((List<TrackedObject>, TrackedObject?, Int, Int) -> Unit)? = null
+    /** Callback: (displayObjects, lockedObject, imageWidth, imageHeight, contour) */
+    var onDetectionResult: ((List<TrackedObject>, TrackedObject?, Int, Int, List<android.graphics.PointF>) -> Unit)? = null
+
+    // Contour cache — updated every N frames to avoid running segmenter per-frame
+    private var cachedContour: List<android.graphics.PointF> = emptyList()
+    private var contourFrameCount = 0
+    private val CONTOUR_UPDATE_INTERVAL_VT = 2   // every 2nd frame during VT (~15fps contour)
+    private val CONTOUR_UPDATE_INTERVAL_DET = 3  // every 3rd frame on detector path (~10fps contour)
 
     init {
         val baseOptions = BaseOptions.builder()
@@ -81,6 +87,8 @@ class ObjectTracker(
         visualTracker.stop()
         vtUnconfirmedFrames = 0
         vtConfirmedFrames = 0
+        cachedContour = emptyList()
+        contourFrameCount = 0
     }
 
     val analyzer = ImageAnalysis.Analyzer { imageProxy ->
@@ -155,7 +163,16 @@ class ObjectTracker(
                         val displayObjects = filter.filter(tracked)
                             .filter { FrameToFrameTracker.computeIou(it.boundingBox, vtBox) < 0.3f } + lockedObj
 
-                        onDetectionResult?.invoke(displayObjects, lockedObj, frameWidth, frameHeight)
+                        // Update contour periodically, unmap from rotated to screen coords
+                        contourFrameCount++
+                        if (contourFrameCount % CONTOUR_UPDATE_INTERVAL_VT == 0) {
+                            cachedContour = unmapContour(
+                                appearanceEmbedder.extractContour(bitmap, rawBox),
+                                deviceRot
+                            )
+                        }
+
+                        onDetectionResult?.invoke(displayObjects, lockedObj, frameWidth, frameHeight, cachedContour)
 
                         synchronized(lastFrameLock) {
                             lastFrameBitmap?.recycle()
@@ -211,7 +228,25 @@ class ObjectTracker(
             // Filter for display
             val displayObjects = filter.filter(withEmbeddings)
 
-            onDetectionResult?.invoke(displayObjects, lockedObject, frameWidth, frameHeight)
+            // Update contour on re-acquire or periodically
+            val deviceRot = deviceRotationProvider?.invoke() ?: 0
+            if (lockedObject != null && reacquisition.framesLost == 0) {
+                contourFrameCount++
+                if (contourFrameCount % CONTOUR_UPDATE_INTERVAL_DET == 0 || (wasSearching && reacquisition.framesLost == 0)) {
+                    // lockedObject.boundingBox is in screen space; remap to rotated bitmap space for segmenter
+                    val screenBox = lockedObject.boundingBox
+                    val rotatedBox = mapToRotated(screenBox.left, screenBox.top, screenBox.right, screenBox.bottom, deviceRot)
+                    cachedContour = unmapContour(
+                        appearanceEmbedder.extractContour(bitmap, rotatedBox),
+                        deviceRot
+                    )
+                }
+            } else if (!reacquisition.isLocked) {
+                cachedContour = emptyList()
+                contourFrameCount = 0
+            }
+
+            onDetectionResult?.invoke(displayObjects, lockedObject, frameWidth, frameHeight, cachedContour)
         } finally {
             imageProxy.close()
             bitmap.recycle()
@@ -351,4 +386,51 @@ internal fun unmapRotation(
         }
         else -> RectF(left, top, right, bottom)
     }
+}
+
+/**
+ * Forward-maps screen coordinates to rotated-image space (inverse of unmapRotation).
+ * Used to convert screen-space bounding boxes back to the rotated bitmap's coordinate system.
+ */
+internal fun mapToRotated(
+    left: Float, top: Float, right: Float, bottom: Float, deviceRot: Int
+): RectF {
+    // The forward map is the inverse of the unmap.
+    // unmapRotation undoes the rotation, so mapToRotated re-applies it.
+    return when (deviceRot) {
+        0 -> RectF(left, top, right, bottom)
+        180 -> RectF(1f - right, 1f - bottom, 1f - left, 1f - top)
+        90 -> {
+            // Inverse of unmap 90°: (x,y) → (1-y, x)
+            RectF(1f - bottom, left, 1f - top, right)
+        }
+        270 -> {
+            // Inverse of unmap 270°: (x,y) → (y, 1-x)
+            RectF(top, 1f - right, bottom, 1f - left)
+        }
+        else -> RectF(left, top, right, bottom)
+    }
+}
+
+/**
+ * Unmap a single normalized point from rotated-image space to screen space.
+ */
+internal fun unmapPoint(x: Float, y: Float, deviceRot: Int): android.graphics.PointF {
+    return when (deviceRot) {
+        0 -> android.graphics.PointF(x, y)
+        180 -> android.graphics.PointF(1f - x, 1f - y)
+        90 -> android.graphics.PointF(y, 1f - x)      // inverse of 90° CW
+        270 -> android.graphics.PointF(1f - y, x)      // inverse of 270° CW
+        else -> android.graphics.PointF(x, y)
+    }
+}
+
+/**
+ * Apply unmapRotation to each contour point (normalized [0,1] coords).
+ */
+internal fun unmapContour(
+    contour: List<android.graphics.PointF>, deviceRot: Int
+): List<android.graphics.PointF> {
+    if (deviceRot == 0 || contour.isEmpty()) return contour
+    return contour.map { pt -> unmapPoint(pt.x, pt.y, deviceRot) }
 }

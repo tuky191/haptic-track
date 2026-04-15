@@ -45,7 +45,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             objectTracker.analyzer
         )
 
-        objectTracker.onDetectionResult = { allObjects, lockedObject, imgWidth, imgHeight ->
+        objectTracker.onDetectionResult = { allObjects, lockedObject, imgWidth, imgHeight, contour ->
             val previousStatus = _uiState.value.status
 
             val status = when {
@@ -90,7 +90,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     detectedObjects = displayObjects,
                     sourceImageWidth = imgWidth,
                     sourceImageHeight = imgHeight,
-                    currentZoomRatio = targetZoom ?: current.currentZoomRatio
+                    currentZoomRatio = targetZoom ?: current.currentZoomRatio,
+                    lockedContour = if (status == TrackingStatus.LOCKED) contour else
+                        if (status == TrackingStatus.LOST) current.lockedContour else emptyList()
                 )
             }
         }

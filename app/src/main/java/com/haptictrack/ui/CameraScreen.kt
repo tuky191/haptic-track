@@ -3,11 +3,10 @@ package com.haptictrack.ui
 import android.graphics.RectF
 import android.view.MotionEvent
 import androidx.camera.view.PreviewView
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -34,8 +33,17 @@ import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.asAndroidPath
 import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.scale
+import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInteropFilter
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -132,18 +140,65 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
             viewModel.startCamera(lifecycleOwner, previewView)
         }
 
-        // Track re-acquire flash: cyan for 500ms after re-acquisition
-        var reacquireFlash by remember { mutableStateOf(false) }
+        // --- Animations ---
+
+        // Lock pulse: scale 0.92 → 1.0 on lock/re-acquire
+        val lockPulse = remember { Animatable(1f) }
         var previousStatus by remember { mutableStateOf(TrackingStatus.IDLE) }
+        var previousLockedId by remember { mutableStateOf<Int?>(null) }
+
+        // Re-acquire flash color blend (0 = green, 1 = cyan)
+        var reacquireBrightness by remember { mutableStateOf(0f) }
+        val reacquireColorBlend by animateFloatAsState(
+            targetValue = reacquireBrightness,
+            animationSpec = tween(300, easing = FastOutSlowInEasing),
+            label = "reacquireColor"
+        )
+
+        // Lost fade-out: opacity decays from 1.0 → 0.0 over 2s
+        val lostOpacity by animateFloatAsState(
+            targetValue = if (uiState.status == TrackingStatus.LOST) 0f else 1f,
+            animationSpec = tween(
+                durationMillis = if (uiState.status == TrackingStatus.LOST) 2000 else 0,
+                easing = LinearEasing
+            ),
+            label = "lostFade"
+        )
+
+        // Bracket opacity: smooth transition between states
+        val bracketOpacity by animateFloatAsState(
+            targetValue = when (uiState.status) {
+                TrackingStatus.LOCKED -> 1f
+                TrackingStatus.LOST -> lostOpacity
+                TrackingStatus.IDLE -> 1f
+                TrackingStatus.SEARCHING -> 0f
+            },
+            animationSpec = tween(200, easing = FastOutSlowInEasing),
+            label = "bracketOpacity"
+        )
 
         LaunchedEffect(uiState.status, uiState.trackedObject?.id) {
-            if (uiState.status == TrackingStatus.LOCKED &&
-                (previousStatus == TrackingStatus.LOST || previousStatus == TrackingStatus.SEARCHING)) {
-                reacquireFlash = true
-                delay(500)
-                reacquireFlash = false
+            val currentId = uiState.trackedObject?.id
+            val justLocked = uiState.status == TrackingStatus.LOCKED && previousStatus == TrackingStatus.IDLE
+            val justReacquired = uiState.status == TrackingStatus.LOCKED &&
+                (previousStatus == TrackingStatus.LOST || previousStatus == TrackingStatus.SEARCHING)
+            val idChanged = currentId != null && currentId != previousLockedId && uiState.status == TrackingStatus.LOCKED
+
+            if (justLocked || justReacquired || idChanged) {
+                // Lock pulse: scale down then back
+                lockPulse.snapTo(0.92f)
+                lockPulse.animateTo(1f, tween(200, easing = FastOutSlowInEasing))
             }
+
+            if (justReacquired) {
+                // Cyan flash → green
+                reacquireBrightness = 1f
+                delay(300)
+                reacquireBrightness = 0f
+            }
+
             previousStatus = uiState.status
+            previousLockedId = currentId
         }
 
         Box(modifier = Modifier.fillMaxSize()) {
@@ -168,10 +223,16 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                     }
             )
 
-            // Bounding box overlay
-            BoundingBoxOverlay(uiState, reacquireFlash)
+            // Bounding box / contour overlay
+            TrackingOverlay(
+                state = uiState,
+                bracketOpacity = bracketOpacity,
+                lockScale = lockPulse.value,
+                reacquireColorBlend = reacquireColorBlend,
+                lostOpacity = lostOpacity
+            )
 
-            // Label overlay (locked object only)
+            // Label overlay (locked object only — kept for testing, remove later)
             LockedLabelOverlay(uiState)
 
             // Status indicator
@@ -219,23 +280,17 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
 // ---------------------------------------------------------------------------
 
 @Composable
-private fun BoundingBoxOverlay(state: TrackingUiState, reacquireFlash: Boolean) {
-    val lockedId = state.trackedObject?.id
+private fun TrackingOverlay(
+    state: TrackingUiState,
+    bracketOpacity: Float,
+    lockScale: Float,
+    reacquireColorBlend: Float,
+    lostOpacity: Float
+) {
     val isLocked = state.status == TrackingStatus.LOCKED
     val isLost = state.status == TrackingStatus.LOST
     val isIdle = state.status == TrackingStatus.IDLE
-
-    // Pulsing alpha for lost/searching state
-    val pulseTransition = rememberInfiniteTransition(label = "lostPulse")
-    val pulseAlpha by pulseTransition.animateFloat(
-        initialValue = 0.3f,
-        targetValue = 0.8f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(800, easing = LinearEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "pulseAlpha"
-    )
+    val hasContour = state.lockedContour.size >= 3
 
     Canvas(modifier = Modifier.fillMaxSize()) {
         val transform = computeFillCenterTransform(
@@ -244,22 +299,128 @@ private fun BoundingBoxOverlay(state: TrackingUiState, reacquireFlash: Boolean) 
         )
 
         if (isIdle) {
-            // Idle: show thin corner brackets so user knows what's tappable
             state.detectedObjects.forEach { obj ->
-                drawIdleBrackets(obj.boundingBox, transform)
+                drawIdleBrackets(obj.boundingBox, transform, bracketOpacity)
             }
         } else if (isLocked && state.trackedObject != null) {
-            // Locked: draw brackets on the single tracked object only
-            val color = if (reacquireFlash) HapticCyan else HapticGreen
-            drawBrackets(state.trackedObject.boundingBox, transform, color)
-        } else if (isLost && state.trackedObject != null) {
-            // Lost: pulsing dashed brackets at last known position
-            drawDashedBrackets(
-                state.trackedObject.boundingBox, transform,
-                HapticRed.copy(alpha = pulseAlpha)
-            )
+            val color = lerp(HapticGreen, HapticCyan, reacquireColorBlend)
+                .copy(alpha = bracketOpacity)
+
+            val box = state.trackedObject.boundingBox
+            val (left, top, right, bottom) = mapBox(box, transform)
+            val cx = (left + right) / 2f
+            val cy = (top + bottom) / 2f
+
+            scale(lockScale, pivot = Offset(cx, cy)) {
+                drawRoundedGlow(left, top, right, bottom, color)
+            }
+        } else if (isLost && state.trackedObject != null && lostOpacity > 0.01f) {
+            val color = HapticRed.copy(alpha = lostOpacity * 0.7f)
+            val (ll, lt, lr, lb) = mapBox(state.trackedObject.boundingBox, transform)
+            drawRoundedGlow(ll, lt, lr, lb, color)
         }
     }
+}
+
+/**
+ * Draw a soft glowing rounded rectangle — backlight effect around the object.
+ * Uses OUTER blur so the interior stays clear and only the edges radiate light.
+ */
+private fun DrawScope.drawRoundedGlow(
+    left: Float, top: Float, right: Float, bottom: Float,
+    color: Color
+) {
+    val nativeCanvas = drawContext.canvas.nativeCanvas
+    val w = right - left
+    val h = bottom - top
+    val cornerRadius = minOf(w, h) * 0.25f  // nicely rounded corners
+    val rect = android.graphics.RectF(left, top, right, bottom)
+
+    val glowPaint = android.graphics.Paint().apply {
+        style = android.graphics.Paint.Style.STROKE
+        isAntiAlias = true
+    }
+
+    // Thick strokes with heavy NORMAL blur — the stroke itself dissolves into
+    // a soft glow on both sides of the edge. No fill = interior stays clear.
+    glowPaint.strokeWidth = 30f
+    glowPaint.color = color.copy(alpha = color.alpha * 0.20f).toArgb()
+    glowPaint.maskFilter = android.graphics.BlurMaskFilter(40f, android.graphics.BlurMaskFilter.Blur.NORMAL)
+    nativeCanvas.drawRoundRect(rect, cornerRadius, cornerRadius, glowPaint)
+
+    glowPaint.strokeWidth = 15f
+    glowPaint.color = color.copy(alpha = color.alpha * 0.30f).toArgb()
+    glowPaint.maskFilter = android.graphics.BlurMaskFilter(20f, android.graphics.BlurMaskFilter.Blur.NORMAL)
+    nativeCanvas.drawRoundRect(rect, cornerRadius, cornerRadius, glowPaint)
+}
+
+/**
+ * Draw a soft neon glow contour following the object's silhouette.
+ * Multiple passes at increasing widths with decreasing opacity for a diffused glow.
+ */
+private fun DrawScope.drawContourGlow(
+    contour: List<android.graphics.PointF>,
+    transform: FillCenterTransform,
+    color: Color
+) {
+    if (contour.size < 3) return
+
+    // Convert to screen coordinates
+    val pts = contour.map { pt ->
+        Offset(
+            transform.toScreenX(pt.x).coerceIn(0f, size.width),
+            transform.toScreenY(pt.y).coerceIn(0f, size.height)
+        )
+    }
+
+    // Build a smooth closed path using Catmull-Rom → cubic bezier conversion
+    val path = Path()
+    path.moveTo(pts[0].x, pts[0].y)
+
+    val n = pts.size
+    for (i in 0 until n) {
+        val p0 = pts[(i - 1 + n) % n]
+        val p1 = pts[i]
+        val p2 = pts[(i + 1) % n]
+        val p3 = pts[(i + 2) % n]
+
+        // Catmull-Rom to cubic bezier control points
+        val cp1x = p1.x + (p2.x - p0.x) / 6f
+        val cp1y = p1.y + (p2.y - p0.y) / 6f
+        val cp2x = p2.x - (p3.x - p1.x) / 6f
+        val cp2y = p2.y - (p3.y - p1.y) / 6f
+
+        path.cubicTo(cp1x, cp1y, cp2x, cp2y, p2.x, p2.y)
+    }
+    path.close()
+
+    val androidPath = path.asAndroidPath()
+    val nativeCanvas = drawContext.canvas.nativeCanvas
+
+    // Backlight glow — blurred filled shape creates a soft halo behind/around the object.
+    // Multiple passes at decreasing alpha give a natural light falloff.
+    val glowPaint = android.graphics.Paint().apply {
+        style = android.graphics.Paint.Style.FILL_AND_STROKE
+        strokeWidth = 2f
+        isAntiAlias = true
+        strokeCap = android.graphics.Paint.Cap.ROUND
+        strokeJoin = android.graphics.Paint.Join.ROUND
+    }
+
+    // Outer halo — large blur, low alpha, spreads wide
+    glowPaint.color = color.copy(alpha = color.alpha * 0.12f).toArgb()
+    glowPaint.maskFilter = android.graphics.BlurMaskFilter(50f, android.graphics.BlurMaskFilter.Blur.OUTER)
+    nativeCanvas.drawPath(androidPath, glowPaint)
+
+    // Mid halo
+    glowPaint.color = color.copy(alpha = color.alpha * 0.18f).toArgb()
+    glowPaint.maskFilter = android.graphics.BlurMaskFilter(25f, android.graphics.BlurMaskFilter.Blur.OUTER)
+    nativeCanvas.drawPath(androidPath, glowPaint)
+
+    // Tight glow around the edge
+    glowPaint.color = color.copy(alpha = color.alpha * 0.30f).toArgb()
+    glowPaint.maskFilter = android.graphics.BlurMaskFilter(10f, android.graphics.BlurMaskFilter.Blur.OUTER)
+    nativeCanvas.drawPath(androidPath, glowPaint)
 }
 
 /** Compute stroke width that scales with box size, clamped to [2, 6] px. */
@@ -281,6 +442,27 @@ private fun DrawScope.mapBox(
 }
 
 /**
+ * Draw brackets from pre-computed screen coordinates with shadow.
+ */
+private fun DrawScope.drawBracketsRaw(
+    left: Float, top: Float, right: Float, bottom: Float,
+    color: Color
+) {
+    val w = right - left
+    val h = bottom - top
+    val cornerLen = minOf(w, h) * 0.2f
+    val stroke = scaledStroke(w, h)
+
+    // Shadow pass
+    val shadow = Color.Black.copy(alpha = color.alpha * 0.4f)
+    val so = 1.5f
+    drawBracketLines(left + so, top + so, right + so, bottom + so, cornerLen, shadow, stroke)
+
+    // Color pass
+    drawBracketLines(left, top, right, bottom, cornerLen, color, stroke)
+}
+
+/**
  * Draw camera-viewfinder-style corner brackets with shadow.
  */
 private fun DrawScope.drawBrackets(
@@ -289,23 +471,11 @@ private fun DrawScope.drawBrackets(
     color: Color
 ) {
     val (left, top, right, bottom) = mapBox(box, transform)
-    val w = right - left
-    val h = bottom - top
-    val cornerLen = minOf(w, h) * 0.2f
-    val stroke = scaledStroke(w, h)
-
-    // Shadow pass
-    val shadow = Color.Black.copy(alpha = 0.4f)
-    val shadowOffset = 1.5f
-    drawBracketLines(left + shadowOffset, top + shadowOffset, right + shadowOffset, bottom + shadowOffset,
-        cornerLen, shadow, stroke)
-
-    // Color pass
-    drawBracketLines(left, top, right, bottom, cornerLen, color, stroke)
+    drawBracketsRaw(left, top, right, bottom, color)
 }
 
 /**
- * Draw dashed corner brackets (for lost/searching state).
+ * Draw dashed corner brackets (for lost state — fading out).
  */
 private fun DrawScope.drawDashedBrackets(
     box: RectF,
@@ -330,16 +500,12 @@ private fun DrawScope.drawBracketLines(
     cornerLen: Float, color: Color, strokeWidth: Float,
     pathEffect: PathEffect? = null
 ) {
-    // Top-left
     drawLine(color, Offset(left, top), Offset(left + cornerLen, top), strokeWidth, pathEffect = pathEffect)
     drawLine(color, Offset(left, top), Offset(left, top + cornerLen), strokeWidth, pathEffect = pathEffect)
-    // Top-right
     drawLine(color, Offset(right, top), Offset(right - cornerLen, top), strokeWidth, pathEffect = pathEffect)
     drawLine(color, Offset(right, top), Offset(right, top + cornerLen), strokeWidth, pathEffect = pathEffect)
-    // Bottom-left
     drawLine(color, Offset(left, bottom), Offset(left + cornerLen, bottom), strokeWidth, pathEffect = pathEffect)
     drawLine(color, Offset(left, bottom), Offset(left, bottom - cornerLen), strokeWidth, pathEffect = pathEffect)
-    // Bottom-right
     drawLine(color, Offset(right, bottom), Offset(right - cornerLen, bottom), strokeWidth, pathEffect = pathEffect)
     drawLine(color, Offset(right, bottom), Offset(right, bottom - cornerLen), strokeWidth, pathEffect = pathEffect)
 }
@@ -347,19 +513,19 @@ private fun DrawScope.drawBracketLines(
 /**
  * Draw thin corner brackets for idle detections — shows what's tappable.
  */
-private fun DrawScope.drawIdleBrackets(box: RectF, transform: FillCenterTransform) {
+private fun DrawScope.drawIdleBrackets(box: RectF, transform: FillCenterTransform, opacity: Float) {
     val (left, top, right, bottom) = mapBox(box, transform)
     val w = right - left
     val h = bottom - top
     val cornerLen = minOf(w, h) * 0.15f
     val stroke = scaledStroke(w, h) * 0.6f
-    val color = Color.White.copy(alpha = 0.6f)
+    val color = Color.White.copy(alpha = 0.5f * opacity)
 
     drawBracketLines(left, top, right, bottom, cornerLen, color, stroke)
 }
 
 // ---------------------------------------------------------------------------
-// Label Overlay — locked object only
+// Label Overlay — locked object only (kept for testing, remove later)
 // ---------------------------------------------------------------------------
 
 @Composable
@@ -380,17 +546,14 @@ private fun LockedLabelOverlay(state: TrackingUiState) {
 
         val left = transform.toScreenX(obj.boundingBox.left)
         val bottom = transform.toScreenY(obj.boundingBox.bottom)
-        val boxWidthPx = transform.toScreenX(obj.boundingBox.right) - left
         val boxHeightPx = bottom - transform.toScreenY(obj.boundingBox.top)
 
-        // Scale font with box size, clamped to 10–16sp
         val fontSize = (boxHeightPx * 0.06f).coerceIn(
             with(density) { 10.sp.toPx() },
             with(density) { 16.sp.toPx() }
         )
         val fontSizeSp = with(density) { fontSize.toSp() }
 
-        // Position inside the box, bottom-left with small inset
         val inset = with(density) { 4.dp.toPx() }
         val xPx = left + inset
         val yPx = bottom - fontSize - inset * 2
