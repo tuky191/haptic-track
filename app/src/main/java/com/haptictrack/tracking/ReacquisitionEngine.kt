@@ -27,7 +27,7 @@ class ReacquisitionEngine(
     companion object {
         private const val TAG = "Reacq"
         /** Embedding similarity above this bypasses position/size hard filters. */
-        const val APPEARANCE_OVERRIDE_THRESHOLD = 0.5f
+        const val APPEARANCE_OVERRIDE_THRESHOLD = 0.7f
         /** Maximum embeddings to keep in gallery. */
         const val MAX_GALLERY_SIZE = 12
     }
