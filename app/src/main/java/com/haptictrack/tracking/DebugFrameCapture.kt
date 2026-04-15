@@ -103,7 +103,10 @@ class DebugFrameCapture(context: Context) {
     ) {
         val dir = outputDir ?: return
 
-        val annotated = bitmap.copy(Bitmap.Config.ARGB_8888, true) ?: return
+        // Draw annotations onto a mutable copy. The caller (ObjectTracker)
+        // has already saved lastFrameBitmap, so we don't need a third bitmap.
+        val annotated = if (bitmap.isMutable) bitmap
+            else bitmap.copy(Bitmap.Config.ARGB_8888, true) ?: return
         val canvas = Canvas(annotated)
         val w = bitmap.width.toFloat()
         val h = bitmap.height.toFloat()
@@ -142,7 +145,8 @@ class DebugFrameCapture(context: Context) {
         } catch (e: Exception) {
             Log.w(TAG, "Failed to save debug frame: ${e.message}")
         } finally {
-            annotated.recycle()
+            // Only recycle if we allocated the copy ourselves
+            if (annotated !== bitmap) annotated.recycle()
         }
 
         pruneOldFiles(dir)

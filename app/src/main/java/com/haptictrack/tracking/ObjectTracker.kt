@@ -196,6 +196,13 @@ class ObjectTracker(
                 visualTracker.init(bitmap, lockedObject.boundingBox)
             }
 
+            // Save lastFrameBitmap before debug capture to avoid a third bitmap copy.
+            // Debug capture draws annotations directly onto a mutable copy of this frame.
+            synchronized(lastFrameLock) {
+                lastFrameBitmap?.recycle()
+                lastFrameBitmap = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
+            }
+
             // Debug frame capture on tracking events
             captureDebugFrame(bitmap, withEmbeddings, lockedObject, wasSearching, prevLost)
 
@@ -203,12 +210,6 @@ class ObjectTracker(
             val displayObjects = filter.filter(withEmbeddings)
 
             onDetectionResult?.invoke(displayObjects, lockedObject, frameWidth, frameHeight)
-
-            // Keep a copy of the frame for embedding on tap-to-lock
-            synchronized(lastFrameLock) {
-                lastFrameBitmap?.recycle()
-                lastFrameBitmap = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
-            }
         } finally {
             imageProxy.close()
             bitmap.recycle()

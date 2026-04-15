@@ -2,6 +2,16 @@
 
 Hands-free camera tracking Android app. Uses on-device object detection + haptic feedback + auto-zoom to let you film a subject without looking at the screen.
 
+## Development Workflow
+
+All changes follow this flow — never commit directly to master:
+
+1. **Branch** — create a feature/fix branch from master
+2. **PR** — push and open a pull request
+3. **Device test** — build, install via ADB, test on physical device
+4. **Review** — review the PR (code review or self-review)
+5. **Merge** — merge to master and delete the branch
+
 ## Quick Reference
 
 ```bash
