@@ -51,8 +51,8 @@ CameraViewModel
 **Re-acquisition (object lost):**
 1. Detector runs, `FrameToFrameTracker` assigns stable IDs via IoU matching
 2. `AppearanceEmbedder` computes visual fingerprints for all candidates
-3. `ReacquisitionEngine` scores candidates: position (decays over time) + size + label (hard filter) + appearance similarity (45% weight)
-4. Strong embedding match (>0.4 cosine similarity) overrides position/size hard thresholds
+3. `ReacquisitionEngine` scores candidates: position (decays over time) + size + label (20% scoring factor) + appearance similarity (45% weight)
+4. Strong embedding match (>0.5 cosine similarity) overrides position/size hard thresholds
 5. Best candidate above `minScoreThreshold` becomes the new lock; visual tracker re-initializes
 
 **Display:**
