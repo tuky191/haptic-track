@@ -151,7 +151,39 @@ class RotationRemapTest {
         }
     }
 
+    // --- mapToRotated / unmapPoint round-trip ---
+
+    @Test
+    fun `mapToRotated is inverse of unmapRotation at all rotations`() {
+        val orig = RectF(0.15f, 0.25f, 0.6f, 0.8f)
+        for (rot in listOf(0, 90, 180, 270)) {
+            val unmapped = unmapRotation(orig.left, orig.top, orig.right, orig.bottom, rot)
+            val remapped = mapToRotated(unmapped.left, unmapped.top, unmapped.right, unmapped.bottom, rot)
+            assertBoxEquals(orig, remapped, "mapToRotated(unmapRotation(box, $rot), $rot) should return original")
+        }
+    }
+
+    @Test
+    fun `unmapPoint round-trip at all rotations`() {
+        val x = 0.3f
+        val y = 0.7f
+        for (rot in listOf(0, 90, 180, 270)) {
+            val unmapped = unmapPoint(x, y, rot)
+            // Inverse of unmapPoint is mapToRotated applied to a point
+            val remapped = mapToRotated(unmapped.x, unmapped.y, unmapped.x, unmapped.y, rot)
+            assertEquals("x round-trip at $rot", x, remapped.left, 0.001f)
+            assertEquals("y round-trip at $rot", y, remapped.top, 0.001f)
+        }
+    }
+
     // --- Helper ---
+
+    private fun assertBoxEquals(expected: RectF, actual: RectF, message: String, tolerance: Float = 0.001f) {
+        assertEquals("$message left", expected.left, actual.left, tolerance)
+        assertEquals("$message top", expected.top, actual.top, tolerance)
+        assertEquals("$message right", expected.right, actual.right, tolerance)
+        assertEquals("$message bottom", expected.bottom, actual.bottom, tolerance)
+    }
 
     private fun assertBoxEquals(expected: RectF, actual: RectF, tolerance: Float = 0.001f) {
         assertEquals("left", expected.left, actual.left, tolerance)

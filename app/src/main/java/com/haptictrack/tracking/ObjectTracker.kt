@@ -3,6 +3,7 @@ package com.haptictrack.tracking
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Matrix
+import android.graphics.PointF
 import android.graphics.RectF
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
@@ -39,13 +40,15 @@ class ObjectTracker(
     private val VT_MAX_UNCONFIRMED = 10  // ~0.3s at 30fps
 
     /** Callback: (displayObjects, lockedObject, imageWidth, imageHeight, contour) */
-    var onDetectionResult: ((List<TrackedObject>, TrackedObject?, Int, Int, List<android.graphics.PointF>) -> Unit)? = null
+    var onDetectionResult: ((List<TrackedObject>, TrackedObject?, Int, Int, List<PointF>) -> Unit)? = null
 
-    // Contour cache — updated every N frames to avoid running segmenter per-frame
-    private var cachedContour: List<android.graphics.PointF> = emptyList()
+    // Contour extraction — disabled until the UI uses it (saves CPU/battery).
+    // Enable by setting to true when contour-based overlay is implemented.
+    private val contourEnabled = false
+    private var cachedContour: List<PointF> = emptyList()
     private var contourFrameCount = 0
-    private val CONTOUR_UPDATE_INTERVAL_VT = 2   // every 2nd frame during VT (~15fps contour)
-    private val CONTOUR_UPDATE_INTERVAL_DET = 3  // every 3rd frame on detector path (~10fps contour)
+    private val CONTOUR_UPDATE_INTERVAL_VT = 2
+    private val CONTOUR_UPDATE_INTERVAL_DET = 3
 
     init {
         val baseOptions = BaseOptions.builder()
@@ -164,12 +167,14 @@ class ObjectTracker(
                             .filter { FrameToFrameTracker.computeIou(it.boundingBox, vtBox) < 0.3f } + lockedObj
 
                         // Update contour periodically, unmap from rotated to screen coords
-                        contourFrameCount++
-                        if (contourFrameCount % CONTOUR_UPDATE_INTERVAL_VT == 0) {
-                            cachedContour = unmapContour(
-                                appearanceEmbedder.extractContour(bitmap, rawBox),
-                                deviceRot
-                            )
+                        if (contourEnabled) {
+                            contourFrameCount++
+                            if (contourFrameCount % CONTOUR_UPDATE_INTERVAL_VT == 0) {
+                                cachedContour = unmapContour(
+                                    appearanceEmbedder.extractContour(bitmap, rawBox),
+                                    deviceRot
+                                )
+                            }
                         }
 
                         onDetectionResult?.invoke(displayObjects, lockedObj, frameWidth, frameHeight, cachedContour)
@@ -228,22 +233,23 @@ class ObjectTracker(
             // Filter for display
             val displayObjects = filter.filter(withEmbeddings)
 
-            // Update contour on re-acquire or periodically
-            val deviceRot = deviceRotationProvider?.invoke() ?: 0
-            if (lockedObject != null && reacquisition.framesLost == 0) {
-                contourFrameCount++
-                if (contourFrameCount % CONTOUR_UPDATE_INTERVAL_DET == 0 || (wasSearching && reacquisition.framesLost == 0)) {
-                    // lockedObject.boundingBox is in screen space; remap to rotated bitmap space for segmenter
-                    val screenBox = lockedObject.boundingBox
-                    val rotatedBox = mapToRotated(screenBox.left, screenBox.top, screenBox.right, screenBox.bottom, deviceRot)
-                    cachedContour = unmapContour(
-                        appearanceEmbedder.extractContour(bitmap, rotatedBox),
-                        deviceRot
-                    )
+            // Update contour on re-acquire or periodically (gated — disabled until UI uses it)
+            if (contourEnabled) {
+                val deviceRot = deviceRotationProvider?.invoke() ?: 0
+                if (lockedObject != null && reacquisition.framesLost == 0) {
+                    contourFrameCount++
+                    if (contourFrameCount % CONTOUR_UPDATE_INTERVAL_DET == 0 || (wasSearching && reacquisition.framesLost == 0)) {
+                        val screenBox = lockedObject.boundingBox
+                        val rotatedBox = mapToRotated(screenBox.left, screenBox.top, screenBox.right, screenBox.bottom, deviceRot)
+                        cachedContour = unmapContour(
+                            appearanceEmbedder.extractContour(bitmap, rotatedBox),
+                            deviceRot
+                        )
+                    }
+                } else if (!reacquisition.isLocked) {
+                    cachedContour = emptyList()
+                    contourFrameCount = 0
                 }
-            } else if (!reacquisition.isLocked) {
-                cachedContour = emptyList()
-                contourFrameCount = 0
             }
 
             onDetectionResult?.invoke(displayObjects, lockedObject, frameWidth, frameHeight, cachedContour)
@@ -415,13 +421,13 @@ internal fun mapToRotated(
 /**
  * Unmap a single normalized point from rotated-image space to screen space.
  */
-internal fun unmapPoint(x: Float, y: Float, deviceRot: Int): android.graphics.PointF {
+internal fun unmapPoint(x: Float, y: Float, deviceRot: Int): PointF {
     return when (deviceRot) {
-        0 -> android.graphics.PointF(x, y)
-        180 -> android.graphics.PointF(1f - x, 1f - y)
-        90 -> android.graphics.PointF(y, 1f - x)      // inverse of 90° CW
-        270 -> android.graphics.PointF(1f - y, x)      // inverse of 270° CW
-        else -> android.graphics.PointF(x, y)
+        0 -> PointF(x, y)
+        180 -> PointF(1f - x, 1f - y)
+        90 -> PointF(y, 1f - x)      // inverse of 90° CW
+        270 -> PointF(1f - y, x)      // inverse of 270° CW
+        else -> PointF(x, y)
     }
 }
 
@@ -429,8 +435,8 @@ internal fun unmapPoint(x: Float, y: Float, deviceRot: Int): android.graphics.Po
  * Apply unmapRotation to each contour point (normalized [0,1] coords).
  */
 internal fun unmapContour(
-    contour: List<android.graphics.PointF>, deviceRot: Int
-): List<android.graphics.PointF> {
+    contour: List<PointF>, deviceRot: Int
+): List<PointF> {
     if (deviceRot == 0 || contour.isEmpty()) return contour
     return contour.map { pt -> unmapPoint(pt.x, pt.y, deviceRot) }
 }

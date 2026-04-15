@@ -322,9 +322,25 @@ private fun TrackingOverlay(
     }
 }
 
+// Cached Paint objects for glow rendering — avoids allocation on every frame.
+// Color/alpha updated per-frame; BlurMaskFilter is reused.
+private val outerGlowPaint = android.graphics.Paint().apply {
+    style = android.graphics.Paint.Style.STROKE
+    isAntiAlias = true
+    strokeWidth = 30f
+    maskFilter = android.graphics.BlurMaskFilter(40f, android.graphics.BlurMaskFilter.Blur.NORMAL)
+}
+
+private val innerGlowPaint = android.graphics.Paint().apply {
+    style = android.graphics.Paint.Style.STROKE
+    isAntiAlias = true
+    strokeWidth = 15f
+    maskFilter = android.graphics.BlurMaskFilter(20f, android.graphics.BlurMaskFilter.Blur.NORMAL)
+}
+
 /**
  * Draw a soft glowing rounded rectangle — backlight effect around the object.
- * Uses OUTER blur so the interior stays clear and only the edges radiate light.
+ * Thick blurred strokes dissolve into diffused light. No fill = interior stays clear.
  */
 private fun DrawScope.drawRoundedGlow(
     left: Float, top: Float, right: Float, bottom: Float,
@@ -333,94 +349,14 @@ private fun DrawScope.drawRoundedGlow(
     val nativeCanvas = drawContext.canvas.nativeCanvas
     val w = right - left
     val h = bottom - top
-    val cornerRadius = minOf(w, h) * 0.25f  // nicely rounded corners
+    val cornerRadius = minOf(w, h) * 0.25f
     val rect = android.graphics.RectF(left, top, right, bottom)
 
-    val glowPaint = android.graphics.Paint().apply {
-        style = android.graphics.Paint.Style.STROKE
-        isAntiAlias = true
-    }
+    outerGlowPaint.color = color.copy(alpha = color.alpha * 0.20f).toArgb()
+    nativeCanvas.drawRoundRect(rect, cornerRadius, cornerRadius, outerGlowPaint)
 
-    // Thick strokes with heavy NORMAL blur — the stroke itself dissolves into
-    // a soft glow on both sides of the edge. No fill = interior stays clear.
-    glowPaint.strokeWidth = 30f
-    glowPaint.color = color.copy(alpha = color.alpha * 0.20f).toArgb()
-    glowPaint.maskFilter = android.graphics.BlurMaskFilter(40f, android.graphics.BlurMaskFilter.Blur.NORMAL)
-    nativeCanvas.drawRoundRect(rect, cornerRadius, cornerRadius, glowPaint)
-
-    glowPaint.strokeWidth = 15f
-    glowPaint.color = color.copy(alpha = color.alpha * 0.30f).toArgb()
-    glowPaint.maskFilter = android.graphics.BlurMaskFilter(20f, android.graphics.BlurMaskFilter.Blur.NORMAL)
-    nativeCanvas.drawRoundRect(rect, cornerRadius, cornerRadius, glowPaint)
-}
-
-/**
- * Draw a soft neon glow contour following the object's silhouette.
- * Multiple passes at increasing widths with decreasing opacity for a diffused glow.
- */
-private fun DrawScope.drawContourGlow(
-    contour: List<android.graphics.PointF>,
-    transform: FillCenterTransform,
-    color: Color
-) {
-    if (contour.size < 3) return
-
-    // Convert to screen coordinates
-    val pts = contour.map { pt ->
-        Offset(
-            transform.toScreenX(pt.x).coerceIn(0f, size.width),
-            transform.toScreenY(pt.y).coerceIn(0f, size.height)
-        )
-    }
-
-    // Build a smooth closed path using Catmull-Rom → cubic bezier conversion
-    val path = Path()
-    path.moveTo(pts[0].x, pts[0].y)
-
-    val n = pts.size
-    for (i in 0 until n) {
-        val p0 = pts[(i - 1 + n) % n]
-        val p1 = pts[i]
-        val p2 = pts[(i + 1) % n]
-        val p3 = pts[(i + 2) % n]
-
-        // Catmull-Rom to cubic bezier control points
-        val cp1x = p1.x + (p2.x - p0.x) / 6f
-        val cp1y = p1.y + (p2.y - p0.y) / 6f
-        val cp2x = p2.x - (p3.x - p1.x) / 6f
-        val cp2y = p2.y - (p3.y - p1.y) / 6f
-
-        path.cubicTo(cp1x, cp1y, cp2x, cp2y, p2.x, p2.y)
-    }
-    path.close()
-
-    val androidPath = path.asAndroidPath()
-    val nativeCanvas = drawContext.canvas.nativeCanvas
-
-    // Backlight glow — blurred filled shape creates a soft halo behind/around the object.
-    // Multiple passes at decreasing alpha give a natural light falloff.
-    val glowPaint = android.graphics.Paint().apply {
-        style = android.graphics.Paint.Style.FILL_AND_STROKE
-        strokeWidth = 2f
-        isAntiAlias = true
-        strokeCap = android.graphics.Paint.Cap.ROUND
-        strokeJoin = android.graphics.Paint.Join.ROUND
-    }
-
-    // Outer halo — large blur, low alpha, spreads wide
-    glowPaint.color = color.copy(alpha = color.alpha * 0.12f).toArgb()
-    glowPaint.maskFilter = android.graphics.BlurMaskFilter(50f, android.graphics.BlurMaskFilter.Blur.OUTER)
-    nativeCanvas.drawPath(androidPath, glowPaint)
-
-    // Mid halo
-    glowPaint.color = color.copy(alpha = color.alpha * 0.18f).toArgb()
-    glowPaint.maskFilter = android.graphics.BlurMaskFilter(25f, android.graphics.BlurMaskFilter.Blur.OUTER)
-    nativeCanvas.drawPath(androidPath, glowPaint)
-
-    // Tight glow around the edge
-    glowPaint.color = color.copy(alpha = color.alpha * 0.30f).toArgb()
-    glowPaint.maskFilter = android.graphics.BlurMaskFilter(10f, android.graphics.BlurMaskFilter.Blur.OUTER)
-    nativeCanvas.drawPath(androidPath, glowPaint)
+    innerGlowPaint.color = color.copy(alpha = color.alpha * 0.30f).toArgb()
+    nativeCanvas.drawRoundRect(rect, cornerRadius, cornerRadius, innerGlowPaint)
 }
 
 /** Compute stroke width that scales with box size, clamped to [2, 6] px. */

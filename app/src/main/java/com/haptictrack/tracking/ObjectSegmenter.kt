@@ -33,7 +33,8 @@ class ObjectSegmenter(context: Context) {
         private const val TAG = "ObjSegmenter"
         private const val MODEL_PATH = "magic_touch.tflite"
         /** Confidence threshold: pixels below this are considered background. */
-        private const val MASK_THRESHOLD = 0.85f
+        /** Threshold for embedding masks. Contour extraction uses its own (higher) threshold. */
+        private const val MASK_THRESHOLD = 0.5f
     }
 
     private val segmenter: InteractiveSegmenter
