@@ -16,7 +16,7 @@ import android.util.Log
  * All decisions are logged to Android logcat under tag "Reacq" for debugging.
  */
 class ReacquisitionEngine(
-    val maxFramesLost: Int = 90,
+    val maxFramesLost: Int = 450,
     val initialPositionThreshold: Float = 0.25f,
     val maxPositionThreshold: Float = 1.5f,
     val sizeRatioThreshold: Float = 2.0f,

@@ -156,9 +156,11 @@ class ObjectTracker(
                             label = reacquisition.lastKnownLabel,
                             confidence = vtResult.confidence
                         )
-                        // Include the visual tracker's box in display objects so
-                        // the UI can draw it green. Detector objects use different IDs.
-                        val displayObjects = filter.filter(tracked) + lockedObj
+                        // Include the visual tracker's box, but remove detector
+                        // boxes that overlap it to avoid duplicate rectangles.
+                        val vtBox = vtResult.boundingBox
+                        val displayObjects = filter.filter(tracked)
+                            .filter { FrameToFrameTracker.computeIou(it.boundingBox, vtBox) < 0.3f } + lockedObj
 
                         onDetectionResult?.invoke(displayObjects, lockedObj, frameWidth, frameHeight)
 
