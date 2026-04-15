@@ -21,7 +21,9 @@ class ReacquisitionEngine(
     val maxPositionThreshold: Float = 1.5f,
     val sizeRatioThreshold: Float = 2.0f,
     val minScoreThreshold: Float = 0.45f,
-    val positionDecayFrames: Int = 30
+    val positionDecayFrames: Int = 30,
+    /** Optional session logger — writes to both logcat and session log file. */
+    var sessionLogger: ((String) -> Unit)? = null
 ) {
 
     companion object {
@@ -72,7 +74,7 @@ class ReacquisitionEngine(
         lastKnownLabel = label
         lastKnownSize = boundingBox.width() * boundingBox.height()
         framesLost = 0
-        Log.i(TAG, "LOCK id=$trackingId label=\"$label\" box=${fmtBox(boundingBox)} size=${fmtF(lastKnownSize)} gallery=${embeddingGallery.size} colorHist=${colorHist != null}")
+        dualLog(Log.INFO, "LOCK id=$trackingId label=\"$label\" box=${fmtBox(boundingBox)} size=${fmtF(lastKnownSize)} gallery=${embeddingGallery.size} colorHist=${colorHist != null}")
     }
 
     /** Add a new embedding to the gallery (e.g. from a confirmed visual tracker frame). */
@@ -89,7 +91,7 @@ class ReacquisitionEngine(
     }
 
     fun clear() {
-        Log.i(TAG, "CLEAR (was id=$lockedId label=\"$lockedLabel\")")
+        dualLog(Log.INFO, "CLEAR (was id=$lockedId label=\"$lockedLabel\")")
         lockedId = null
         lockedLabel = null
         _embeddingGallery.clear()
@@ -107,7 +109,7 @@ class ReacquisitionEngine(
         val directMatch = detections.find { it.id == lockId }
         if (directMatch != null) {
             if (framesLost > 0) {
-                Log.d(TAG, "DIRECT_MATCH id=$lockId recovered after $framesLost lost frames, label=\"${directMatch.label}\"")
+                dualLog(Log.DEBUG, "DIRECT_MATCH id=$lockId recovered after $framesLost lost frames, label=\"${directMatch.label}\"")
             }
             updateFromMatch(directMatch)
             return directMatch
@@ -116,29 +118,29 @@ class ReacquisitionEngine(
         // Object lost
         framesLost++
         if (framesLost == 1) {
-            Log.w(TAG, "LOST id=$lockId (lockedLabel=\"$lockedLabel\") — starting search. ${detections.size} candidates in frame")
+            dualLog(Log.WARN, "LOST id=$lockId (lockedLabel=\"$lockedLabel\") — starting search. ${detections.size} candidates in frame")
         }
         if (framesLost > maxFramesLost) {
             if (framesLost == maxFramesLost + 1) {
-                Log.w(TAG, "TIMEOUT after $maxFramesLost frames. Giving up on lockedLabel=\"$lockedLabel\"")
+                dualLog(Log.WARN, "TIMEOUT after $maxFramesLost frames. Giving up on lockedLabel=\"$lockedLabel\"")
             }
             return null
         }
 
         // Log candidates periodically (every 10 frames to avoid spam)
         if (framesLost % 10 == 1) {
-            Log.d(TAG, "SEARCH frame=$framesLost posConf=${fmtF(positionConfidence())} posThresh=${fmtF(effectivePositionThreshold())} gallery=${embeddingGallery.size} candidates=${detections.size}")
+            dualLog(Log.DEBUG, "SEARCH frame=$framesLost posConf=${fmtF(positionConfidence())} posThresh=${fmtF(effectivePositionThreshold())} gallery=${embeddingGallery.size} candidates=${detections.size}")
             detections.forEach { d ->
                 val simStr = if (hasEmbeddings && d.embedding != null) {
                     " sim=${fmtF(bestGallerySimilarity(d.embedding!!))}"
                 } else ""
-                Log.d(TAG, "  candidate id=${d.id} label=\"${d.label}\" conf=${fmtF(d.confidence)}$simStr box=${fmtBox(d.boundingBox)}")
+                dualLog(Log.DEBUG, "  candidate id=${d.id} label=\"${d.label}\" conf=${fmtF(d.confidence)}$simStr box=${fmtBox(d.boundingBox)}")
             }
         }
 
         val reacquired = findBestCandidate(detections)
         if (reacquired != null) {
-            Log.i(TAG, "REACQUIRE id=${reacquired.id} label=\"${reacquired.label}\" after $framesLost frames (lockedLabel=\"$lockedLabel\") box=${fmtBox(reacquired.boundingBox)}")
+            dualLog(Log.INFO, "REACQUIRE id=${reacquired.id} label=\"${reacquired.label}\" after $framesLost frames (lockedLabel=\"$lockedLabel\") box=${fmtBox(reacquired.boundingBox)}")
             lockedId = reacquired.id
             updateFromMatch(reacquired)
             return reacquired
@@ -196,12 +198,12 @@ class ReacquisitionEngine(
             } else null
             if (score != null) {
                 if (logThis) {
-                    Log.d(TAG, "  scored id=${candidate.id} label=\"${candidate.label}\" score=${fmtF(score)} sim=${sim?.let { fmtF(it) } ?: "n/a"} color=${colorSim?.let { fmtF(it) } ?: "n/a"} (min=${fmtF(minScoreThreshold)})")
+                    dualLog(Log.DEBUG, "  scored id=${candidate.id} label=\"${candidate.label}\" score=${fmtF(score)} sim=${sim?.let { fmtF(it) } ?: "n/a"} color=${colorSim?.let { fmtF(it) } ?: "n/a"} (min=${fmtF(minScoreThreshold)})")
                 }
                 Pair(candidate, score)
             } else {
                 if (logThis) {
-                    Log.d(TAG, "  rejected id=${candidate.id} label=\"${candidate.label}\" sim=${sim?.let { fmtF(it) } ?: "n/a"} (hard threshold)")
+                    dualLog(Log.DEBUG, "  rejected id=${candidate.id} label=\"${candidate.label}\" sim=${sim?.let { fmtF(it) } ?: "n/a"} (hard threshold)")
                 }
                 null
             }
@@ -245,7 +247,7 @@ class ReacquisitionEngine(
 
         if (distance > posThreshold && !strongVisualMatch) return null
         if (distance > posThreshold && strongVisualMatch) {
-            Log.d(TAG, "  OVERRIDE position: dist=${fmtF(distance)} > thresh=${fmtF(posThreshold)}, but sim=${fmtF(appearanceScore)}")
+            dualLog(Log.DEBUG, "  OVERRIDE position: dist=${fmtF(distance)} > thresh=${fmtF(posThreshold)}, but sim=${fmtF(appearanceScore)}")
         }
 
         val candSize = candBox.width() * candBox.height()
@@ -255,7 +257,7 @@ class ReacquisitionEngine(
         val effectiveSizeThreshold = effectiveSizeRatioThreshold()
         if (sizeRatio > effectiveSizeThreshold && !strongVisualMatch) return null
         if (sizeRatio > effectiveSizeThreshold && strongVisualMatch) {
-            Log.d(TAG, "  OVERRIDE size: ratio=${fmtF(sizeRatio)} > thresh=${fmtF(effectiveSizeThreshold)}, but sim=${fmtF(appearanceScore)}")
+            dualLog(Log.DEBUG, "  OVERRIDE size: ratio=${fmtF(sizeRatio)} > thresh=${fmtF(effectiveSizeThreshold)}, but sim=${fmtF(appearanceScore)}")
         }
 
         val positionScore = if (posThreshold > 0f) (1f - (distance / posThreshold)).coerceIn(0f, 1f) else 1f
@@ -311,6 +313,12 @@ class ReacquisitionEngine(
     /** Best cosine similarity between a candidate and any embedding in the gallery. */
     internal fun bestGallerySimilarity(candidateEmbedding: FloatArray): Float {
         return bestGallerySimilarity(candidateEmbedding, _embeddingGallery)
+    }
+
+    /** Log to both logcat and session file. */
+    private fun dualLog(level: Int, msg: String) {
+        Log.println(level, TAG, msg)
+        sessionLogger?.invoke(msg)
     }
 
     private fun fmtF(f: Float) = "%.3f".format(f)

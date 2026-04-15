@@ -62,6 +62,9 @@ class ObjectTracker(
             .build()
 
         detector = ObjectDetector.createFromOptions(context, options)
+
+        // Wire ReacquisitionEngine logs to session logger
+        reacquisition.sessionLogger = { msg -> debugCapture.log("[Reacq] $msg") }
     }
 
     /**
@@ -85,6 +88,9 @@ class ObjectTracker(
             reacquisition.lock(trackingId, boundingBox, label, embeddings, colorHist)
             visualTracker.init(bmp, boundingBox)
 
+            debugCapture.startSession(label, trackingId)
+            debugCapture.log("LOCK id=$trackingId label=$label box=${boundingBox} gallery=${embeddings.size} colorHist=${colorHist != null}")
+
             val locked = TrackedObject(trackingId, boundingBox, label)
             debugCapture.capture(DebugEvent.LOCK, bmp, listOf(locked), lockedObject = locked,
                 extraInfo = "id=$trackingId label=$label gallery=${embeddings.size}")
@@ -92,6 +98,8 @@ class ObjectTracker(
     }
 
     fun clearLock() {
+        debugCapture.log("CLEAR by user")
+        debugCapture.endSession()
         reacquisition.clear()
         visualTracker.stop()
         vtUnconfirmedFrames = 0
@@ -326,6 +334,7 @@ class ObjectTracker(
         when {
             // Just re-acquired
             wasSearching && lockedObject != null && nowLost == 0 -> {
+                debugCapture.log("REACQUIRE id=${lockedObject.id} label=${lockedObject.label} after $prevFramesLost frames box=${lockedObject.boundingBox}")
                 debugCapture.capture(
                     DebugEvent.REACQUIRE, bitmap, detections,
                     lockedObject = lockedObject,
@@ -334,17 +343,20 @@ class ObjectTracker(
             }
             // Just lost (first frame)
             nowLost == 1 && prevFramesLost == 0 -> {
+                debugCapture.log("LOST lockedLabel=${reacquisition.lockedLabel} ${detections.size} candidates")
                 debugCapture.capture(
                     DebugEvent.LOST, bitmap, detections,
                     lastKnownBox = reacquisition.lastKnownBox,
                     extraInfo = "label=${reacquisition.lockedLabel}"
                 )
             }
-            // Searching: capture every 10th frame, or whenever a same-label candidate exists
-            // but didn't match — this is the key diagnostic frame
+            // Searching
             wasSearching && lockedObject == null && nowLost > 0 -> {
                 val hasSameLabelCandidate = detections.any { d ->
                     d.label != null && d.label == reacquisition.lockedLabel
+                }
+                if (nowLost % 10 == 1) {
+                    debugCapture.log("SEARCH frame=$nowLost candidates=${detections.size} sameLabelMatch=$hasSameLabelCandidate")
                 }
                 if (hasSameLabelCandidate || nowLost % 10 == 0) {
                     val candidateInfo = detections
@@ -359,6 +371,8 @@ class ObjectTracker(
             }
             // Timed out
             nowLost == reacquisition.maxFramesLost + 1 -> {
+                debugCapture.log("TIMEOUT after ${reacquisition.maxFramesLost} frames, gave up on ${reacquisition.lockedLabel}")
+                debugCapture.endSession()
                 debugCapture.capture(
                     DebugEvent.TIMEOUT, bitmap, detections,
                     lastKnownBox = reacquisition.lastKnownBox,
@@ -369,6 +383,7 @@ class ObjectTracker(
     }
 
     fun shutdown() {
+        debugCapture.endSession()
         detector.close()
         appearanceEmbedder.shutdown()
         visualTracker.stop()
