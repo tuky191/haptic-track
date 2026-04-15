@@ -13,6 +13,15 @@ import android.view.Surface
  */
 class DeviceOrientationListener(context: Context) {
 
+    companion object {
+        /**
+         * Hysteresis margin in degrees. To leave the current orientation, the
+         * sensor must read past the midpoint (45°) by this many degrees.
+         * Creates a dead zone of 2×HYSTERESIS degrees at each boundary.
+         */
+        const val HYSTERESIS = 20
+    }
+
     /** Current device rotation in degrees: 0, 90, 180, or 270. */
     @Volatile
     var deviceRotation: Int = 0
@@ -31,15 +40,7 @@ class DeviceOrientationListener(context: Context) {
     private val listener = object : OrientationEventListener(context) {
         override fun onOrientationChanged(orientation: Int) {
             if (orientation == ORIENTATION_UNKNOWN) return
-
-            // Snap to nearest 90° bucket with hysteresis
-            deviceRotation = when (orientation) {
-                in 0..44, in 316..359 -> 0
-                in 45..134 -> 90
-                in 135..224 -> 180
-                in 225..315 -> 270
-                else -> 0
-            }
+            deviceRotation = snapWithHysteresis(orientation, deviceRotation)
         }
     }
 
@@ -51,5 +52,37 @@ class DeviceOrientationListener(context: Context) {
 
     fun stop() {
         listener.disable()
+    }
+}
+
+/**
+ * Snap raw orientation to 0/90/180/270 with directional hysteresis.
+ *
+ * Once in a state, the sensor must move [DeviceOrientationListener.HYSTERESIS]
+ * degrees past the midpoint before switching. This prevents flickering when
+ * the phone is held near a boundary (e.g. ~45°).
+ *
+ * Package-level for testability.
+ */
+internal fun snapWithHysteresis(orientation: Int, current: Int): Int {
+    val h = DeviceOrientationListener.HYSTERESIS
+    // Check if we're still within the sticky range of the current orientation.
+    // The sticky range is wider than the entry range by HYSTERESIS on each side.
+    val inCurrent = when (current) {
+        0   -> orientation in 0..(45 + h) || orientation in (315 - h)..359
+        90  -> orientation in (45 - h)..(135 + h)
+        180 -> orientation in (135 - h)..(225 + h)
+        270 -> orientation in (225 - h)..(315 + h)
+        else -> false
+    }
+    if (inCurrent) return current
+
+    // Outside the sticky range — commit to whichever quadrant center is nearest
+    return when (orientation) {
+        in 0..(45 - h), in (315 + h)..359 -> 0
+        in (45 + h)..(135 - h) -> 90
+        in (135 + h)..(225 - h) -> 180
+        in (225 + h)..(315 - h) -> 270
+        else -> current  // in dead zone between quadrants, keep current
     }
 }
