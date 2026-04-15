@@ -27,6 +27,7 @@ class AppearanceEmbedder(context: Context) {
     }
 
     private val embedder: ImageEmbedder
+    private val segmenter: ObjectSegmenter = ObjectSegmenter(context)
 
     init {
         val baseOptions = BaseOptions.builder()
@@ -44,19 +45,16 @@ class AppearanceEmbedder(context: Context) {
 
     /**
      * Extract an embedding from a crop of the given bitmap at the normalized bounding box.
+     * Uses the segmenter to mask out background pixels before embedding.
      * Returns null if the crop is invalid.
      */
     fun embed(bitmap: Bitmap, normalizedBox: RectF): FloatArray? {
-        val crop = cropBitmap(bitmap, normalizedBox) ?: return null
+        // Try segmented crop first; fall back to raw crop if segmentation fails
+        val crop = segmenter.segmentAndCrop(bitmap, normalizedBox)
+            ?: cropBitmap(bitmap, normalizedBox)
+            ?: return null
         return try {
-            val mpImage = BitmapImageBuilder(crop).build()
-            val result = embedder.embed(mpImage)
-            val embedding = result.embeddingResult().embeddings().firstOrNull()
-            val raw = embedding?.floatEmbedding()
-            if (raw != null && raw.isNotEmpty()) raw else null
-        } catch (e: Exception) {
-            Log.w(TAG, "Embedding failed: ${e.message}")
-            null
+            embedBitmap(crop)
         } finally {
             crop.recycle()
         }
@@ -64,10 +62,13 @@ class AppearanceEmbedder(context: Context) {
 
     /**
      * Embed the crop plus augmented variants (rotated 90°/180°/270°, flipped).
+     * Uses the segmenter to mask out background pixels before embedding.
      * Returns a list of embeddings covering multiple orientations.
      */
     fun embedWithAugmentations(bitmap: Bitmap, normalizedBox: RectF): List<FloatArray> {
-        val crop = cropBitmap(bitmap, normalizedBox) ?: return emptyList()
+        val crop = segmenter.segmentAndCrop(bitmap, normalizedBox)
+            ?: cropBitmap(bitmap, normalizedBox)
+            ?: return emptyList()
         val results = mutableListOf<FloatArray>()
 
         try {
@@ -140,6 +141,7 @@ class AppearanceEmbedder(context: Context) {
 
     fun shutdown() {
         embedder.close()
+        segmenter.shutdown()
     }
 
     private fun cropBitmap(bitmap: Bitmap, normalizedBox: RectF): Bitmap? {

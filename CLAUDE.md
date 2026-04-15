@@ -230,6 +230,6 @@ All in constructor defaults — no settings UI yet:
 
 ## Device Testing
 
-Tested on: Xiaomi 2210132G (Poco F4), Android 15
+Tested on: Xiaomi 13 Pro, Android 15 (3.2x optical telephoto)
 
 Wireless debugging disconnects frequently on Xiaomi — this is Xiaomi battery management killing the connection. Workaround: disable battery optimization for wireless debugging, or use USB.

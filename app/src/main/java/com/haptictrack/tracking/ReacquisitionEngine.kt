@@ -20,7 +20,7 @@ class ReacquisitionEngine(
     val initialPositionThreshold: Float = 0.25f,
     val maxPositionThreshold: Float = 1.5f,
     val sizeRatioThreshold: Float = 2.0f,
-    val minScoreThreshold: Float = 0.35f,
+    val minScoreThreshold: Float = 0.45f,
     val positionDecayFrames: Int = 30
 ) {
 
@@ -255,7 +255,7 @@ class ReacquisitionEngine(
 
         val positionScore = if (posThreshold > 0f) (1f - (distance / posThreshold)).coerceIn(0f, 1f) else 1f
         val sizeScore = (1f - ((sizeRatio - 1f) / (effectiveSizeThreshold - 1f).coerceAtLeast(0.01f))).coerceIn(0f, 1f)
-        val labelScore = if (lastKnownLabel != null && candidate.label == lastKnownLabel) 1f else 0f
+        val labelScore = if (lockedLabel != null && candidate.label == lockedLabel) 1f else 0f
 
         // Weight distribution depends on whether we have appearance data.
         // With appearance: it gets the dominant share (replaces most of label weight

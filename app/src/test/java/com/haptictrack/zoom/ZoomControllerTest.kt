@@ -35,8 +35,8 @@ class ZoomControllerTest {
 
     @Test
     fun `holds steady when subject is well-framed`() {
-        // Object at roughly target occupancy: ~9% area, target is 9% (0.3^2)
-        val box = RectF(0.35f, 0.35f, 0.65f, 0.65f) // 0.3 * 0.3 = 0.09
+        // Object at roughly target occupancy: ~30% area, target is 0.3
+        val box = RectF(0.2f, 0.2f, 0.75f, 0.75f) // 0.55 * 0.55 = 0.3025 area
         val result = zoom.calculateZoom(box, minZoom = 1f, maxZoom = 10f)
         assertEquals(1f, result, 0.001f)
     }
@@ -78,7 +78,7 @@ class ZoomControllerTest {
         repeat(10) { zoom.calculateZoom(box, 1f, 10f) }
         zoom.reset()
         // After reset, a well-framed object should give 1.0
-        val box2 = RectF(0.35f, 0.35f, 0.65f, 0.65f)
+        val box2 = RectF(0.2f, 0.2f, 0.75f, 0.75f) // ~30% area
         assertEquals(1f, zoom.calculateZoom(box2, 1f, 10f), 0.001f)
     }
 

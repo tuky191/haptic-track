@@ -679,6 +679,34 @@ class ReacquisitionEngineTest {
         assertEquals("Food", engine.lastKnownLabel)
     }
 
+    @Test
+    fun `label flicker during tracking does not corrupt re-acquisition scoring`() {
+        // Lock on a bowl
+        engine.lock(1, RectF(0.4f, 0.4f, 0.6f, 0.6f), "bowl")
+        assertEquals("bowl", engine.lockedLabel)
+
+        // Direct match with flickered label — updates lastKnownLabel
+        val flickered = listOf(
+            obj(id = 1, left = 0.41f, top = 0.41f, right = 0.61f, bottom = 0.61f, label = "potted plant")
+        )
+        engine.processFrame(flickered)
+        assertEquals("potted plant", engine.lastKnownLabel)
+        assertEquals("bowl", engine.lockedLabel) // lockedLabel unchanged
+
+        // Object lost — re-acquisition should prefer "bowl", not "potted plant"
+        engine.lock(1, RectF(0.4f, 0.4f, 0.6f, 0.6f), "bowl")
+        // Simulate loss
+        val noMatch = listOf(
+            obj(id = 99, left = 0.4f, top = 0.4f, right = 0.6f, bottom = 0.6f, label = "potted plant"),
+            obj(id = 100, left = 0.41f, top = 0.41f, right = 0.61f, bottom = 0.61f, label = "bowl")
+        )
+        // Lose the locked id
+        repeat(2) { engine.processFrame(emptyList()) }
+
+        val result = engine.findBestCandidate(noMatch)
+        assertEquals("bowl", result?.label)
+    }
+
     // --- Helpers ---
 
     private fun obj(

@@ -53,14 +53,19 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 zoomController.calculateEdgeProximity(it.boundingBox)
             } ?: 0f
 
-            if (lockedObject != null) {
-                val targetZoom = zoomController.calculateZoom(
+            val targetZoom = if (lockedObject != null) {
+                zoomController.calculateZoom(
                     lockedObject.boundingBox,
                     cameraManager.getMinZoom(),
                     cameraManager.getMaxZoom()
-                )
-                cameraManager.setZoomRatio(targetZoom)
-            }
+                ).also { cameraManager.setZoomRatio(it) }
+            } else if (status == TrackingStatus.LOST && previousStatus == TrackingStatus.LOCKED) {
+                // Just lost — zoom out partially to widen field of view for re-acquisition
+                zoomController.zoomOutForSearch(
+                    cameraManager.getMinZoom(),
+                    cameraManager.getMaxZoom()
+                ).also { cameraManager.setZoomRatio(it) }
+            } else null
 
             hapticManager.updateTrackingStatus(status, edgeProximity)
 
@@ -71,13 +76,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     detectedObjects = allObjects,
                     sourceImageWidth = imgWidth,
                     sourceImageHeight = imgHeight,
-                    currentZoomRatio = lockedObject?.let {
-                        zoomController.calculateZoom(
-                            it.boundingBox,
-                            cameraManager.getMinZoom(),
-                            cameraManager.getMaxZoom()
-                        )
-                    } ?: current.currentZoomRatio
+                    currentZoomRatio = targetZoom ?: current.currentZoomRatio
                 )
             }
         }
