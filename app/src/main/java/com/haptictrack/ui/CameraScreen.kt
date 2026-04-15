@@ -3,6 +3,12 @@ package com.haptictrack.ui
 import android.graphics.RectF
 import android.view.MotionEvent
 import androidx.camera.view.PreviewView
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
@@ -20,15 +26,16 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.DrawScope
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInteropFilter
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -44,15 +51,14 @@ import com.haptictrack.tracking.TrackedObject
 import com.haptictrack.tracking.TrackingStatus
 import com.haptictrack.tracking.TrackingUiState
 import com.haptictrack.ui.theme.HapticAmber
+import com.haptictrack.ui.theme.HapticCyan
 import com.haptictrack.ui.theme.HapticGreen
 import com.haptictrack.ui.theme.HapticRed
+import kotlinx.coroutines.delay
 
 /**
  * Computes the FILL_CENTER transform: scale + offset to map normalized image
  * coordinates (0..1) to screen pixel coordinates.
- *
- * FILL_CENTER scales the image so the shorter dimension fills the view,
- * then crops the longer dimension equally on both sides.
  */
 private data class FillCenterTransform(
     val scale: Float,
@@ -75,12 +81,9 @@ private fun computeFillCenterTransform(
     val viewAspect = viewWidth / viewHeight
     val imageAspect = imageWidth.toFloat() / imageHeight.toFloat()
 
-    // FILL_CENTER: scale so the image fully covers the view, then crop
     val scale = if (imageAspect > viewAspect) {
-        // Image is wider than view → match heights, crop width
         viewHeight / imageHeight
     } else {
-        // Image is taller than view → match widths, crop height
         viewWidth / imageWidth
     }
 
@@ -92,14 +95,12 @@ private fun computeFillCenterTransform(
     return FillCenterTransform(scale, offsetX, offsetY, mappedWidth, mappedHeight)
 }
 
-/** Map a normalized image coordinate to screen pixel coordinate. */
 private fun FillCenterTransform.toScreenX(normalizedX: Float): Float =
     offsetX + normalizedX * mappedWidth
 
 private fun FillCenterTransform.toScreenY(normalizedY: Float): Float =
     offsetY + normalizedY * mappedHeight
 
-/** Map a screen pixel coordinate back to normalized image coordinate. */
 private fun FillCenterTransform.toNormalizedX(screenX: Float): Float =
     (screenX - offsetX) / mappedWidth
 
@@ -131,6 +132,20 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
             viewModel.startCamera(lifecycleOwner, previewView)
         }
 
+        // Track re-acquire flash: cyan for 500ms after re-acquisition
+        var reacquireFlash by remember { mutableStateOf(false) }
+        var previousStatus by remember { mutableStateOf(TrackingStatus.IDLE) }
+
+        LaunchedEffect(uiState.status, uiState.trackedObject?.id) {
+            if (uiState.status == TrackingStatus.LOCKED &&
+                (previousStatus == TrackingStatus.LOST || previousStatus == TrackingStatus.SEARCHING)) {
+                reacquireFlash = true
+                delay(500)
+                reacquireFlash = false
+            }
+            previousStatus = uiState.status
+        }
+
         Box(modifier = Modifier.fillMaxSize()) {
             // Camera preview
             AndroidView(
@@ -153,11 +168,11 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                     }
             )
 
-            // Bounding box overlay (Canvas)
-            BoundingBoxOverlay(uiState)
+            // Bounding box overlay
+            BoundingBoxOverlay(uiState, reacquireFlash)
 
-            // Labels overlay (Compose Text elements positioned over boxes)
-            ObjectLabelOverlay(uiState)
+            // Label overlay (locked object only)
+            LockedLabelOverlay(uiState)
 
             // Status indicator
             StatusBadge(
@@ -199,73 +214,164 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Bounding Box Overlay
+// ---------------------------------------------------------------------------
+
 @Composable
-private fun BoundingBoxOverlay(state: TrackingUiState) {
+private fun BoundingBoxOverlay(state: TrackingUiState, reacquireFlash: Boolean) {
     val lockedId = state.trackedObject?.id
+    val isLocked = state.status == TrackingStatus.LOCKED
+    val isLost = state.status == TrackingStatus.LOST
+    val isIdle = state.status == TrackingStatus.IDLE
+
+    // Pulsing alpha for lost/searching state
+    val pulseTransition = rememberInfiniteTransition(label = "lostPulse")
+    val pulseAlpha by pulseTransition.animateFloat(
+        initialValue = 0.3f,
+        targetValue = 0.8f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(800, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "pulseAlpha"
+    )
+
     Canvas(modifier = Modifier.fillMaxSize()) {
         val transform = computeFillCenterTransform(
             size.width, size.height,
             state.sourceImageWidth, state.sourceImageHeight
         )
 
-        state.detectedObjects.forEach { obj ->
-            val isLocked = obj.id == lockedId && state.status == TrackingStatus.LOCKED
-            val color = if (isLocked) HapticGreen else Color.White.copy(alpha = 0.5f)
-            val strokeWidth = if (isLocked) 4f else 2f
-
-            drawMappedRect(obj.boundingBox, transform, color, strokeWidth)
-
-            if (isLocked) {
-                drawCornerAccents(obj.boundingBox, transform)
+        if (isIdle) {
+            // Idle: show subtle corner dots on all detections
+            state.detectedObjects.forEach { obj ->
+                drawCornerDots(obj.boundingBox, transform)
             }
-        }
-
-        // Draw last-known box for lost object
-        if (state.status == TrackingStatus.LOST && state.trackedObject != null) {
-            drawMappedRect(state.trackedObject.boundingBox, transform, HapticRed.copy(alpha = 0.5f), 3f)
+        } else if (isLocked) {
+            // Locked: show only the locked object's brackets, hide everything else
+            state.detectedObjects.forEach { obj ->
+                if (obj.id == lockedId) {
+                    val color = if (reacquireFlash) HapticCyan else HapticGreen
+                    drawBrackets(obj.boundingBox, transform, color)
+                }
+            }
+        } else if (isLost && state.trackedObject != null) {
+            // Lost: pulsing dashed brackets at last known position
+            drawDashedBrackets(
+                state.trackedObject.boundingBox, transform,
+                HapticRed.copy(alpha = pulseAlpha)
+            )
         }
     }
 }
 
-private fun DrawScope.drawMappedRect(
-    box: RectF,
-    transform: FillCenterTransform,
-    color: Color,
-    strokeWidth: Float
-) {
-    val left = transform.toScreenX(box.left)
-    val top = transform.toScreenY(box.top)
-    val right = transform.toScreenX(box.right)
-    val bottom = transform.toScreenY(box.bottom)
+/** Compute stroke width that scales with box size, clamped to [2, 6] px. */
+private fun scaledStroke(boxWidthPx: Float, boxHeightPx: Float): Float {
+    return (minOf(boxWidthPx, boxHeightPx) * 0.008f).coerceIn(2f, 6f)
+}
 
-    drawRect(
-        color = color,
-        topLeft = Offset(left, top),
-        size = Size(right - left, bottom - top),
-        style = Stroke(width = strokeWidth)
+/** Map a normalized box to screen pixel coordinates. */
+private fun mapBox(
+    box: RectF,
+    transform: FillCenterTransform
+): FloatArray {
+    return floatArrayOf(
+        transform.toScreenX(box.left),
+        transform.toScreenY(box.top),
+        transform.toScreenX(box.right),
+        transform.toScreenY(box.bottom)
     )
 }
 
-private fun DrawScope.drawCornerAccents(box: RectF, transform: FillCenterTransform) {
-    val left = transform.toScreenX(box.left)
-    val top = transform.toScreenY(box.top)
-    val right = transform.toScreenX(box.right)
-    val bottom = transform.toScreenY(box.bottom)
-    val cornerLen = minOf(right - left, bottom - top) * 0.2f
+/**
+ * Draw camera-viewfinder-style corner brackets with shadow.
+ */
+private fun DrawScope.drawBrackets(
+    box: RectF,
+    transform: FillCenterTransform,
+    color: Color
+) {
+    val (left, top, right, bottom) = mapBox(box, transform)
+    val w = right - left
+    val h = bottom - top
+    val cornerLen = minOf(w, h) * 0.2f
+    val stroke = scaledStroke(w, h)
 
-    drawLine(HapticGreen, Offset(left, top), Offset(left + cornerLen, top), 6f)
-    drawLine(HapticGreen, Offset(left, top), Offset(left, top + cornerLen), 6f)
-    drawLine(HapticGreen, Offset(right, top), Offset(right - cornerLen, top), 6f)
-    drawLine(HapticGreen, Offset(right, top), Offset(right, top + cornerLen), 6f)
-    drawLine(HapticGreen, Offset(left, bottom), Offset(left + cornerLen, bottom), 6f)
-    drawLine(HapticGreen, Offset(left, bottom), Offset(left, bottom - cornerLen), 6f)
-    drawLine(HapticGreen, Offset(right, bottom), Offset(right - cornerLen, bottom), 6f)
-    drawLine(HapticGreen, Offset(right, bottom), Offset(right, bottom - cornerLen), 6f)
+    // Shadow pass
+    val shadow = Color.Black.copy(alpha = 0.4f)
+    val shadowOffset = 1.5f
+    drawBracketLines(left + shadowOffset, top + shadowOffset, right + shadowOffset, bottom + shadowOffset,
+        cornerLen, shadow, stroke)
+
+    // Color pass
+    drawBracketLines(left, top, right, bottom, cornerLen, color, stroke)
 }
 
+/**
+ * Draw dashed corner brackets (for lost/searching state).
+ */
+private fun DrawScope.drawDashedBrackets(
+    box: RectF,
+    transform: FillCenterTransform,
+    color: Color
+) {
+    val (left, top, right, bottom) = mapBox(box, transform)
+    val w = right - left
+    val h = bottom - top
+    val cornerLen = minOf(w, h) * 0.2f
+    val stroke = scaledStroke(w, h)
+    val dashEffect = PathEffect.dashPathEffect(floatArrayOf(8f, 6f), 0f)
+
+    drawBracketLines(left, top, right, bottom, cornerLen, color, stroke, dashEffect)
+}
+
+/**
+ * Draw the eight bracket line segments (two per corner).
+ */
+private fun DrawScope.drawBracketLines(
+    left: Float, top: Float, right: Float, bottom: Float,
+    cornerLen: Float, color: Color, strokeWidth: Float,
+    pathEffect: PathEffect? = null
+) {
+    // Top-left
+    drawLine(color, Offset(left, top), Offset(left + cornerLen, top), strokeWidth, pathEffect = pathEffect)
+    drawLine(color, Offset(left, top), Offset(left, top + cornerLen), strokeWidth, pathEffect = pathEffect)
+    // Top-right
+    drawLine(color, Offset(right, top), Offset(right - cornerLen, top), strokeWidth, pathEffect = pathEffect)
+    drawLine(color, Offset(right, top), Offset(right, top + cornerLen), strokeWidth, pathEffect = pathEffect)
+    // Bottom-left
+    drawLine(color, Offset(left, bottom), Offset(left + cornerLen, bottom), strokeWidth, pathEffect = pathEffect)
+    drawLine(color, Offset(left, bottom), Offset(left, bottom - cornerLen), strokeWidth, pathEffect = pathEffect)
+    // Bottom-right
+    drawLine(color, Offset(right, bottom), Offset(right - cornerLen, bottom), strokeWidth, pathEffect = pathEffect)
+    drawLine(color, Offset(right, bottom), Offset(right, bottom - cornerLen), strokeWidth, pathEffect = pathEffect)
+}
+
+/**
+ * Draw subtle corner dots for untracked detections (idle state only).
+ */
+private fun DrawScope.drawCornerDots(box: RectF, transform: FillCenterTransform) {
+    val (left, top, right, bottom) = mapBox(box, transform)
+    val w = right - left
+    val h = bottom - top
+    val radius = (minOf(w, h) * 0.012f).coerceIn(2f, 5f)
+    val color = Color.White.copy(alpha = 0.4f)
+
+    drawCircle(color, radius, Offset(left, top))
+    drawCircle(color, radius, Offset(right, top))
+    drawCircle(color, radius, Offset(left, bottom))
+    drawCircle(color, radius, Offset(right, bottom))
+}
+
+// ---------------------------------------------------------------------------
+// Label Overlay — locked object only
+// ---------------------------------------------------------------------------
+
 @Composable
-private fun ObjectLabelOverlay(state: TrackingUiState) {
-    val lockedId = state.trackedObject?.id
+private fun LockedLabelOverlay(state: TrackingUiState) {
+    if (state.status != TrackingStatus.LOCKED || state.trackedObject == null) return
+    val obj = state.trackedObject
 
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val parentWidth = constraints.maxWidth.toFloat()
@@ -276,55 +382,43 @@ private fun ObjectLabelOverlay(state: TrackingUiState) {
             state.sourceImageWidth, state.sourceImageHeight
         )
 
-        state.detectedObjects.forEach { obj ->
-            val labelText = formatObjectLabel(obj)
-            val isLocked = obj.id == lockedId && state.status == TrackingStatus.LOCKED
-            val bgColor = if (isLocked) HapticGreen else Color.Black.copy(alpha = 0.6f)
+        val label = obj.label ?: return@BoxWithConstraints
 
-            val xPx = transform.toScreenX(obj.boundingBox.left)
-            val yPx = transform.toScreenY(obj.boundingBox.top) - with(density) { 20.dp.toPx() }
+        val left = transform.toScreenX(obj.boundingBox.left)
+        val bottom = transform.toScreenY(obj.boundingBox.bottom)
+        val boxWidthPx = transform.toScreenX(obj.boundingBox.right) - left
+        val boxHeightPx = bottom - transform.toScreenY(obj.boundingBox.top)
 
-            Text(
-                text = labelText,
-                color = Color.White,
-                fontSize = 11.sp,
-                modifier = Modifier
-                    .offset(
-                        x = with(density) { xPx.toDp() },
-                        y = with(density) { yPx.coerceAtLeast(0f).toDp() }
-                    )
-                    .background(bgColor, RoundedCornerShape(4.dp))
-                    .padding(horizontal = 6.dp, vertical = 2.dp)
-            )
-        }
+        // Scale font with box size, clamped to 10–16sp
+        val fontSize = (boxHeightPx * 0.06f).coerceIn(
+            with(density) { 10.sp.toPx() },
+            with(density) { 16.sp.toPx() }
+        )
+        val fontSizeSp = with(density) { fontSize.toSp() }
 
-        // Label for lost object
-        if (state.status == TrackingStatus.LOST && state.trackedObject != null) {
-            val obj = state.trackedObject
-            val xPx = transform.toScreenX(obj.boundingBox.left)
-            val yPx = transform.toScreenY(obj.boundingBox.top) - with(density) { 20.dp.toPx() }
+        // Position inside the box, bottom-left with small inset
+        val inset = with(density) { 4.dp.toPx() }
+        val xPx = left + inset
+        val yPx = bottom - fontSize - inset * 2
 
-            Text(
-                text = "Lost: ${obj.label ?: "Object"}",
-                color = Color.White,
-                fontSize = 11.sp,
-                modifier = Modifier
-                    .offset(
-                        x = with(density) { xPx.toDp() },
-                        y = with(density) { yPx.coerceAtLeast(0f).toDp() }
-                    )
-                    .background(HapticRed.copy(alpha = 0.7f), RoundedCornerShape(4.dp))
-                    .padding(horizontal = 6.dp, vertical = 2.dp)
-            )
-        }
+        Text(
+            text = label,
+            color = Color.White,
+            fontSize = fontSizeSp,
+            modifier = Modifier
+                .offset(
+                    x = with(density) { xPx.toDp() },
+                    y = with(density) { yPx.coerceAtLeast(0f).toDp() }
+                )
+                .background(Color.Black.copy(alpha = 0.5f), RoundedCornerShape(4.dp))
+                .padding(horizontal = 6.dp, vertical = 2.dp)
+        )
     }
 }
 
-private fun formatObjectLabel(obj: TrackedObject): String {
-    val label = obj.label ?: return "Object #${obj.id}"
-    val pct = (obj.confidence * 100).toInt()
-    return if (pct > 0) "$label $pct%" else label
-}
+// ---------------------------------------------------------------------------
+// Status Badge & Record Button
+// ---------------------------------------------------------------------------
 
 @Composable
 private fun StatusBadge(state: TrackingUiState, modifier: Modifier = Modifier) {
