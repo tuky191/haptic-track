@@ -76,7 +76,13 @@ class ObjectTracker(
             }
 
             val embeddings = appearanceEmbedder.embedWithAugmentations(bmp, boundingBox)
-            reacquisition.lock(trackingId, boundingBox, label, embeddings)
+            // Compute color histogram on the masked crop for better discrimination
+            val maskedCrop = appearanceEmbedder.getMaskedCrop(bmp, boundingBox)
+            val colorHist = if (maskedCrop != null) {
+                val fullBox = RectF(0f, 0f, 1f, 1f) // crop is already the object
+                computeColorHistogram(maskedCrop, fullBox).also { maskedCrop.recycle() }
+            } else computeColorHistogram(bmp, boundingBox)
+            reacquisition.lock(trackingId, boundingBox, label, embeddings, colorHist)
             visualTracker.init(bmp, boundingBox)
 
             val locked = TrackedObject(trackingId, boundingBox, label)
@@ -204,7 +210,13 @@ class ObjectTracker(
             val withEmbeddings = if (needEmbeddings) {
                 tracked.map { obj ->
                     val emb = appearanceEmbedder.embed(bitmap, obj.boundingBox)
-                    if (emb != null) obj.copy(embedding = emb) else obj
+                    // Compute histogram on masked crop to exclude background
+                    val maskedCrop = appearanceEmbedder.getMaskedCrop(bitmap, obj.boundingBox)
+                    val hist = if (maskedCrop != null) {
+                        val fullBox = RectF(0f, 0f, 1f, 1f)
+                        computeColorHistogram(maskedCrop, fullBox).also { maskedCrop.recycle() }
+                    } else computeColorHistogram(bitmap, obj.boundingBox)
+                    obj.copy(embedding = emb, colorHistogram = hist)
                 }
             } else tracked
 

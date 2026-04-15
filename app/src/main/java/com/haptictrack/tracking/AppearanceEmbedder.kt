@@ -138,6 +138,14 @@ class AppearanceEmbedder(context: Context) {
         return segmenter.extractContour(bitmap, normalizedBox)
     }
 
+    /**
+     * Get the segmented (masked) crop for color histogram computation.
+     * Returns null if segmentation fails. Caller must recycle the bitmap.
+     */
+    fun getMaskedCrop(bitmap: Bitmap, normalizedBox: RectF): Bitmap? {
+        return segmenter.segmentAndCrop(bitmap, normalizedBox)
+    }
+
     fun shutdown() {
         embedder.close()
         segmenter.shutdown()

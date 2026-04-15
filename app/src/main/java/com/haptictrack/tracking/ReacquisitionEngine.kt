@@ -42,6 +42,9 @@ class ReacquisitionEngine(
 
     /** Convenience: true if we have any reference embeddings. */
     val hasEmbeddings: Boolean get() = _embeddingGallery.isNotEmpty()
+    /** Reference color histogram from lock time. */
+    var lockedColorHistogram: FloatArray? = null
+        private set
     var lastKnownBox: RectF? = null
         private set
     var lastKnownLabel: String? = null
@@ -59,15 +62,17 @@ class ReacquisitionEngine(
         lock(trackingId, boundingBox, label, if (embedding != null) listOf(embedding) else emptyList())
     }
 
-    fun lock(trackingId: Int, boundingBox: RectF, label: String?, embeddings: List<FloatArray>) {
+    fun lock(trackingId: Int, boundingBox: RectF, label: String?, embeddings: List<FloatArray>,
+             colorHist: FloatArray? = null) {
         lockedId = trackingId
         lockedLabel = label
         _embeddingGallery = embeddings.map { it.copyOf() }.toMutableList()
+        lockedColorHistogram = colorHist?.copyOf()
         lastKnownBox = RectF(boundingBox)
         lastKnownLabel = label
         lastKnownSize = boundingBox.width() * boundingBox.height()
         framesLost = 0
-        Log.i(TAG, "LOCK id=$trackingId label=\"$label\" box=${fmtBox(boundingBox)} size=${fmtF(lastKnownSize)} gallery=${embeddingGallery.size}")
+        Log.i(TAG, "LOCK id=$trackingId label=\"$label\" box=${fmtBox(boundingBox)} size=${fmtF(lastKnownSize)} gallery=${embeddingGallery.size} colorHist=${colorHist != null}")
     }
 
     /** Add a new embedding to the gallery (e.g. from a confirmed visual tracker frame). */
@@ -88,6 +93,7 @@ class ReacquisitionEngine(
         lockedId = null
         lockedLabel = null
         _embeddingGallery.clear()
+        lockedColorHistogram = null
         lastKnownBox = null
         lastKnownLabel = null
         lastKnownSize = 0f
@@ -185,9 +191,12 @@ class ReacquisitionEngine(
             val sim = if (hasEmbeddings && candidate.embedding != null) {
                 bestGallerySimilarity(candidate.embedding!!)
             } else null
+            val colorSim = if (lockedColorHistogram != null && candidate.colorHistogram != null) {
+                histogramCorrelation(lockedColorHistogram!!, candidate.colorHistogram!!)
+            } else null
             if (score != null) {
                 if (logThis) {
-                    Log.d(TAG, "  scored id=${candidate.id} label=\"${candidate.label}\" score=${fmtF(score)} sim=${sim?.let { fmtF(it) } ?: "n/a"} (min=${fmtF(minScoreThreshold)})")
+                    Log.d(TAG, "  scored id=${candidate.id} label=\"${candidate.label}\" score=${fmtF(score)} sim=${sim?.let { fmtF(it) } ?: "n/a"} color=${colorSim?.let { fmtF(it) } ?: "n/a"} (min=${fmtF(minScoreThreshold)})")
                 }
                 Pair(candidate, score)
             } else {
@@ -253,25 +262,35 @@ class ReacquisitionEngine(
         val sizeScore = (1f - ((sizeRatio - 1f) / (effectiveSizeThreshold - 1f).coerceAtLeast(0.01f))).coerceIn(0f, 1f)
         val labelScore = if (lockedLabel != null && candidate.label == lockedLabel) 1f else 0f
 
-        // Weight distribution depends on whether we have appearance data.
-        // With appearance: it gets the dominant share (replaces most of label weight
-        // since visual identity is strictly more informative than category label).
+        // Color histogram similarity — cheap but very effective for same-category discrimination
+        val hasColor = lockedColorHistogram != null && candidate.colorHistogram != null
+        val colorScore = if (hasColor) {
+            histogramCorrelation(lockedColorHistogram!!, candidate.colorHistogram!!)
+                .coerceIn(0f, 1f)
+        } else 0f
+
+        // Weight distribution depends on available signals.
         if (hasAppearance) {
-            val basePositionWeight = 0.20f
-            val baseSizeWeight = 0.15f
-            val baseLabelWeight = 0.20f
-            val baseAppearanceWeight = 0.45f
+            val basePositionWeight = 0.15f
+            val baseSizeWeight = 0.10f
+            val baseLabelWeight = 0.10f
+            val baseAppearanceWeight = 0.40f
+            val baseColorWeight = if (hasColor) 0.25f else 0f
+            // Redistribute color weight to appearance if no histogram
+            val effectiveAppearanceBase = baseAppearanceWeight + if (!hasColor) 0.25f else 0f
 
             val effectivePositionWeight = basePositionWeight * positionConfidence
             val redistributed = basePositionWeight * (1f - positionConfidence)
-            val effectiveSizeWeight = baseSizeWeight + redistributed * 0.15f
-            val effectiveLabelWeight = baseLabelWeight + redistributed * 0.15f
-            val effectiveAppearanceWeight = baseAppearanceWeight + redistributed * 0.7f
+            val effectiveSizeWeight = baseSizeWeight + redistributed * 0.10f
+            val effectiveLabelWeight = baseLabelWeight + redistributed * 0.10f
+            val effectiveAppearanceWeight = effectiveAppearanceBase + redistributed * 0.50f
+            val effectiveColorWeight = baseColorWeight + redistributed * 0.30f
 
             return (positionScore * effectivePositionWeight) +
                    (sizeScore * effectiveSizeWeight) +
                    (labelScore * effectiveLabelWeight) +
-                   (appearanceScore * effectiveAppearanceWeight)
+                   (appearanceScore * effectiveAppearanceWeight) +
+                   (colorScore * effectiveColorWeight)
         } else {
             // Fallback: no embedding available, use original weights
             val basePositionWeight = 0.45f
