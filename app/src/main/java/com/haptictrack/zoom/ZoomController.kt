@@ -44,9 +44,9 @@ class ZoomController(
 
     companion object {
         /** Object touching frame edge — actively zoom out. */
-        private const val CLIP_THRESHOLD = 0.01f
+        private const val CLIP_THRESHOLD = 0.02f
         /** Object near frame edge — stop zooming in. */
-        private const val EDGE_MARGIN = 0.05f
+        private const val EDGE_MARGIN = 0.08f
     }
 
     /**
