@@ -23,7 +23,7 @@ class AppearanceEmbedder(context: Context) {
 
     companion object {
         private const val TAG = "AppearEmbed"
-        private const val MODEL_PATH = "mobilenet_v3_small_075_224_embedder.tflite"
+        private const val MODEL_PATH = "mobilenet_v3_large_embedder.tflite"
     }
 
     private val embedder: ImageEmbedder
@@ -44,12 +44,24 @@ class AppearanceEmbedder(context: Context) {
     }
 
     /**
-     * Extract an embedding from a crop of the given bitmap at the normalized bounding box.
-     * Uses the segmenter to mask out background pixels before embedding.
-     * Returns null if the crop is invalid.
+     * Extract an embedding using segmentation masking. Returns null if segmentation
+     * fails — caller should NOT match against unmasked embeddings since they include
+     * too much background noise for reliable identity discrimination.
      */
     fun embed(bitmap: Bitmap, normalizedBox: RectF): FloatArray? {
-        // Try segmented crop first; fall back to raw crop if segmentation fails
+        val crop = segmenter.segmentAndCrop(bitmap, normalizedBox) ?: return null
+        return try {
+            embedBitmap(crop)
+        } finally {
+            crop.recycle()
+        }
+    }
+
+    /**
+     * Extract an embedding with raw crop fallback. Used at lock time when we need
+     * at least some embedding in the gallery even if segmentation fails.
+     */
+    fun embedWithFallback(bitmap: Bitmap, normalizedBox: RectF): FloatArray? {
         val crop = segmenter.segmentAndCrop(bitmap, normalizedBox)
             ?: cropNormalized(bitmap, normalizedBox)
             ?: return null
