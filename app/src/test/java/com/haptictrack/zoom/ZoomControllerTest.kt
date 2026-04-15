@@ -85,16 +85,15 @@ class ZoomControllerTest {
     // --- Edge awareness ---
 
     @Test
-    fun `does not zoom in when object is near edge`() {
-        // Small object near the right edge — should NOT zoom in
-        val box = RectF(0.92f, 0.4f, 0.99f, 0.5f) // right edge, small
-        val result = zoom.calculateZoom(box, minZoom = 1f, maxZoom = 10f)
+    fun `holds steady when near edge but not clipped`() {
+        // right=0.95: > 1-0.08=0.92 (near edge), < 1-0.02=0.98 (not clipped)
+        val box = RectF(0.85f, 0.4f, 0.95f, 0.5f)
+        val result = zoom.calculateZoom(box, minZoom = 0.5f, maxZoom = 10f)
         assertEquals("Should hold steady near edge", 1f, result, 0.001f)
     }
 
     @Test
-    fun `zooms out when object is clipped at edge`() {
-        // Object touching the bottom edge — should zoom out
+    fun `zooms out when object is clipped at bottom`() {
         val box = RectF(0.3f, 0.7f, 0.7f, 1.0f) // bottom clipped
         val result = zoom.calculateZoom(box, minZoom = 0.5f, maxZoom = 10f)
         assertTrue("Should zoom out when clipped, got $result", result < 1f)
@@ -109,18 +108,25 @@ class ZoomControllerTest {
 
     @Test
     fun `still zooms in when small and centered`() {
-        // Small centered object — safe to zoom in
         val box = RectF(0.45f, 0.45f, 0.55f, 0.55f)
         val result = zoom.calculateZoom(box, minZoom = 1f, maxZoom = 10f)
         assertTrue("Should zoom in when centered and small, got $result", result > 1f)
     }
 
     @Test
-    fun `near-edge large object still zooms out`() {
-        // Large object near edge — nearEdge is true AND too large
-        val box = RectF(0.02f, 0.1f, 0.9f, 0.9f) // near left edge, large
+    fun `near-edge large object zooms out`() {
+        // left=0.05: < 0.08 (near edge), > 0.02 (not clipped). Area > targetArea*1.5
+        val box = RectF(0.05f, 0.1f, 0.95f, 0.9f)
         val result = zoom.calculateZoom(box, minZoom = 0.5f, maxZoom = 10f)
         assertTrue("Should zoom out when near edge and large, got $result", result < 1f)
+    }
+
+    @Test
+    fun `near-edge small object does not zoom in`() {
+        // top=0.04: < 0.08 (near edge), > 0.02 (not clipped). Small area.
+        val box = RectF(0.4f, 0.04f, 0.6f, 0.15f)
+        val result = zoom.calculateZoom(box, minZoom = 0.5f, maxZoom = 10f)
+        assertEquals("Should hold steady near edge even if small", 1f, result, 0.001f)
     }
 
     // --- Edge proximity ---
