@@ -119,6 +119,13 @@ class AppearanceEmbedder(context: Context) {
         return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
     }
 
+    /**
+     * Extract the object contour as normalized [0,1] points for UI overlay.
+     */
+    fun extractContour(bitmap: Bitmap, normalizedBox: RectF): List<android.graphics.PointF> {
+        return segmenter.extractContour(bitmap, normalizedBox)
+    }
+
     fun shutdown() {
         embedder.close()
         segmenter.shutdown()

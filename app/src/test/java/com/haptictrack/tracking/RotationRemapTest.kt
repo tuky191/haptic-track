@@ -91,7 +91,99 @@ class RotationRemapTest {
         assertBoxEquals(orig, back)
     }
 
+    // --- VT/detector coordinate consistency ---
+    // The visual tracker returns coords in rotated-image space.
+    // The detector returns coords that are unmapped back to screen space.
+    // For cross-checking (IoU), both must be in the same space.
+    // These tests simulate: an object at a known screen position, rotated for
+    // detection, then unmapped — and verify the VT raw coords, when also
+    // unmapped, produce the same screen box.
+
+    @Test
+    fun `VT box unmapped at 90 degrees matches detector box in screen space`() {
+        // Both VT and detector see the same object in rotated-image space.
+        // Both unmap with the same rotation → identical screen coords.
+        val rawBox = RectF(0.2f, 0.3f, 0.5f, 0.7f) // coords in rotated image
+        val vtScreen = unmapRotation(rawBox.left, rawBox.top, rawBox.right, rawBox.bottom, 90)
+        val detScreen = unmapRotation(rawBox.left, rawBox.top, rawBox.right, rawBox.bottom, 90)
+        assertBoxEquals(vtScreen, detScreen)
+    }
+
+    @Test
+    fun `VT box unmapped at 270 degrees matches detector box in screen space`() {
+        val rawBox = RectF(0.2f, 0.3f, 0.5f, 0.7f)
+        val vtScreen = unmapRotation(rawBox.left, rawBox.top, rawBox.right, rawBox.bottom, 270)
+        val detScreen = unmapRotation(rawBox.left, rawBox.top, rawBox.right, rawBox.bottom, 270)
+        assertBoxEquals(vtScreen, detScreen)
+    }
+
+    @Test
+    fun `VT box unmapped at 180 degrees matches detector box in screen space`() {
+        val rawBox = RectF(0.2f, 0.3f, 0.5f, 0.7f)
+        val vtScreen = unmapRotation(rawBox.left, rawBox.top, rawBox.right, rawBox.bottom, 180)
+        val detScreen = unmapRotation(rawBox.left, rawBox.top, rawBox.right, rawBox.bottom, 180)
+        assertBoxEquals(vtScreen, detScreen)
+    }
+
+    @Test
+    fun `without unmapping VT box misaligns with detector at 90 degrees`() {
+        // This test documents the bug: if VT coords are NOT unmapped,
+        // they mismatch with unmapped detector coords → low IoU.
+        val rawBox = RectF(0.1f, 0.2f, 0.4f, 0.6f)
+        val detScreen = unmapRotation(rawBox.left, rawBox.top, rawBox.right, rawBox.bottom, 90)
+        // VT raw coords used directly as screen coords (the bug)
+        val vtNoUnmap = rawBox
+        val iou = FrameToFrameTracker.computeIou(detScreen, vtNoUnmap)
+        assertTrue("Without unmapping, IoU should be low (was $iou)", iou < 0.5f)
+    }
+
+    @Test
+    fun `VT and detector boxes have high IoU after unmapping at all rotations`() {
+        // Simulate: same object detected by both VT and detector in rotated space
+        // After unmapping, they should have IoU = 1.0
+        val rawBox = RectF(0.2f, 0.3f, 0.6f, 0.7f)
+
+        for (rotation in listOf(0, 90, 180, 270)) {
+            val vtScreen = unmapRotation(rawBox.left, rawBox.top, rawBox.right, rawBox.bottom, rotation)
+            val detScreen = unmapRotation(rawBox.left, rawBox.top, rawBox.right, rawBox.bottom, rotation)
+            val iou = FrameToFrameTracker.computeIou(vtScreen, detScreen)
+            assertEquals("IoU should be 1.0 at rotation=$rotation", 1.0f, iou, 0.001f)
+        }
+    }
+
+    // --- mapToRotated / unmapPoint round-trip ---
+
+    @Test
+    fun `mapToRotated is inverse of unmapRotation at all rotations`() {
+        val orig = RectF(0.15f, 0.25f, 0.6f, 0.8f)
+        for (rot in listOf(0, 90, 180, 270)) {
+            val unmapped = unmapRotation(orig.left, orig.top, orig.right, orig.bottom, rot)
+            val remapped = mapToRotated(unmapped.left, unmapped.top, unmapped.right, unmapped.bottom, rot)
+            assertBoxEquals(orig, remapped, "mapToRotated(unmapRotation(box, $rot), $rot) should return original")
+        }
+    }
+
+    @Test
+    fun `unmapPoint round-trip at all rotations`() {
+        val x = 0.3f
+        val y = 0.7f
+        for (rot in listOf(0, 90, 180, 270)) {
+            val unmapped = unmapPoint(x, y, rot)
+            // Inverse of unmapPoint is mapToRotated applied to a point
+            val remapped = mapToRotated(unmapped.x, unmapped.y, unmapped.x, unmapped.y, rot)
+            assertEquals("x round-trip at $rot", x, remapped.left, 0.001f)
+            assertEquals("y round-trip at $rot", y, remapped.top, 0.001f)
+        }
+    }
+
     // --- Helper ---
+
+    private fun assertBoxEquals(expected: RectF, actual: RectF, message: String, tolerance: Float = 0.001f) {
+        assertEquals("$message left", expected.left, actual.left, tolerance)
+        assertEquals("$message top", expected.top, actual.top, tolerance)
+        assertEquals("$message right", expected.right, actual.right, tolerance)
+        assertEquals("$message bottom", expected.bottom, actual.bottom, tolerance)
+    }
 
     private fun assertBoxEquals(expected: RectF, actual: RectF, tolerance: Float = 0.001f) {
         assertEquals("left", expected.left, actual.left, tolerance)

@@ -3,6 +3,7 @@ package com.haptictrack.tracking
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Matrix
+import android.graphics.PointF
 import android.graphics.RectF
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
@@ -38,8 +39,16 @@ class ObjectTracker(
     private var vtConfirmedFrames = 0
     private val VT_MAX_UNCONFIRMED = 10  // ~0.3s at 30fps
 
-    /** Callback: (displayObjects, lockedObject, imageWidth, imageHeight) */
-    var onDetectionResult: ((List<TrackedObject>, TrackedObject?, Int, Int) -> Unit)? = null
+    /** Callback: (displayObjects, lockedObject, imageWidth, imageHeight, contour) */
+    var onDetectionResult: ((List<TrackedObject>, TrackedObject?, Int, Int, List<PointF>) -> Unit)? = null
+
+    // Contour extraction — disabled until the UI uses it (saves CPU/battery).
+    // Enable by setting to true when contour-based overlay is implemented.
+    private val contourEnabled = false
+    private var cachedContour: List<PointF> = emptyList()
+    private var contourFrameCount = 0
+    private val CONTOUR_UPDATE_INTERVAL_VT = 2
+    private val CONTOUR_UPDATE_INTERVAL_DET = 3
 
     init {
         val baseOptions = BaseOptions.builder()
@@ -81,6 +90,8 @@ class ObjectTracker(
         visualTracker.stop()
         vtUnconfirmedFrames = 0
         vtConfirmedFrames = 0
+        cachedContour = emptyList()
+        contourFrameCount = 0
     }
 
     val analyzer = ImageAnalysis.Analyzer { imageProxy ->
@@ -108,9 +119,11 @@ class ObjectTracker(
                     val detections = runDetector(bitmap, frameWidth, frameHeight)
                     val tracked = frameTracker.assignIds(detections)
 
-                    // Cross-check: does any detection with the locked label
-                    // overlap the visual tracker's box?
-                    val vtBox = vtResult.boundingBox
+                    // VT returns coords in rotated-image space; unmap to screen space
+                    // to match detector boxes (which are already unmapped).
+                    val deviceRot = deviceRotationProvider?.invoke() ?: 0
+                    val rawBox = vtResult.boundingBox
+                    val vtBox = unmapRotation(rawBox.left, rawBox.top, rawBox.right, rawBox.bottom, deviceRot)
                     val confirmed = tracked.any { det ->
                         det.label == reacquisition.lockedLabel &&
                         FrameToFrameTracker.computeIou(det.boundingBox, vtBox) > 0.15f
@@ -118,13 +131,14 @@ class ObjectTracker(
 
                     if (confirmed) {
                         vtUnconfirmedFrames = 0
-                        // Only sync lastKnownBox when detector confirms
-                        reacquisition.updateFromVisualTracker(vtResult.boundingBox)
+                        // Sync lastKnownBox in screen coords when detector confirms
+                        reacquisition.updateFromVisualTracker(vtBox)
 
                         // Accumulate embedding from current angle (every 30 confirmed frames ≈ 1s)
+                        // Use raw rotated-image coords for embedding (embedder works on rotated bitmap)
                         vtConfirmedFrames++
                         if (vtConfirmedFrames % 30 == 0) {
-                            val emb = appearanceEmbedder.embed(bitmap, vtResult.boundingBox)
+                            val emb = appearanceEmbedder.embed(bitmap, rawBox)
                             if (emb != null) {
                                 reacquisition.addEmbedding(emb)
                                 android.util.Log.d("AppearEmbed", "Gallery +1 → ${reacquisition.embeddingGallery.size} (accumulated)")
@@ -143,17 +157,27 @@ class ObjectTracker(
                     } else {
                         val lockedObj = TrackedObject(
                             id = reacquisition.lockedId ?: -1,
-                            boundingBox = vtResult.boundingBox,
+                            boundingBox = vtBox,
                             label = reacquisition.lastKnownLabel,
                             confidence = vtResult.confidence
                         )
                         // Include the visual tracker's box, but remove detector
                         // boxes that overlap it to avoid duplicate rectangles.
-                        val vtBox = vtResult.boundingBox
                         val displayObjects = filter.filter(tracked)
                             .filter { FrameToFrameTracker.computeIou(it.boundingBox, vtBox) < 0.3f } + lockedObj
 
-                        onDetectionResult?.invoke(displayObjects, lockedObj, frameWidth, frameHeight)
+                        // Update contour periodically, unmap from rotated to screen coords
+                        if (contourEnabled) {
+                            contourFrameCount++
+                            if (contourFrameCount % CONTOUR_UPDATE_INTERVAL_VT == 0) {
+                                cachedContour = unmapContour(
+                                    appearanceEmbedder.extractContour(bitmap, rawBox),
+                                    deviceRot
+                                )
+                            }
+                        }
+
+                        onDetectionResult?.invoke(displayObjects, lockedObj, frameWidth, frameHeight, cachedContour)
 
                         synchronized(lastFrameLock) {
                             lastFrameBitmap?.recycle()
@@ -209,7 +233,26 @@ class ObjectTracker(
             // Filter for display
             val displayObjects = filter.filter(withEmbeddings)
 
-            onDetectionResult?.invoke(displayObjects, lockedObject, frameWidth, frameHeight)
+            // Update contour on re-acquire or periodically (gated — disabled until UI uses it)
+            if (contourEnabled) {
+                val deviceRot = deviceRotationProvider?.invoke() ?: 0
+                if (lockedObject != null && reacquisition.framesLost == 0) {
+                    contourFrameCount++
+                    if (contourFrameCount % CONTOUR_UPDATE_INTERVAL_DET == 0 || (wasSearching && reacquisition.framesLost == 0)) {
+                        val screenBox = lockedObject.boundingBox
+                        val rotatedBox = mapToRotated(screenBox.left, screenBox.top, screenBox.right, screenBox.bottom, deviceRot)
+                        cachedContour = unmapContour(
+                            appearanceEmbedder.extractContour(bitmap, rotatedBox),
+                            deviceRot
+                        )
+                    }
+                } else if (!reacquisition.isLocked) {
+                    cachedContour = emptyList()
+                    contourFrameCount = 0
+                }
+            }
+
+            onDetectionResult?.invoke(displayObjects, lockedObject, frameWidth, frameHeight, cachedContour)
         } finally {
             imageProxy.close()
             bitmap.recycle()
@@ -349,4 +392,51 @@ internal fun unmapRotation(
         }
         else -> RectF(left, top, right, bottom)
     }
+}
+
+/**
+ * Forward-maps screen coordinates to rotated-image space (inverse of unmapRotation).
+ * Used to convert screen-space bounding boxes back to the rotated bitmap's coordinate system.
+ */
+internal fun mapToRotated(
+    left: Float, top: Float, right: Float, bottom: Float, deviceRot: Int
+): RectF {
+    // The forward map is the inverse of the unmap.
+    // unmapRotation undoes the rotation, so mapToRotated re-applies it.
+    return when (deviceRot) {
+        0 -> RectF(left, top, right, bottom)
+        180 -> RectF(1f - right, 1f - bottom, 1f - left, 1f - top)
+        90 -> {
+            // Inverse of unmap 90°: (x,y) → (1-y, x)
+            RectF(1f - bottom, left, 1f - top, right)
+        }
+        270 -> {
+            // Inverse of unmap 270°: (x,y) → (y, 1-x)
+            RectF(top, 1f - right, bottom, 1f - left)
+        }
+        else -> RectF(left, top, right, bottom)
+    }
+}
+
+/**
+ * Unmap a single normalized point from rotated-image space to screen space.
+ */
+internal fun unmapPoint(x: Float, y: Float, deviceRot: Int): PointF {
+    return when (deviceRot) {
+        0 -> PointF(x, y)
+        180 -> PointF(1f - x, 1f - y)
+        90 -> PointF(y, 1f - x)      // inverse of 90° CW
+        270 -> PointF(1f - y, x)      // inverse of 270° CW
+        else -> PointF(x, y)
+    }
+}
+
+/**
+ * Apply unmapRotation to each contour point (normalized [0,1] coords).
+ */
+internal fun unmapContour(
+    contour: List<PointF>, deviceRot: Int
+): List<PointF> {
+    if (deviceRot == 0 || contour.isEmpty()) return contour
+    return contour.map { pt -> unmapPoint(pt.x, pt.y, deviceRot) }
 }

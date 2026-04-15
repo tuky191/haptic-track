@@ -1,5 +1,6 @@
 package com.haptictrack.tracking
 
+import android.graphics.PointF
 import android.graphics.RectF
 
 enum class TrackingStatus {
@@ -45,5 +46,7 @@ data class TrackingUiState(
     /** Source image width (post-rotation, i.e. portrait width). */
     val sourceImageWidth: Int = 0,
     /** Source image height (post-rotation, i.e. portrait height). */
-    val sourceImageHeight: Int = 0
+    val sourceImageHeight: Int = 0,
+    /** Contour points of the locked object in normalized [0,1] coordinates. */
+    val lockedContour: List<PointF> = emptyList()
 )

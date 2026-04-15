@@ -3,6 +3,7 @@ package com.haptictrack.tracking
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.PointF
 import android.graphics.RectF
 import android.util.Log
 import com.google.mediapipe.framework.image.BitmapImageBuilder
@@ -10,6 +11,11 @@ import com.google.mediapipe.framework.image.ByteBufferExtractor
 import com.google.mediapipe.tasks.components.containers.NormalizedKeypoint
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.vision.interactivesegmenter.InteractiveSegmenter
+import org.opencv.core.CvType
+import org.opencv.core.Mat
+import org.opencv.core.MatOfPoint
+import org.opencv.core.MatOfPoint2f
+import org.opencv.imgproc.Imgproc
 
 /**
  * Segments an object from its background using MediaPipe Interactive Segmenter.
@@ -27,6 +33,7 @@ class ObjectSegmenter(context: Context) {
         private const val TAG = "ObjSegmenter"
         private const val MODEL_PATH = "magic_touch.tflite"
         /** Confidence threshold: pixels below this are considered background. */
+        /** Threshold for embedding masks. Contour extraction uses its own (higher) threshold. */
         private const val MASK_THRESHOLD = 0.5f
     }
 
@@ -177,6 +184,99 @@ class ObjectSegmenter(context: Context) {
         } catch (e: Exception) {
             Log.d(TAG, "Category mask extraction failed: ${e.message}")
             null
+        }
+    }
+
+    /**
+     * Extract the contour of the object at [normalizedBox] as normalized [0,1] points.
+     * Uses the segmentation mask + OpenCV findContours + approxPolyDP for a smooth outline.
+     * Returns an empty list on failure.
+     */
+    fun extractContour(bitmap: Bitmap, normalizedBox: RectF): List<PointF> {
+        var crop: Bitmap? = null
+        return try {
+            // Crop to bounding box with padding, then segment the crop.
+            // This gives the segmenter a close-up view → much tighter mask.
+            val imgW = bitmap.width
+            val imgH = bitmap.height
+            val pad = 0.05f // 5% padding around the box
+            val cropLeft = ((normalizedBox.left - pad) * imgW).toInt().coerceIn(0, imgW - 1)
+            val cropTop = ((normalizedBox.top - pad) * imgH).toInt().coerceIn(0, imgH - 1)
+            val cropRight = ((normalizedBox.right + pad) * imgW).toInt().coerceIn(cropLeft + 1, imgW)
+            val cropBottom = ((normalizedBox.bottom + pad) * imgH).toInt().coerceIn(cropTop + 1, imgH)
+            val cropW = cropRight - cropLeft
+            val cropH = cropBottom - cropTop
+            if (cropW < 10 || cropH < 10) return emptyList()
+
+            crop = Bitmap.createBitmap(bitmap, cropLeft, cropTop, cropW, cropH)
+            val inputCrop = if (crop.config != Bitmap.Config.ARGB_8888) {
+                val c = crop.copy(Bitmap.Config.ARGB_8888, false)
+                crop.recycle()
+                c.also { crop = it }
+            } else crop!!
+
+            val mpImage = BitmapImageBuilder(inputCrop).build()
+
+            // Keypoint at center of the crop
+            val roi = InteractiveSegmenter.RegionOfInterest.create(
+                NormalizedKeypoint.create(inputCrop.width / 2f, inputCrop.height / 2f)
+            )
+
+            val result = segmenter.segment(mpImage, roi)
+            val maskData = extractConfidenceMask(result) ?: extractCategoryMask(result) ?: return emptyList()
+            val maskW = maskData.first
+            val maskH = maskData.second
+            val pixels = maskData.third
+
+            // Build binary mask
+            val maskMat = Mat(maskH, maskW, CvType.CV_8UC1)
+            val maskBytes = ByteArray(maskW * maskH)
+            for (i in pixels.indices) {
+                maskBytes[i] = if (pixels[i] >= MASK_THRESHOLD) 255.toByte() else 0
+            }
+            maskMat.put(0, 0, maskBytes)
+
+            // Heavy erosion to shrink mask well inside the object boundary.
+            // This ensures the glow sits on the object, not on the background.
+            val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, org.opencv.core.Size(15.0, 15.0))
+            Imgproc.erode(maskMat, maskMat, kernel)
+            kernel.release()
+
+            // Find contours
+            val contours = mutableListOf<MatOfPoint>()
+            val hierarchy = Mat()
+            Imgproc.findContours(maskMat, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+            maskMat.release()
+            hierarchy.release()
+
+            if (contours.isEmpty()) return emptyList()
+
+            val largest = contours.maxByOrNull { Imgproc.contourArea(it) } ?: return emptyList()
+
+            // Smooth contour
+            val contour2f = MatOfPoint2f(*largest.toArray())
+            val epsilon = Imgproc.arcLength(contour2f, true) * 0.003
+            val approx = MatOfPoint2f()
+            Imgproc.approxPolyDP(contour2f, approx, epsilon, true)
+
+            // Convert mask-space points → full image normalized [0,1] coordinates
+            val points = approx.toArray().map { pt ->
+                val pixX = cropLeft + pt.x.toFloat() / maskW * cropW
+                val pixY = cropTop + pt.y.toFloat() / maskH * cropH
+                PointF(pixX / imgW, pixY / imgH)
+            }
+
+            contours.forEach { it.release() }
+            contour2f.release()
+            approx.release()
+
+            Log.d(TAG, "Contour: ${points.size} points")
+            points
+        } catch (e: Exception) {
+            Log.w(TAG, "Contour extraction failed: ${e.message}")
+            emptyList()
+        } finally {
+            crop?.recycle()
         }
     }
 

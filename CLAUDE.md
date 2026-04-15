@@ -62,7 +62,7 @@ CameraViewModel
 1. Detector runs, `FrameToFrameTracker` assigns stable IDs via IoU matching
 2. `AppearanceEmbedder` computes visual fingerprints for all candidates
 3. `ReacquisitionEngine` scores candidates: position (decays over time) + size + label (20% scoring factor) + appearance similarity (45% weight)
-4. Strong embedding match (>0.5 cosine similarity) overrides position/size hard thresholds
+4. Strong embedding match (>0.7 cosine similarity) overrides position/size hard thresholds
 5. Best candidate above `minScoreThreshold` becomes the new lock; visual tracker re-initializes
 
 **Display:**
@@ -79,7 +79,7 @@ TrackerNano (OpenCV) follows the locked object by pixel correlation — no class
 At lock time, `AppearanceEmbedder` generates 5 embeddings (original + rotated 90°/180°/270° + horizontal flip) for immediate multi-angle coverage. During confirmed visual tracking, a new real-world embedding is captured every ~1s. Gallery holds up to 12 embeddings. Re-acquisition compares candidates against the best match in the gallery. This handles viewpoint changes (phone rotation, walking around the object).
 
 ### Appearance override of geometric filters (decided 2026-04-13)
-When embedding similarity > 0.5, position and size hard thresholds are bypassed. This handles phone rotation (tiny edge-of-frame lock → large centered detection after flip = 12x size ratio) and camera movement (object reappears at completely different screen position).
+When embedding similarity > 0.7, position and size hard thresholds are bypassed. This handles phone rotation (tiny edge-of-frame lock → large centered detection after flip = 12x size ratio) and camera movement (object reappears at completely different screen position).
 
 ### Label is a scoring factor, not a gate (decided 2026-04-14)
 EfficientDet-Lite0 labels flicker across frames (bowl↔potted plant↔toilet for the same object). A hard label filter caused more harm than good — blocking correct re-acquisition when the detector misclassified. Label is now a 20% weight in scoring. Wrong label loses points but doesn't block. The embedding handles identity; the label is a bonus.
@@ -195,7 +195,7 @@ All in constructor defaults — no settings UI yet:
 | `positionDecayFrames` | ReacquisitionEngine | 30 | Frames for position weight to reach zero |
 | `sizeRatioThreshold` | ReacquisitionEngine | 2.0 | Initial max size difference for candidates |
 | `minScoreThreshold` | ReacquisitionEngine | 0.35 | Minimum score to accept a candidate |
-| `APPEARANCE_OVERRIDE_THRESHOLD` | ReacquisitionEngine | 0.5 | Embedding similarity to bypass geometric filters |
+| `APPEARANCE_OVERRIDE_THRESHOLD` | ReacquisitionEngine | 0.7 | Embedding similarity to bypass geometric filters |
 | `MAX_GALLERY_SIZE` | ReacquisitionEngine | 12 | Maximum embeddings in the reference gallery |
 | `minConfidence` | DetectionFilter | 0.5 | Minimum ML confidence to show detection |
 | `minIou` | FrameToFrameTracker | 0.2 | Minimum IoU to match across frames |
