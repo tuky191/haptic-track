@@ -3,7 +3,7 @@ package com.haptictrack.zoom
 import android.graphics.RectF
 
 class ZoomController(
-    private val targetFrameOccupancy: Float = 0.3f,
+    private val targetFrameOccupancy: Float = 0.15f,
     private val zoomSpeed: Float = 0.05f
 ) {
 
