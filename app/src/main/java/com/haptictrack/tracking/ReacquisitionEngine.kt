@@ -47,6 +47,9 @@ class ReacquisitionEngine(
     /** Reference color histogram from lock time. */
     var lockedColorHistogram: FloatArray? = null
         private set
+    /** Reference person attributes from lock time. */
+    var lockedPersonAttributes: PersonAttributes? = null
+        private set
     var lastKnownBox: RectF? = null
         private set
     var lastKnownLabel: String? = null
@@ -65,16 +68,18 @@ class ReacquisitionEngine(
     }
 
     fun lock(trackingId: Int, boundingBox: RectF, label: String?, embeddings: List<FloatArray>,
-             colorHist: FloatArray? = null) {
+             colorHist: FloatArray? = null, personAttrs: PersonAttributes? = null) {
         lockedId = trackingId
         lockedLabel = label
         _embeddingGallery = embeddings.map { it.copyOf() }.toMutableList()
         lockedColorHistogram = colorHist?.copyOf()
+        lockedPersonAttributes = personAttrs
         lastKnownBox = RectF(boundingBox)
         lastKnownLabel = label
         lastKnownSize = boundingBox.width() * boundingBox.height()
         framesLost = 0
-        dualLog(Log.INFO, "LOCK id=$trackingId label=\"$label\" box=${fmtBox(boundingBox)} size=${fmtF(lastKnownSize)} gallery=${embeddingGallery.size} colorHist=${colorHist != null}")
+        val attrStr = personAttrs?.summary() ?: "n/a"
+        dualLog(Log.INFO, "LOCK id=$trackingId label=\"$label\" box=${fmtBox(boundingBox)} size=${fmtF(lastKnownSize)} gallery=${embeddingGallery.size} colorHist=${colorHist != null} attrs=\"$attrStr\"")
     }
 
     /** Add a new embedding to the gallery (e.g. from a confirmed visual tracker frame). */
@@ -96,6 +101,7 @@ class ReacquisitionEngine(
         lockedLabel = null
         _embeddingGallery.clear()
         lockedColorHistogram = null
+        lockedPersonAttributes = null
         lastKnownBox = null
         lastKnownLabel = null
         lastKnownSize = 0f
@@ -198,7 +204,10 @@ class ReacquisitionEngine(
             } else null
             if (score != null) {
                 if (logThis) {
-                    dualLog(Log.DEBUG, "  scored id=${candidate.id} label=\"${candidate.label}\" score=${fmtF(score)} sim=${sim?.let { fmtF(it) } ?: "n/a"} color=${colorSim?.let { fmtF(it) } ?: "n/a"} (min=${fmtF(minScoreThreshold)})")
+                    val attrStr = if (lockedPersonAttributes != null && candidate.personAttributes != null) {
+                        " attrs=${fmtF(lockedPersonAttributes!!.similarity(candidate.personAttributes!!))}"
+                    } else ""
+                    dualLog(Log.DEBUG, "  scored id=${candidate.id} label=\"${candidate.label}\" score=${fmtF(score)} sim=${sim?.let { fmtF(it) } ?: "n/a"} color=${colorSim?.let { fmtF(it) } ?: "n/a"}$attrStr (min=${fmtF(minScoreThreshold)})")
                 }
                 Pair(candidate, score)
             } else {
@@ -271,28 +280,42 @@ class ReacquisitionEngine(
                 .coerceIn(0f, 1f)
         } else 0f
 
+        // Person attribute similarity — very discriminative for same-label "person" candidates
+        val hasAttrs = lockedPersonAttributes != null && candidate.personAttributes != null
+        val attrScore = if (hasAttrs) {
+            lockedPersonAttributes!!.similarity(candidate.personAttributes!!)
+        } else 0f
+
         // Weight distribution depends on available signals.
         if (hasAppearance) {
+            // With person attributes, redistribute some weight from appearance/color to attrs.
+            // Attributes are highly discriminative for persons (gender, clothing, accessories).
             val basePositionWeight = 0.15f
             val baseSizeWeight = 0.10f
-            val baseLabelWeight = 0.10f
-            val baseAppearanceWeight = 0.40f
-            val baseColorWeight = if (hasColor) 0.25f else 0f
-            // Redistribute color weight to appearance if no histogram
-            val effectiveAppearanceBase = baseAppearanceWeight + if (!hasColor) 0.25f else 0f
+            val baseLabelWeight = if (hasAttrs) 0.05f else 0.10f  // attrs subsume label for persons
+            val baseAttrWeight = if (hasAttrs) 0.15f else 0f
+            val baseAppearanceWeight = if (hasAttrs) 0.30f else 0.40f
+            val baseColorWeight = if (hasColor) (if (hasAttrs) 0.15f else 0.25f) else 0f
+            // Redistribute unused weights to appearance
+            val unusedBase = 1f - basePositionWeight - baseSizeWeight - baseLabelWeight -
+                             baseAttrWeight - baseAppearanceWeight - baseColorWeight
+            val effectiveAppearanceBase = baseAppearanceWeight + unusedBase
 
             val effectivePositionWeight = basePositionWeight * positionConfidence
             val redistributed = basePositionWeight * (1f - positionConfidence)
             // Redistribute decayed position weight proportionally to active signals only.
-            // When no color histogram, its 30% share goes to appearance instead.
             val effectiveSizeWeight = baseSizeWeight + redistributed * 0.10f
-            val effectiveLabelWeight = baseLabelWeight + redistributed * 0.10f
-            val effectiveAppearanceWeight = effectiveAppearanceBase + redistributed * if (hasColor) 0.50f else 0.80f
-            val effectiveColorWeight = if (hasColor) baseColorWeight + redistributed * 0.30f else 0f
+            val effectiveLabelWeight = baseLabelWeight + redistributed * 0.05f
+            val effectiveAttrWeight = if (hasAttrs) baseAttrWeight + redistributed * 0.15f else 0f
+            val colorRedistShare = if (hasColor) 0.20f else 0f
+            val appearRedistShare = 1f - 0.10f - 0.05f - 0.15f - colorRedistShare
+            val effectiveAppearanceWeight = effectiveAppearanceBase + redistributed * appearRedistShare
+            val effectiveColorWeight = if (hasColor) baseColorWeight + redistributed * colorRedistShare else 0f
 
             return (positionScore * effectivePositionWeight) +
                    (sizeScore * effectiveSizeWeight) +
                    (labelScore * effectiveLabelWeight) +
+                   (attrScore * effectiveAttrWeight) +
                    (appearanceScore * effectiveAppearanceWeight) +
                    (colorScore * effectiveColorWeight)
         } else {

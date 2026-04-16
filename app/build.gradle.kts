@@ -74,6 +74,9 @@ dependencies {
     // OpenCV (visual tracking)
     implementation(libs.opencv)
 
+    // TensorFlow Lite (person attribute classifier)
+    implementation(libs.tensorflow.lite)
+
     // Permissions
     implementation(libs.accompanist.permissions)
 

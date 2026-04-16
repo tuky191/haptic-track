@@ -121,6 +121,7 @@ class DebugFrameCapture(context: Context) {
 
     /**
      * Capture a frame on a tracking event.
+     * Saves both a raw (unannotated) frame and an annotated frame with bounding boxes.
      */
     fun capture(
         event: DebugEvent,
@@ -132,8 +133,20 @@ class DebugFrameCapture(context: Context) {
     ) {
         val dir = sessionDir ?: baseDir ?: return
 
-        val annotated = if (bitmap.isMutable) bitmap
-            else bitmap.copy(Bitmap.Config.ARGB_8888, true) ?: return
+        val timestamp = LocalTime.now().format(frameTimeFormat)
+
+        // Save raw frame first (before any annotations)
+        val rawFilename = "${timestamp}_${event}_raw.png"
+        try {
+            FileOutputStream(File(dir, rawFilename)).use { out ->
+                bitmap.compress(Bitmap.CompressFormat.PNG, 90, out)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to save raw frame: ${e.message}")
+        }
+
+        // Create annotated copy
+        val annotated = bitmap.copy(Bitmap.Config.ARGB_8888, true) ?: return
         val canvas = Canvas(annotated)
         val w = bitmap.width.toFloat()
         val h = bitmap.height.toFloat()
@@ -156,19 +169,16 @@ class DebugFrameCapture(context: Context) {
         val eventLabel = "$event${if (extraInfo != null) " | $extraInfo" else ""}"
         drawEventBanner(canvas, eventLabel, w)
 
-        val timestamp = LocalTime.now().format(frameTimeFormat)
         val filename = "${timestamp}_${event}.png"
-        val file = File(dir, filename)
-
         try {
-            FileOutputStream(file).use { out ->
+            FileOutputStream(File(dir, filename)).use { out ->
                 annotated.compress(Bitmap.CompressFormat.PNG, 90, out)
             }
-            log("FRAME $event: $filename (${detections.size} detections) ${extraInfo ?: ""}")
+            log("FRAME $event: $filename + $rawFilename (${detections.size} detections) ${extraInfo ?: ""}")
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to save debug frame: ${e.message}")
+            Log.w(TAG, "Failed to save annotated frame: ${e.message}")
         } finally {
-            if (annotated !== bitmap) annotated.recycle()
+            annotated.recycle()
         }
     }
 

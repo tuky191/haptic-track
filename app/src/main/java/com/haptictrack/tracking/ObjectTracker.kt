@@ -18,6 +18,7 @@ class ObjectTracker(
     val filter: DetectionFilter = DetectionFilter(),
     private val frameTracker: FrameToFrameTracker = FrameToFrameTracker(),
     private val appearanceEmbedder: AppearanceEmbedder = AppearanceEmbedder(context),
+    private val personClassifier: PersonAttributeClassifier = PersonAttributeClassifier(context),
     val debugCapture: DebugFrameCapture = DebugFrameCapture(context),
     private val visualTracker: VisualTracker = VisualTracker(context),
     /** Provides physical device orientation; set from ViewModel. */
@@ -84,11 +85,14 @@ class ObjectTracker(
                 val fullBox = RectF(0f, 0f, 1f, 1f) // crop is already the object
                 computeColorHistogram(augResult.maskedCrop, fullBox).also { augResult.maskedCrop.recycle() }
             } else computeColorHistogram(bmp, boundingBox)
-            reacquisition.lock(trackingId, boundingBox, label, augResult.embeddings, colorHist)
+            // Classify person attributes at lock time
+            val personAttrs = personClassifier.classify(bmp, boundingBox, label)
+            reacquisition.lock(trackingId, boundingBox, label, augResult.embeddings, colorHist, personAttrs)
             visualTracker.init(bmp, boundingBox)
 
             debugCapture.startSession(label, trackingId)
-            debugCapture.log("LOCK id=$trackingId label=$label box=${boundingBox} gallery=${augResult.embeddings.size} colorHist=${colorHist != null}")
+            val attrStr = personAttrs?.summary() ?: "n/a"
+            debugCapture.log("LOCK id=$trackingId label=$label box=${boundingBox} gallery=${augResult.embeddings.size} colorHist=${colorHist != null} attrs=\"$attrStr\"")
 
             val locked = TrackedObject(trackingId, boundingBox, label)
             debugCapture.capture(DebugEvent.LOCK, bmp, listOf(locked), lockedObject = locked,
@@ -224,7 +228,9 @@ class ObjectTracker(
                         val fullBox = RectF(0f, 0f, 1f, 1f)
                         computeColorHistogram(result.maskedCrop, fullBox).also { result.maskedCrop.recycle() }
                     } else computeColorHistogram(bitmap, obj.boundingBox)
-                    obj.copy(embedding = result.embedding, colorHistogram = hist)
+                    // Classify person attributes for person candidates
+                    val attrs = personClassifier.classify(bitmap, obj.boundingBox, obj.label)
+                    obj.copy(embedding = result.embedding, colorHistogram = hist, personAttributes = attrs)
                 }
             } else tracked
 
