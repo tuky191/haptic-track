@@ -264,6 +264,19 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                     Text("Clear", color = Color.White)
                 }
             }
+
+            // Switch camera button
+            if (uiState.status == TrackingStatus.IDLE) {
+                Button(
+                    onClick = { viewModel.switchCamera() },
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(top = 64.dp, start = 16.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color.Black.copy(alpha = 0.5f))
+                ) {
+                    Text("\u21BB", color = Color.White, fontSize = 18.sp)
+                }
+            }
         }
     } else {
         LaunchedEffect(Unit) {

@@ -148,6 +148,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         private const val TAP_PADDING = 0.03f
     }
 
+    fun switchCamera() {
+        clearTracking()
+        cameraManager.switchCamera()
+    }
+
     fun clearTracking() {
         objectTracker.clearLock()
         zoomController.reset()
