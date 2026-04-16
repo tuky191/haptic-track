@@ -24,12 +24,12 @@ from benchmark_embeddings import create_embedder, crop_and_embed, cosine_similar
 TOOLS_DIR = Path(__file__).parent
 FIXTURES_DIR = TOOLS_DIR / "test_fixtures"
 DEFAULT_MODEL = str(
-    TOOLS_DIR.parent / "app/src/main/assets/mobilenet_v3_small_075_224_embedder.tflite"
+    TOOLS_DIR.parent / "app/src/main/assets/mobilenet_v3_large_embedder.tflite"
 )
 
 # Thresholds — tune these as we gather real data
 MIN_SEPARATION_GAP = 0.05       # same-object mean minus different-object mean
-MIN_SAME_OBJECT_SIM = 0.4       # floor for same-object pairs
+MIN_SAME_OBJECT_SIM = 0.3       # floor for same-object pairs (MobileNetV3 Large, 1280-dim)
 MAX_DIFFERENT_OBJECT_SIM = 0.95  # ceiling for different-object pairs
 
 

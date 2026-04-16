@@ -25,7 +25,7 @@ from PIL import Image
 
 DEFAULT_MODEL = str(
     Path(__file__).parent.parent
-    / "app/src/main/assets/mobilenet_v3_small_075_224_embedder.tflite"
+    / "app/src/main/assets/mobilenet_v3_large_embedder.tflite"
 )
 
 

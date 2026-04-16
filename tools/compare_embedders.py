@@ -55,7 +55,7 @@ def test_mobilenet():
 
     model_path = str(
         Path(__file__).parent.parent
-        / "app/src/main/assets/mobilenet_v3_small_075_224_embedder.tflite"
+        / "app/src/main/assets/mobilenet_v3_large_embedder.tflite"
     )
 
     base_options = mp.tasks.BaseOptions(model_asset_path=model_path)

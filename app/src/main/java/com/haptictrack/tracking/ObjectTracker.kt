@@ -78,22 +78,21 @@ class ObjectTracker(
                 return
             }
 
-            val embeddings = appearanceEmbedder.embedWithAugmentations(bmp, boundingBox)
-            // Compute color histogram on the masked crop for better discrimination
-            val maskedCrop = appearanceEmbedder.getMaskedCrop(bmp, boundingBox)
-            val colorHist = if (maskedCrop != null) {
+            val augResult = appearanceEmbedder.embedWithAugmentations(bmp, boundingBox)
+            // Compute color histogram on the masked crop (single segmentation pass)
+            val colorHist = if (augResult.maskedCrop != null) {
                 val fullBox = RectF(0f, 0f, 1f, 1f) // crop is already the object
-                computeColorHistogram(maskedCrop, fullBox).also { maskedCrop.recycle() }
+                computeColorHistogram(augResult.maskedCrop, fullBox).also { augResult.maskedCrop.recycle() }
             } else computeColorHistogram(bmp, boundingBox)
-            reacquisition.lock(trackingId, boundingBox, label, embeddings, colorHist)
+            reacquisition.lock(trackingId, boundingBox, label, augResult.embeddings, colorHist)
             visualTracker.init(bmp, boundingBox)
 
             debugCapture.startSession(label, trackingId)
-            debugCapture.log("LOCK id=$trackingId label=$label box=${boundingBox} gallery=${embeddings.size} colorHist=${colorHist != null}")
+            debugCapture.log("LOCK id=$trackingId label=$label box=${boundingBox} gallery=${augResult.embeddings.size} colorHist=${colorHist != null}")
 
             val locked = TrackedObject(trackingId, boundingBox, label)
             debugCapture.capture(DebugEvent.LOCK, bmp, listOf(locked), lockedObject = locked,
-                extraInfo = "id=$trackingId label=$label gallery=${embeddings.size}")
+                extraInfo = "id=$trackingId label=$label gallery=${augResult.embeddings.size}")
         }
     }
 
@@ -152,7 +151,9 @@ class ObjectTracker(
                         // Use raw rotated-image coords for embedding (embedder works on rotated bitmap)
                         vtConfirmedFrames++
                         if (vtConfirmedFrames % 30 == 0) {
-                            val emb = appearanceEmbedder.embed(bitmap, rawBox)
+                            // Use fallback: during confirmed tracking, even an unmasked
+                            // embedding is better than no embedding for gallery diversity
+                            val emb = appearanceEmbedder.embedWithFallback(bitmap, rawBox)
                             if (emb != null) {
                                 reacquisition.addEmbedding(emb)
                                 android.util.Log.d("AppearEmbed", "Gallery +1 → ${reacquisition.embeddingGallery.size} (accumulated)")
@@ -217,14 +218,13 @@ class ObjectTracker(
                 (reacquisition.isSearching || (reacquisition.isLocked && reacquisition.framesLost == 0))
             val withEmbeddings = if (needEmbeddings) {
                 tracked.map { obj ->
-                    val emb = appearanceEmbedder.embed(bitmap, obj.boundingBox)
-                    // Compute histogram on masked crop to exclude background
-                    val maskedCrop = appearanceEmbedder.getMaskedCrop(bitmap, obj.boundingBox)
-                    val hist = if (maskedCrop != null) {
+                    // Single segmentation pass: get both embedding and masked crop
+                    val result = appearanceEmbedder.embedAndCrop(bitmap, obj.boundingBox)
+                    val hist = if (result.maskedCrop != null) {
                         val fullBox = RectF(0f, 0f, 1f, 1f)
-                        computeColorHistogram(maskedCrop, fullBox).also { maskedCrop.recycle() }
+                        computeColorHistogram(result.maskedCrop, fullBox).also { result.maskedCrop.recycle() }
                     } else computeColorHistogram(bitmap, obj.boundingBox)
-                    obj.copy(embedding = emb, colorHistogram = hist)
+                    obj.copy(embedding = result.embedding, colorHistogram = hist)
                 }
             } else tracked
 

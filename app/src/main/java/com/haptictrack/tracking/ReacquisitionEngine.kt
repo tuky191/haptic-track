@@ -283,10 +283,12 @@ class ReacquisitionEngine(
 
             val effectivePositionWeight = basePositionWeight * positionConfidence
             val redistributed = basePositionWeight * (1f - positionConfidence)
+            // Redistribute decayed position weight proportionally to active signals only.
+            // When no color histogram, its 30% share goes to appearance instead.
             val effectiveSizeWeight = baseSizeWeight + redistributed * 0.10f
             val effectiveLabelWeight = baseLabelWeight + redistributed * 0.10f
-            val effectiveAppearanceWeight = effectiveAppearanceBase + redistributed * 0.50f
-            val effectiveColorWeight = baseColorWeight + redistributed * 0.30f
+            val effectiveAppearanceWeight = effectiveAppearanceBase + redistributed * if (hasColor) 0.50f else 0.80f
+            val effectiveColorWeight = if (hasColor) baseColorWeight + redistributed * 0.30f else 0f
 
             return (positionScore * effectivePositionWeight) +
                    (sizeScore * effectiveSizeWeight) +
