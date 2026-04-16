@@ -15,7 +15,8 @@ data class TrackedObject(
     val boundingBox: RectF,
     val label: String? = null,
     val confidence: Float = 0f,
-    val embedding: FloatArray? = null
+    val embedding: FloatArray? = null,
+    val colorHistogram: FloatArray? = null
 ) {
     // INVARIANT: embedding is excluded from equals/hashCode. Two TrackedObjects
     // differing only in embedding are considered equal. This is intentional —

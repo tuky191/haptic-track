@@ -1,6 +1,7 @@
 package com.haptictrack.tracking
 
 import android.graphics.Bitmap
+import android.graphics.Color
 import android.graphics.RectF
 import android.util.Log
 
@@ -65,4 +66,80 @@ fun cropCoordinates(normalizedBox: RectF, imgW: Int, imgH: Int): IntArray? {
     val bottom = (normalizedBox.bottom * imgH).toInt().coerceIn(top + 1, imgH)
     if (right - left <= 0 || bottom - top <= 0) return null
     return intArrayOf(left, top, right, bottom)
+}
+
+// ---------------------------------------------------------------------------
+// Color Histogram — lightweight color identity signal
+// ---------------------------------------------------------------------------
+
+/** Number of bins per channel in the HSV histogram. */
+private const val H_BINS = 18
+private const val S_BINS = 8
+const val COLOR_HISTOGRAM_SIZE = H_BINS + S_BINS
+
+/**
+ * Compute an HSV color histogram from a bitmap crop at a normalized bounding box.
+ * Returns a normalized float array of [COLOR_HISTOGRAM_SIZE] bins, or null if crop is invalid.
+ *
+ * Hue is the primary discriminator (red car vs dark car), saturation adds
+ * texture information. Value (brightness) is excluded because it varies too much
+ * with lighting conditions.
+ */
+fun computeColorHistogram(bitmap: Bitmap, normalizedBox: RectF): FloatArray? {
+    val coords = cropCoordinates(normalizedBox, bitmap.width, bitmap.height) ?: return null
+    val left = coords[0]; val top = coords[1]; val right = coords[2]; val bottom = coords[3]
+    val w = right - left
+    val h = bottom - top
+    if (w < 4 || h < 4) return null
+
+    val pixels = IntArray(w * h)
+    bitmap.getPixels(pixels, 0, w, left, top, w, h)
+
+    val hHist = FloatArray(H_BINS)
+    val sHist = FloatArray(S_BINS)
+    val hsv = FloatArray(3)
+
+    for (pixel in pixels) {
+        if (pixel == Color.BLACK) continue // skip masked-out pixels
+        Color.colorToHSV(pixel, hsv)
+        val hBin = ((hsv[0] / 360f) * H_BINS).toInt().coerceIn(0, H_BINS - 1)
+        val sBin = (hsv[1] * S_BINS).toInt().coerceIn(0, S_BINS - 1)
+        hHist[hBin]++
+        sHist[sBin]++
+    }
+
+    // Combine and normalize
+    val combined = FloatArray(COLOR_HISTOGRAM_SIZE)
+    System.arraycopy(hHist, 0, combined, 0, H_BINS)
+    System.arraycopy(sHist, 0, combined, H_BINS, S_BINS)
+
+    val sum = combined.sum()
+    if (sum <= 0f) return null
+    for (i in combined.indices) combined[i] /= sum
+
+    return combined
+}
+
+/**
+ * Histogram correlation — measures how similar two color distributions are.
+ * Returns a value in [-1, 1] where 1 = identical distributions.
+ */
+fun histogramCorrelation(a: FloatArray, b: FloatArray): Float {
+    if (a.size != b.size) return 0f
+    val n = a.size
+    var aMean = 0f; var bMean = 0f
+    for (i in 0 until n) { aMean += a[i]; bMean += b[i] }
+    aMean /= n; bMean /= n
+
+    var num = 0f; var denA = 0f; var denB = 0f
+    for (i in 0 until n) {
+        val da = a[i] - aMean
+        val db = b[i] - bMean
+        num += da * db
+        denA += da * da
+        denB += db * db
+    }
+
+    val den = kotlin.math.sqrt(denA * denB)
+    return if (den > 1e-8f) num / den else 0f
 }

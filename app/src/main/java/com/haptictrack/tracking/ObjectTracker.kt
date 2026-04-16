@@ -52,7 +52,7 @@ class ObjectTracker(
 
     init {
         val baseOptions = BaseOptions.builder()
-            .setModelAssetPath("efficientdet-lite0.tflite")
+            .setModelAssetPath("efficientdet-lite2.tflite")
             .build()
 
         val options = ObjectDetector.ObjectDetectorOptions.builder()
@@ -62,6 +62,9 @@ class ObjectTracker(
             .build()
 
         detector = ObjectDetector.createFromOptions(context, options)
+
+        // Wire ReacquisitionEngine logs to session logger
+        reacquisition.sessionLogger = { msg -> debugCapture.log("[Reacq] $msg") }
     }
 
     /**
@@ -75,17 +78,27 @@ class ObjectTracker(
                 return
             }
 
-            val embeddings = appearanceEmbedder.embedWithAugmentations(bmp, boundingBox)
-            reacquisition.lock(trackingId, boundingBox, label, embeddings)
+            val augResult = appearanceEmbedder.embedWithAugmentations(bmp, boundingBox)
+            // Compute color histogram on the masked crop (single segmentation pass)
+            val colorHist = if (augResult.maskedCrop != null) {
+                val fullBox = RectF(0f, 0f, 1f, 1f) // crop is already the object
+                computeColorHistogram(augResult.maskedCrop, fullBox).also { augResult.maskedCrop.recycle() }
+            } else computeColorHistogram(bmp, boundingBox)
+            reacquisition.lock(trackingId, boundingBox, label, augResult.embeddings, colorHist)
             visualTracker.init(bmp, boundingBox)
+
+            debugCapture.startSession(label, trackingId)
+            debugCapture.log("LOCK id=$trackingId label=$label box=${boundingBox} gallery=${augResult.embeddings.size} colorHist=${colorHist != null}")
 
             val locked = TrackedObject(trackingId, boundingBox, label)
             debugCapture.capture(DebugEvent.LOCK, bmp, listOf(locked), lockedObject = locked,
-                extraInfo = "id=$trackingId label=$label gallery=${embeddings.size}")
+                extraInfo = "id=$trackingId label=$label gallery=${augResult.embeddings.size}")
         }
     }
 
     fun clearLock() {
+        debugCapture.log("CLEAR by user")
+        debugCapture.endSession()
         reacquisition.clear()
         visualTracker.stop()
         vtUnconfirmedFrames = 0
@@ -138,7 +151,9 @@ class ObjectTracker(
                         // Use raw rotated-image coords for embedding (embedder works on rotated bitmap)
                         vtConfirmedFrames++
                         if (vtConfirmedFrames % 30 == 0) {
-                            val emb = appearanceEmbedder.embed(bitmap, rawBox)
+                            // Use fallback: during confirmed tracking, even an unmasked
+                            // embedding is better than no embedding for gallery diversity
+                            val emb = appearanceEmbedder.embedWithFallback(bitmap, rawBox)
                             if (emb != null) {
                                 reacquisition.addEmbedding(emb)
                                 android.util.Log.d("AppearEmbed", "Gallery +1 → ${reacquisition.embeddingGallery.size} (accumulated)")
@@ -203,8 +218,13 @@ class ObjectTracker(
                 (reacquisition.isSearching || (reacquisition.isLocked && reacquisition.framesLost == 0))
             val withEmbeddings = if (needEmbeddings) {
                 tracked.map { obj ->
-                    val emb = appearanceEmbedder.embed(bitmap, obj.boundingBox)
-                    if (emb != null) obj.copy(embedding = emb) else obj
+                    // Single segmentation pass: get both embedding and masked crop
+                    val result = appearanceEmbedder.embedAndCrop(bitmap, obj.boundingBox)
+                    val hist = if (result.maskedCrop != null) {
+                        val fullBox = RectF(0f, 0f, 1f, 1f)
+                        computeColorHistogram(result.maskedCrop, fullBox).also { result.maskedCrop.recycle() }
+                    } else computeColorHistogram(bitmap, obj.boundingBox)
+                    obj.copy(embedding = result.embedding, colorHistogram = hist)
                 }
             } else tracked
 
@@ -314,6 +334,7 @@ class ObjectTracker(
         when {
             // Just re-acquired
             wasSearching && lockedObject != null && nowLost == 0 -> {
+                debugCapture.log("REACQUIRE id=${lockedObject.id} label=${lockedObject.label} after $prevFramesLost frames box=${lockedObject.boundingBox}")
                 debugCapture.capture(
                     DebugEvent.REACQUIRE, bitmap, detections,
                     lockedObject = lockedObject,
@@ -322,17 +343,20 @@ class ObjectTracker(
             }
             // Just lost (first frame)
             nowLost == 1 && prevFramesLost == 0 -> {
+                debugCapture.log("LOST lockedLabel=${reacquisition.lockedLabel} ${detections.size} candidates")
                 debugCapture.capture(
                     DebugEvent.LOST, bitmap, detections,
                     lastKnownBox = reacquisition.lastKnownBox,
                     extraInfo = "label=${reacquisition.lockedLabel}"
                 )
             }
-            // Searching: capture every 10th frame, or whenever a same-label candidate exists
-            // but didn't match — this is the key diagnostic frame
+            // Searching
             wasSearching && lockedObject == null && nowLost > 0 -> {
                 val hasSameLabelCandidate = detections.any { d ->
                     d.label != null && d.label == reacquisition.lockedLabel
+                }
+                if (nowLost % 10 == 1) {
+                    debugCapture.log("SEARCH frame=$nowLost candidates=${detections.size} sameLabelMatch=$hasSameLabelCandidate")
                 }
                 if (hasSameLabelCandidate || nowLost % 10 == 0) {
                     val candidateInfo = detections
@@ -347,6 +371,8 @@ class ObjectTracker(
             }
             // Timed out
             nowLost == reacquisition.maxFramesLost + 1 -> {
+                debugCapture.log("TIMEOUT after ${reacquisition.maxFramesLost} frames, gave up on ${reacquisition.lockedLabel}")
+                debugCapture.endSession()
                 debugCapture.capture(
                     DebugEvent.TIMEOUT, bitmap, detections,
                     lastKnownBox = reacquisition.lastKnownBox,
@@ -357,6 +383,7 @@ class ObjectTracker(
     }
 
     fun shutdown() {
+        debugCapture.endSession()
         detector.close()
         appearanceEmbedder.shutdown()
         visualTracker.stop()

@@ -9,41 +9,35 @@ import org.opencv.android.Utils
 import org.opencv.core.Mat
 import org.opencv.core.Rect
 import org.opencv.imgproc.Imgproc
-import org.opencv.video.TrackerNano
-import org.opencv.video.TrackerNano_Params
+import org.opencv.video.TrackerVit
+import org.opencv.video.TrackerVit_Params
 import java.io.File
 import java.io.FileOutputStream
 
 /**
- * Frame-to-frame visual tracker using OpenCV TrackerNano.
+ * Frame-to-frame visual tracker using OpenCV VitTracker.
  *
- * Tracks the *specific pixels* of the locked object, not the category.
- * This provides stable frame-to-frame tracking without relying on the
- * object detector, which eliminates the LOST→REACQUIRE flicker when
- * the detector briefly fails to classify the object.
- *
- * Falls back to null (tracker lost) when confidence drops, signaling
- * the ReacquisitionEngine to take over with embedding-based search.
+ * Replaced TrackerNano — VitTracker is smaller (698KB vs 1.7MB), 20% faster on ARM,
+ * and critically returns meaningful confidence scores (TrackerNano always returned ~0.9).
+ * This allows direct confidence-based lost detection instead of the 10-frame
+ * detector cross-check heuristic.
  */
 class VisualTracker(private val context: Context) {
 
     companion object {
         private const val TAG = "VisualTracker"
-        private const val MIN_CONFIDENCE = 0.5f
-        private const val BACKBONE_ASSET = "nanotrack_backbone.onnx"
-        private const val HEAD_ASSET = "nanotrack_head.onnx"
+        private const val MIN_CONFIDENCE = 0.4f  // VitTracker returns real scores — lower threshold works
+        private const val MODEL_ASSET = "object_tracking_vittrack_2023sep.onnx"
 
         @Volatile
         private var opencvInitialized = false
     }
 
-    private var tracker: TrackerNano? = null
+    private var tracker: TrackerVit? = null
     private var isTracking = false
     private var lastConfidence = 0f
 
-    // Model files must be on disk for OpenCV
-    private val backbonePath: String by lazy { copyAssetToFile(BACKBONE_ASSET) }
-    private val headPath: String by lazy { copyAssetToFile(HEAD_ASSET) }
+    private val modelPath: String by lazy { copyAssetToFile(MODEL_ASSET) }
 
     init {
         if (!opencvInitialized) {
@@ -60,13 +54,6 @@ class VisualTracker(private val context: Context) {
         }
     }
 
-    /**
-     * Initialize tracking on a specific region of the frame.
-     *
-     * @param bitmap The full camera frame
-     * @param normalizedBox The bounding box in normalized [0,1] coordinates
-     * @return true if tracker initialized successfully
-     */
     fun init(bitmap: Bitmap, normalizedBox: RectF): Boolean {
         if (!opencvInitialized) return false
 
@@ -74,7 +61,6 @@ class VisualTracker(private val context: Context) {
             val mat = bitmapToMat(bitmap)
             val roi = toPixelRect(normalizedBox, bitmap.width, bitmap.height)
 
-            // Clamp roi to frame bounds
             val clampedRoi = Rect(
                 roi.x.coerceIn(0, bitmap.width - 2),
                 roi.y.coerceIn(0, bitmap.height - 2),
@@ -82,11 +68,10 @@ class VisualTracker(private val context: Context) {
                 roi.height.coerceIn(1, bitmap.height - roi.y.coerceIn(0, bitmap.height - 2))
             )
 
-            val params = TrackerNano_Params().apply {
-                set_backbone(backbonePath)
-                set_neckhead(headPath)
+            val params = TrackerVit_Params().apply {
+                set_net(modelPath)
             }
-            tracker = TrackerNano.create(params)
+            tracker = TrackerVit.create(params)
             tracker!!.init(mat, clampedRoi)
             isTracking = true
             lastConfidence = 1.0f
@@ -101,11 +86,6 @@ class VisualTracker(private val context: Context) {
         }
     }
 
-    /**
-     * Update the tracker with a new frame.
-     *
-     * @return The updated bounding box in normalized coordinates, or null if lost.
-     */
     fun update(bitmap: Bitmap): TrackerResult? {
         if (!isTracking || tracker == null) return null
 
@@ -138,8 +118,6 @@ class VisualTracker(private val context: Context) {
 
     fun stop() {
         isTracking = false
-        // TrackerNano has no explicit release/close. Setting to null lets GC
-        // finalize the native resources. We don't hold a reference longer than needed.
         tracker = null
         lastConfidence = 0f
     }

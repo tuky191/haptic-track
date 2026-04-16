@@ -33,8 +33,9 @@ class ObjectSegmenter(context: Context) {
         private const val TAG = "ObjSegmenter"
         private const val MODEL_PATH = "magic_touch.tflite"
         /** Confidence threshold: pixels below this are considered background. */
-        /** Threshold for embedding masks. Contour extraction uses its own (higher) threshold. */
-        private const val MASK_THRESHOLD = 0.5f
+        /** Higher threshold = tighter mask = more discriminative embeddings.
+         *  Python tests show 0.85 gives best same-vs-different gap (+0.195). */
+        private const val MASK_THRESHOLD = 0.8f
     }
 
     private val segmenter: InteractiveSegmenter
@@ -60,30 +61,44 @@ class ObjectSegmenter(context: Context) {
      * The crop region matches [normalizedBox] (same as AppearanceEmbedder.cropBitmap).
      */
     fun segmentAndCrop(bitmap: Bitmap, normalizedBox: RectF): Bitmap? {
-        var convertedBitmap: Bitmap? = null
+        var cropBitmap: Bitmap? = null
         return try {
-            // Ensure ARGB_8888 for MediaPipe
-            val inputBitmap = if (bitmap.config != Bitmap.Config.ARGB_8888) {
-                bitmap.copy(Bitmap.Config.ARGB_8888, false).also { convertedBitmap = it }
-            } else bitmap
+            val imgW = bitmap.width
+            val imgH = bitmap.height
 
-            val mpImage = BitmapImageBuilder(inputBitmap).build()
+            // Crop to bounding box with padding FIRST, then segment the crop.
+            // Segmenting a close-up produces much tighter masks than segmenting
+            // the full frame where the object is a small part of the scene.
+            val pad = 0.05f
+            val cl = ((normalizedBox.left - pad) * imgW).toInt().coerceIn(0, imgW - 1)
+            val ct = ((normalizedBox.top - pad) * imgH).toInt().coerceIn(0, imgH - 1)
+            val cr = ((normalizedBox.right + pad) * imgW).toInt().coerceIn(cl + 1, imgW)
+            val cb = ((normalizedBox.bottom + pad) * imgH).toInt().coerceIn(ct + 1, imgH)
+            val cw = cr - cl
+            val ch = cb - ct
+            if (cw < 10 || ch < 10) return null
 
-            // Use bounding box center as the keypoint (pixel coordinates)
-            val centerX = (normalizedBox.left + normalizedBox.right) / 2f * inputBitmap.width
-            val centerY = (normalizedBox.top + normalizedBox.bottom) / 2f * inputBitmap.height
+            cropBitmap = Bitmap.createBitmap(bitmap, cl, ct, cw, ch)
+            val inputCrop = if (cropBitmap!!.config != Bitmap.Config.ARGB_8888) {
+                val c = cropBitmap!!.copy(Bitmap.Config.ARGB_8888, false)
+                cropBitmap!!.recycle()
+                c.also { cropBitmap = it }
+            } else cropBitmap!!
+
+            val mpImage = BitmapImageBuilder(inputCrop).build()
+
+            // Keypoint at center of the crop (pixel coordinates — Android API)
             val roi = InteractiveSegmenter.RegionOfInterest.create(
-                NormalizedKeypoint.create(centerX, centerY)
+                NormalizedKeypoint.create(inputCrop.width / 2f, inputCrop.height / 2f)
             )
 
             val result = segmenter.segment(mpImage, roi)
 
-            // Try confidence masks first, fall back to category mask
             val maskPixels = extractConfidenceMask(result)
                 ?: extractCategoryMask(result)
 
             if (maskPixels == null) {
-                Log.w(TAG, "No masks returned (conf=${result.confidenceMasks().isPresent} cat=${result.categoryMask().isPresent})")
+                Log.w(TAG, "No masks returned")
                 return null
             }
 
@@ -91,50 +106,41 @@ class ObjectSegmenter(context: Context) {
             val maskHeight = maskPixels.second
             val mask = maskPixels.third
 
-            val imgW = bitmap.width
-            val imgH = bitmap.height
-            val coords = cropCoordinates(normalizedBox, imgW, imgH) ?: return null
-            val left = coords[0]; val top = coords[1]; val right = coords[2]; val bottom = coords[3]
-            val cropW = right - left
-            val cropH = bottom - top
+            // Apply mask to the crop pixels
+            val srcPixels = IntArray(cw * ch)
+            inputCrop.getPixels(srcPixels, 0, cw, 0, 0, cw, ch)
 
-            // Bulk read source pixels
-            val srcPixels = IntArray(cropW * cropH)
-            bitmap.getPixels(srcPixels, 0, cropW, left, top, cropW, cropH)
-
-            // Apply mask in bulk
             var fgCount = 0
-            val totalPixels = cropW * cropH
+            val totalPixels = cw * ch
             val black = Color.BLACK
-            for (y in 0 until cropH) {
-                for (x in 0 until cropW) {
-                    val maskX = ((left + x).toFloat() / imgW * maskWidth).toInt().coerceIn(0, maskWidth - 1)
-                    val maskY = ((top + y).toFloat() / imgH * maskHeight).toInt().coerceIn(0, maskHeight - 1)
+            for (y in 0 until ch) {
+                for (x in 0 until cw) {
+                    val maskX = (x.toFloat() / cw * maskWidth).toInt().coerceIn(0, maskWidth - 1)
+                    val maskY = (y.toFloat() / ch * maskHeight).toInt().coerceIn(0, maskHeight - 1)
                     if (mask[maskY * maskWidth + maskX] >= MASK_THRESHOLD) {
                         fgCount++
                     } else {
-                        srcPixels[y * cropW + x] = black
+                        srcPixels[y * cw + x] = black
                     }
                 }
             }
 
             val fgPct = if (totalPixels > 0) fgCount * 100 / totalPixels else 0
-            Log.d(TAG, "Mask: ${fgCount}/${totalPixels} fg pixels (${fgPct}%) maskSize=${maskWidth}x${maskHeight} crop=${cropW}x${cropH}")
+            Log.d(TAG, "Mask: ${fgCount}/${totalPixels} fg pixels (${fgPct}%) crop=${cw}x${ch}")
 
             if (fgPct < 5 || fgPct > 95) {
                 Log.d(TAG, "Mask not useful (${fgPct}%), falling back to raw crop")
                 return null
             }
 
-            // Bulk write masked pixels
-            val maskedCrop = Bitmap.createBitmap(cropW, cropH, Bitmap.Config.ARGB_8888)
-            maskedCrop.setPixels(srcPixels, 0, cropW, 0, 0, cropW, cropH)
+            val maskedCrop = Bitmap.createBitmap(cw, ch, Bitmap.Config.ARGB_8888)
+            maskedCrop.setPixels(srcPixels, 0, cw, 0, 0, cw, ch)
             maskedCrop
         } catch (e: Exception) {
             Log.w(TAG, "Segmentation failed: ${e.message}")
             null
         } finally {
-            convertedBitmap?.recycle()
+            cropBitmap?.recycle()
         }
     }
 
@@ -217,7 +223,7 @@ class ObjectSegmenter(context: Context) {
 
             val mpImage = BitmapImageBuilder(inputCrop).build()
 
-            // Keypoint at center of the crop
+            // Keypoint at center of the crop (pixel coordinates — Android API)
             val roi = InteractiveSegmenter.RegionOfInterest.create(
                 NormalizedKeypoint.create(inputCrop.width / 2f, inputCrop.height / 2f)
             )

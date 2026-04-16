@@ -706,6 +706,143 @@ class ReacquisitionEngineTest {
         assertEquals("bowl", result?.label)
     }
 
+    // --- Color histogram scoring ---
+
+    @Test
+    fun `color match boosts score over color mismatch`() {
+        val refHist = FloatArray(COLOR_HISTOGRAM_SIZE).also { it[0] = 1f } // all red
+        val matchHist = FloatArray(COLOR_HISTOGRAM_SIZE).also { it[0] = 1f } // same red
+        val mismatchHist = FloatArray(COLOR_HISTOGRAM_SIZE).also { it[10] = 1f } // different hue
+
+        val emb = floatArrayOf(1f, 0f, 0f, 0f)
+        engine.lock(1, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup",
+            listOf(emb), refHist)
+        repeat(2) { engine.processFrame(emptyList()) }
+
+        val matchCandidate = obj(id = 10, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "cup", embedding = emb, colorHistogram = matchHist)
+        val mismatchCandidate = obj(id = 11, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "cup", embedding = emb, colorHistogram = mismatchHist)
+
+        val matchScore = engine.scoreCandidate(matchCandidate, engine.lastKnownBox!!)
+        val mismatchScore = engine.scoreCandidate(mismatchCandidate, engine.lastKnownBox!!)
+
+        assertNotNull(matchScore)
+        assertNotNull(mismatchScore)
+        assertTrue("Color match ($matchScore) should score higher than mismatch ($mismatchScore)",
+            matchScore!! > mismatchScore!!)
+    }
+
+    @Test
+    fun `no color histogram redistributes weight to appearance`() {
+        val emb = floatArrayOf(1f, 0f, 0f, 0f)
+        engine.lock(1, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup",
+            listOf(emb), null) // no color histogram
+        repeat(2) { engine.processFrame(emptyList()) }
+
+        val candidate = obj(id = 10, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "cup", embedding = emb, colorHistogram = null)
+
+        val score = engine.scoreCandidate(candidate, engine.lastKnownBox!!)
+        assertNotNull(score)
+        // With perfect embedding match and no color, score should still be high
+        assertTrue("Score without color should be reasonable: $score", score!! > 0.4f)
+    }
+
+    @Test
+    fun `color weight is zero when no histogram available`() {
+        // After full position decay, no weight should leak to color when no histogram
+        val emb = floatArrayOf(1f, 0f, 0f, 0f)
+        engine.lock(1, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup",
+            listOf(emb), null)
+        // Lose enough frames for full position decay
+        repeat(35) { engine.processFrame(emptyList()) }
+
+        val candidate = obj(id = 10, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "cup", embedding = emb, colorHistogram = null)
+
+        val scoreNoColor = engine.scoreCandidate(candidate, engine.lastKnownBox!!)
+        assertNotNull(scoreNoColor)
+        // Without color, all weight should go to appearance/size/label — no wasted weight
+        assertTrue("Score should be high with perfect embedding: $scoreNoColor", scoreNoColor!! > 0.5f)
+    }
+
+    @Test
+    fun `color histogram discriminates same-label same-embedding objects`() {
+        // Two cups with identical embeddings but different colors
+        val refHist = FloatArray(COLOR_HISTOGRAM_SIZE).also { it[0] = 1f } // red
+        val emb = floatArrayOf(0.5f, 0.5f, 0.5f, 0.5f)
+        engine.lock(1, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup",
+            listOf(emb), refHist)
+        repeat(2) { engine.processFrame(emptyList()) }
+
+        val redCup = obj(id = 10, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "cup", embedding = emb,
+            colorHistogram = FloatArray(COLOR_HISTOGRAM_SIZE).also { it[0] = 1f }) // red
+        val blueCup = obj(id = 11, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "cup", embedding = emb,
+            colorHistogram = FloatArray(COLOR_HISTOGRAM_SIZE).also { it[9] = 1f }) // blue
+
+        val redScore = engine.scoreCandidate(redCup, engine.lastKnownBox!!)
+        val blueScore = engine.scoreCandidate(blueCup, engine.lastKnownBox!!)
+
+        assertNotNull(redScore)
+        assertNotNull(blueScore)
+        assertTrue("Red cup ($redScore) should beat blue cup ($blueScore)",
+            redScore!! > blueScore!!)
+    }
+
+    @Test
+    fun `candidate with color and no reference color does not crash`() {
+        val emb = floatArrayOf(1f, 0f, 0f, 0f)
+        engine.lock(1, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup",
+            listOf(emb), null) // no reference histogram
+        repeat(2) { engine.processFrame(emptyList()) }
+
+        val candidateWithColor = obj(id = 10, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "cup", embedding = emb,
+            colorHistogram = FloatArray(COLOR_HISTOGRAM_SIZE).also { it[0] = 1f })
+
+        val score = engine.scoreCandidate(candidateWithColor, engine.lastKnownBox!!)
+        assertNotNull(score)
+    }
+
+    // --- histogramCorrelation edge cases ---
+
+    @Test
+    fun `histogramCorrelation returns 1 for identical histograms`() {
+        val hist = FloatArray(COLOR_HISTOGRAM_SIZE) { it.toFloat() / COLOR_HISTOGRAM_SIZE }
+        val corr = histogramCorrelation(hist, hist)
+        assertEquals(1f, corr, 0.001f)
+    }
+
+    @Test
+    fun `histogramCorrelation returns near zero for uncorrelated histograms`() {
+        // Alternating pattern vs shifted alternating pattern
+        val a = FloatArray(COLOR_HISTOGRAM_SIZE) { if (it % 2 == 0) 1f else 0f }
+        val b = FloatArray(COLOR_HISTOGRAM_SIZE) { if (it % 2 == 0) 0f else 1f }
+        val corr = histogramCorrelation(a, b)
+        assertTrue("Uncorrelated histograms should have negative or near-zero correlation: $corr",
+            corr < 0.1f)
+    }
+
+    @Test
+    fun `histogramCorrelation returns 0 for mismatched sizes`() {
+        val a = FloatArray(10) { 1f }
+        val b = FloatArray(5) { 1f }
+        assertEquals(0f, histogramCorrelation(a, b), 0.001f)
+    }
+
+    @Test
+    fun `histogramCorrelation handles uniform histograms`() {
+        // All bins equal — zero variance — should return 0
+        val a = FloatArray(COLOR_HISTOGRAM_SIZE) { 1f / COLOR_HISTOGRAM_SIZE }
+        val b = FloatArray(COLOR_HISTOGRAM_SIZE) { 0.5f }
+        val corr = histogramCorrelation(a, b)
+        // Both are constant → zero variance → returns 0
+        assertEquals(0f, corr, 0.001f)
+    }
+
     // --- Helpers ---
 
     private fun obj(
@@ -715,11 +852,15 @@ class ReacquisitionEngineTest {
         right: Float = 0.1f,
         bottom: Float = 0.1f,
         label: String? = null,
-        confidence: Float = 0.8f
+        confidence: Float = 0.8f,
+        embedding: FloatArray? = null,
+        colorHistogram: FloatArray? = null
     ) = TrackedObject(
         id = id,
         boundingBox = RectF(left, top, right, bottom),
         label = label,
-        confidence = confidence
+        confidence = confidence,
+        embedding = embedding,
+        colorHistogram = colorHistogram
     )
 }
