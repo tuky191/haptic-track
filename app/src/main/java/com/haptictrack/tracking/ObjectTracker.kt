@@ -221,16 +221,28 @@ class ObjectTracker(
             val needEmbeddings = reacquisition.hasEmbeddings &&
                 (reacquisition.isSearching || (reacquisition.isLocked && reacquisition.framesLost == 0))
             val withEmbeddings = if (needEmbeddings) {
-                tracked.map { obj ->
-                    // Single segmentation pass: get both embedding and masked crop
+                // First pass: compute embeddings + histograms for all candidates
+                val withVisual = tracked.map { obj ->
                     val result = appearanceEmbedder.embedAndCrop(bitmap, obj.boundingBox)
                     val hist = if (result.maskedCrop != null) {
                         val fullBox = RectF(0f, 0f, 1f, 1f)
                         computeColorHistogram(result.maskedCrop, fullBox).also { result.maskedCrop.recycle() }
                     } else computeColorHistogram(bitmap, obj.boundingBox)
-                    // Classify person attributes for person candidates
-                    val attrs = personClassifier.classify(bitmap, obj.boundingBox, obj.label)
-                    obj.copy(embedding = result.embedding, colorHistogram = hist, personAttributes = attrs)
+                    obj.copy(embedding = result.embedding, colorHistogram = hist)
+                }
+                // Second pass: classify person attributes only for top-2 person
+                // candidates by embedding similarity (3 model inferences is expensive)
+                val personCandidates = withVisual
+                    .filter { it.label == "person" && it.embedding != null }
+                    .sortedByDescending { reacquisition.bestGallerySimilarity(it.embedding!!) }
+                    .take(2)
+                    .map { it.id }
+                    .toSet()
+                withVisual.map { obj ->
+                    if (obj.id in personCandidates) {
+                        val attrs = personClassifier.classify(bitmap, obj.boundingBox, obj.label)
+                        obj.copy(personAttributes = attrs)
+                    } else obj
                 }
             } else tracked
 

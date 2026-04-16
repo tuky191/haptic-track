@@ -72,7 +72,10 @@ class PersonAttributeClassifier(context: Context) {
     fun classify(bitmap: Bitmap, normalizedBox: RectF, label: String?): PersonAttributes? {
         if (label != "person") return null
 
-        val crop = cropAndResize(bitmap, normalizedBox, BODY_WIDTH, BODY_HEIGHT) ?: return null
+        // Crop person at full resolution (used for face detection + color sampling)
+        val fullResCrop = cropFullRes(bitmap, normalizedBox) ?: return null
+        // Resize for body model
+        val crop = Bitmap.createScaledBitmap(fullResCrop, BODY_WIDTH, BODY_HEIGHT, true)
 
         try {
             // --- Body attributes from Crossroad-0230 ---
@@ -91,12 +94,12 @@ class PersonAttributeClassifier(context: Context) {
 
             val attrProbs = attributes[0][0][0]
 
-            // Sample clothing colors from fixed body regions
+            // Sample clothing colors from fixed body regions (use body-model-sized crop)
             val upperColor = dominantRegionColor(crop, 0.25f, 0.50f)
             val lowerColor = dominantRegionColor(crop, 0.58f, 0.85f)
 
-            // --- Face-based gender + age (overrides body-based gender) ---
-            val faceResult = classifyFace(bitmap, normalizedBox)
+            // --- Face-based gender + age (use full-res crop for better face detection) ---
+            val faceResult = classifyFaceFromCrop(fullResCrop)
             val isMale = faceResult?.isMale ?: (attrProbs[0] > ATTR_THRESHOLD)
             val age = faceResult?.age
 
@@ -128,6 +131,7 @@ class PersonAttributeClassifier(context: Context) {
             return null
         } finally {
             crop.recycle()
+            fullResCrop.recycle()
         }
     }
 
@@ -141,27 +145,16 @@ class PersonAttributeClassifier(context: Context) {
     private data class FaceGenderResult(val isMale: Boolean, val maleProb: Float, val age: Float)
 
     /**
-     * Detect a face within the person crop, then classify gender + age.
-     * Returns null if no face is found.
+     * Detect a face within the already-cropped person bitmap, then classify gender + age.
+     * Returns null if no face is found. Does NOT recycle [personCrop].
      */
-    private fun classifyFace(bitmap: Bitmap, normalizedBox: RectF): FaceGenderResult? {
+    private fun classifyFaceFromCrop(personCrop: Bitmap): FaceGenderResult? {
+        if (personCrop.width < 30 || personCrop.height < 30) return null
         try {
-            // Crop person from frame
-            val imgW = bitmap.width; val imgH = bitmap.height
-            val left = (normalizedBox.left * imgW).toInt().coerceIn(0, imgW - 1)
-            val top = (normalizedBox.top * imgH).toInt().coerceIn(0, imgH - 1)
-            val right = (normalizedBox.right * imgW).toInt().coerceIn(left + 1, imgW)
-            val bottom = (normalizedBox.bottom * imgH).toInt().coerceIn(top + 1, imgH)
-            if (right - left < 30 || bottom - top < 30) return null
-
-            val personCrop = Bitmap.createBitmap(bitmap, left, top, right - left, bottom - top)
             val mpImage = BitmapImageBuilder(personCrop).build()
             val faces = faceDetector.detect(mpImage)
 
-            if (faces.detections().isEmpty()) {
-                personCrop.recycle()
-                return null
-            }
+            if (faces.detections().isEmpty()) return null
 
             // Use the largest face
             val face = faces.detections().maxByOrNull {
@@ -174,7 +167,6 @@ class PersonAttributeClassifier(context: Context) {
             val fh = fb.height().toInt().coerceIn(1, personCrop.height - fy)
 
             val faceCrop = Bitmap.createBitmap(personCrop, fx, fy, fw, fh)
-            personCrop.recycle()
             val faceResized = Bitmap.createScaledBitmap(faceCrop, FACE_SIZE, FACE_SIZE, true)
             if (faceResized !== faceCrop) faceCrop.recycle()
 
@@ -211,7 +203,8 @@ class PersonAttributeClassifier(context: Context) {
         }
     }
 
-    private fun cropAndResize(bitmap: Bitmap, normalizedBox: RectF, targetW: Int, targetH: Int): Bitmap? {
+    /** Crop person from full frame at original resolution. Caller must recycle. */
+    private fun cropFullRes(bitmap: Bitmap, normalizedBox: RectF): Bitmap? {
         val imgW = bitmap.width
         val imgH = bitmap.height
         val left = (normalizedBox.left * imgW).toInt().coerceIn(0, imgW - 1)
@@ -223,10 +216,7 @@ class PersonAttributeClassifier(context: Context) {
         if (w < 10 || h < 20) return null
 
         return try {
-            val cropped = Bitmap.createBitmap(bitmap, left, top, w, h)
-            Bitmap.createScaledBitmap(cropped, targetW, targetH, true).also {
-                if (it !== cropped) cropped.recycle()
-            }
+            Bitmap.createBitmap(bitmap, left, top, w, h)
         } catch (e: Exception) {
             Log.w(TAG, "Crop failed: ${e.message}")
             null
@@ -331,7 +321,6 @@ fun quantizeColor(h: Float, s: Float, v: Float): String {
         h < 195f -> "cyan"
         h < 260f -> "blue"
         h < 290f -> "purple"
-        h < 345f -> "pink"
-        else -> "red"
+        else -> "pink" // 290-345
     }
 }

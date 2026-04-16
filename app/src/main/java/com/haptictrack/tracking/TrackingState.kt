@@ -114,10 +114,9 @@ data class TrackedObject(
     val colorHistogram: FloatArray? = null,
     val personAttributes: PersonAttributes? = null
 ) {
-    // INVARIANT: embedding is excluded from equals/hashCode. Two TrackedObjects
-    // differing only in embedding are considered equal. This is intentional —
-    // embedding is transient ML output, not part of the object's identity for
-    // UI diffing and collection operations.
+    // INVARIANT: embedding, colorHistogram, and personAttributes are excluded from
+    // equals/hashCode. These are transient ML output, not part of the object's
+    // identity for UI diffing and collection operations.
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is TrackedObject) return false

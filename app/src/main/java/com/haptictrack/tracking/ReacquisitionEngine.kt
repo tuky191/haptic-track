@@ -303,12 +303,16 @@ class ReacquisitionEngine(
 
             val effectivePositionWeight = basePositionWeight * positionConfidence
             val redistributed = basePositionWeight * (1f - positionConfidence)
-            // Redistribute decayed position weight proportionally to active signals only.
-            val effectiveSizeWeight = baseSizeWeight + redistributed * 0.10f
-            val effectiveLabelWeight = baseLabelWeight + redistributed * 0.05f
-            val effectiveAttrWeight = if (hasAttrs) baseAttrWeight + redistributed * 0.15f else 0f
+            // Redistribute decayed position weight to active signals only.
+            // Shares must sum to 1.0 regardless of which signals are available.
+            val attrRedistShare = if (hasAttrs) 0.15f else 0f
             val colorRedistShare = if (hasColor) 0.20f else 0f
-            val appearRedistShare = 1f - 0.10f - 0.05f - 0.15f - colorRedistShare
+            val sizeRedistShare = 0.10f
+            val labelRedistShare = 0.05f
+            val appearRedistShare = 1f - sizeRedistShare - labelRedistShare - attrRedistShare - colorRedistShare
+            val effectiveSizeWeight = baseSizeWeight + redistributed * sizeRedistShare
+            val effectiveLabelWeight = baseLabelWeight + redistributed * labelRedistShare
+            val effectiveAttrWeight = if (hasAttrs) baseAttrWeight + redistributed * attrRedistShare else 0f
             val effectiveAppearanceWeight = effectiveAppearanceBase + redistributed * appearRedistShare
             val effectiveColorWeight = if (hasColor) baseColorWeight + redistributed * colorRedistShare else 0f
 

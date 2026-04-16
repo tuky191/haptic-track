@@ -32,7 +32,7 @@ class DebugFrameCapture(context: Context) {
     companion object {
         private const val TAG = "DebugCapture"
         private const val DIR_NAME = "debug_frames"
-        private const val MAX_SESSIONS = 20
+        private const val MAX_SESSIONS = 10
     }
 
     private val baseDir: File? = context.getExternalFilesDir(null)?.let {
