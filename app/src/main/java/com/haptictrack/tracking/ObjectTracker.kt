@@ -52,7 +52,7 @@ class ObjectTracker(
 
     init {
         val baseOptions = BaseOptions.builder()
-            .setModelAssetPath("efficientdet-lite0.tflite")
+            .setModelAssetPath("efficientdet-lite2.tflite")
             .build()
 
         val options = ObjectDetector.ObjectDetectorOptions.builder()
