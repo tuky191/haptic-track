@@ -34,9 +34,15 @@ class CameraManager(private val context: Context) {
     private var cameraProvider: ProcessCameraProvider? = null
     private var cameraControl: CameraControl? = null
     private var cameraInfo: CameraInfo? = null
+    private var lifecycleOwnerRef: LifecycleOwner? = null
+    private var previewViewRef: PreviewView? = null
 
     /** Detected optical zoom limit from physical camera focal lengths. */
     private var opticalZoomMax: Float = DEFAULT_OPTICAL_MAX
+
+    /** Current lens facing — back by default. */
+    var isFrontCamera: Boolean = false
+        private set
 
     val preview = Preview.Builder().build()
 
@@ -56,11 +62,26 @@ class CameraManager(private val context: Context) {
     }
 
     fun startCamera(lifecycleOwner: LifecycleOwner, previewView: PreviewView) {
+        lifecycleOwnerRef = lifecycleOwner
+        previewViewRef = previewView
         val providerFuture = ProcessCameraProvider.getInstance(context)
         providerFuture.addListener({
             cameraProvider = providerFuture.get()
             bindUseCases(lifecycleOwner, previewView)
         }, mainExecutor)
+    }
+
+    fun switchCamera() {
+        isFrontCamera = !isFrontCamera
+        val owner = lifecycleOwnerRef ?: return
+        val view = previewViewRef ?: return
+        if (isFrontCamera) {
+            opticalZoomMax = DEFAULT_OPTICAL_MAX  // front cameras have no optical zoom
+        } else {
+            opticalZoomMax = detectOpticalZoomMax()
+        }
+        bindUseCases(owner, view)
+        Log.i(TAG, "Switched to ${if (isFrontCamera) "front" else "back"} camera")
     }
 
     private fun bindUseCases(lifecycleOwner: LifecycleOwner, previewView: PreviewView) {
@@ -69,9 +90,12 @@ class CameraManager(private val context: Context) {
 
         preview.surfaceProvider = previewView.surfaceProvider
 
+        val selector = if (isFrontCamera) CameraSelector.DEFAULT_FRONT_CAMERA
+                       else CameraSelector.DEFAULT_BACK_CAMERA
+
         val camera = provider.bindToLifecycle(
             lifecycleOwner,
-            CameraSelector.DEFAULT_BACK_CAMERA,
+            selector,
             preview,
             imageAnalysis,
             videoCapture

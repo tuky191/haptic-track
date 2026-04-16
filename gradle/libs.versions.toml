@@ -8,6 +8,7 @@ composeBom = "2024.12.01"
 camerax = "1.4.1"
 mediapipeVision = "0.10.21"
 opencv = "4.13.0"
+tensorflowLite = "2.16.1"
 accompanistPermissions = "0.36.0"
 junit = "4.13.2"
 robolectric = "4.14.1"
@@ -39,6 +40,9 @@ mediapipe-tasksvision = { group = "com.google.mediapipe", name = "tasks-vision",
 
 # OpenCV
 opencv = { group = "org.opencv", name = "opencv", version.ref = "opencv" }
+
+# TensorFlow Lite
+tensorflow-lite = { group = "org.tensorflow", name = "tensorflow-lite", version.ref = "tensorflowLite" }
 
 # Testing
 junit = { group = "junit", name = "junit", version.ref = "junit" }

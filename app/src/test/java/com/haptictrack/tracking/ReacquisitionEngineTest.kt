@@ -843,6 +843,60 @@ class ReacquisitionEngineTest {
         assertEquals(0f, corr, 0.001f)
     }
 
+    // --- Person attribute scoring ---
+
+    @Test
+    fun `matching person attributes boost score over mismatching`() {
+        val emb = floatArrayOf(1f, 0f, 0f, 0f)
+        val refAttrs = PersonAttributes(
+            isMale = true, hasBag = false, hasBackpack = true, hasHat = true,
+            hasLongSleeves = false, hasLongPants = true, hasLongHair = false, hasCoatJacket = false,
+            rawProbabilities = floatArrayOf(0.9f, 0.1f, 0.9f, 0.9f, 0.1f, 0.9f, 0.1f, 0.1f)
+        )
+        engine.lock(1, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
+            listOf(emb), null, refAttrs)
+        repeat(2) { engine.processFrame(emptyList()) }
+
+        val matchAttrs = PersonAttributes(
+            isMale = true, hasBag = false, hasBackpack = true, hasHat = true,
+            hasLongSleeves = false, hasLongPants = true, hasLongHair = false, hasCoatJacket = false,
+            rawProbabilities = floatArrayOf(0.9f, 0.1f, 0.9f, 0.9f, 0.1f, 0.9f, 0.1f, 0.1f)
+        )
+        val mismatchAttrs = PersonAttributes(
+            isMale = false, hasBag = true, hasBackpack = false, hasHat = false,
+            hasLongSleeves = true, hasLongPants = false, hasLongHair = true, hasCoatJacket = true,
+            rawProbabilities = floatArrayOf(0.1f, 0.9f, 0.1f, 0.1f, 0.9f, 0.1f, 0.9f, 0.9f)
+        )
+
+        val matchCandidate = obj(id = 10, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "person", embedding = emb, personAttributes = matchAttrs)
+        val mismatchCandidate = obj(id = 11, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "person", embedding = emb, personAttributes = mismatchAttrs)
+
+        val matchScore = engine.scoreCandidate(matchCandidate, engine.lastKnownBox!!)
+        val mismatchScore = engine.scoreCandidate(mismatchCandidate, engine.lastKnownBox!!)
+
+        assertNotNull(matchScore)
+        assertNotNull(mismatchScore)
+        assertTrue("Matching attrs ($matchScore) should beat mismatching ($mismatchScore)",
+            matchScore!! > mismatchScore!!)
+    }
+
+    @Test
+    fun `no person attributes does not crash and redistributes weight`() {
+        val emb = floatArrayOf(1f, 0f, 0f, 0f)
+        engine.lock(1, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
+            listOf(emb), null, null)
+        repeat(2) { engine.processFrame(emptyList()) }
+
+        val candidate = obj(id = 10, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "person", embedding = emb, personAttributes = null)
+
+        val score = engine.scoreCandidate(candidate, engine.lastKnownBox!!)
+        assertNotNull(score)
+        assertTrue("Score without attrs should be reasonable: $score", score!! > 0.4f)
+    }
+
     // --- Helpers ---
 
     private fun obj(
@@ -854,13 +908,15 @@ class ReacquisitionEngineTest {
         label: String? = null,
         confidence: Float = 0.8f,
         embedding: FloatArray? = null,
-        colorHistogram: FloatArray? = null
+        colorHistogram: FloatArray? = null,
+        personAttributes: PersonAttributes? = null
     ) = TrackedObject(
         id = id,
         boundingBox = RectF(left, top, right, bottom),
         label = label,
         confidence = confidence,
         embedding = embedding,
-        colorHistogram = colorHistogram
+        colorHistogram = colorHistogram,
+        personAttributes = personAttributes
     )
 }
