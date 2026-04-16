@@ -32,6 +32,8 @@ class ReacquisitionEngine(
         const val APPEARANCE_OVERRIDE_THRESHOLD = 0.7f
         /** Maximum embeddings to keep in gallery. */
         const val MAX_GALLERY_SIZE = 12
+        /** Max times we re-acquire different objects before giving up. */
+        const val MAX_REACQUISITION_HOPS = 3
     }
 
     var lockedId: Int? = null
@@ -58,6 +60,9 @@ class ReacquisitionEngine(
         private set
     var framesLost: Int = 0
         private set
+    /** Number of times we've re-acquired a different object since the original lock. */
+    var reacquisitionHops: Int = 0
+        private set
 
     val isLocked: Boolean get() = lockedId != null
     val isSearching: Boolean get() = lockedId != null && framesLost > 0 && framesLost <= maxFramesLost
@@ -78,6 +83,7 @@ class ReacquisitionEngine(
         lastKnownLabel = label
         lastKnownSize = boundingBox.width() * boundingBox.height()
         framesLost = 0
+        reacquisitionHops = 0
         val attrStr = personAttrs?.summary() ?: "n/a"
         dualLog(Log.INFO, "LOCK id=$trackingId label=\"$label\" box=${fmtBox(boundingBox)} size=${fmtF(lastKnownSize)} gallery=${embeddingGallery.size} colorHist=${colorHist != null} attrs=\"$attrStr\"")
     }
@@ -106,6 +112,7 @@ class ReacquisitionEngine(
         lastKnownLabel = null
         lastKnownSize = 0f
         framesLost = 0
+        reacquisitionHops = 0
     }
 
     fun processFrame(detections: List<TrackedObject>): TrackedObject? {
@@ -126,9 +133,13 @@ class ReacquisitionEngine(
         if (framesLost == 1) {
             dualLog(Log.WARN, "LOST id=$lockId (lockedLabel=\"$lockedLabel\") — starting search. ${detections.size} candidates in frame")
         }
-        if (framesLost > maxFramesLost) {
+        if (framesLost > maxFramesLost || reacquisitionHops >= MAX_REACQUISITION_HOPS) {
             if (framesLost == maxFramesLost + 1) {
                 dualLog(Log.WARN, "TIMEOUT after $maxFramesLost frames. Giving up on lockedLabel=\"$lockedLabel\"")
+            }
+            if (reacquisitionHops >= MAX_REACQUISITION_HOPS && framesLost == 1) {
+                dualLog(Log.WARN, "GIVE_UP after $reacquisitionHops re-acquisition hops — original object is gone")
+                framesLost = maxFramesLost + 1  // force timeout state
             }
             return null
         }
@@ -146,7 +157,8 @@ class ReacquisitionEngine(
 
         val reacquired = findBestCandidate(detections)
         if (reacquired != null) {
-            dualLog(Log.INFO, "REACQUIRE id=${reacquired.id} label=\"${reacquired.label}\" after $framesLost frames (lockedLabel=\"$lockedLabel\") box=${fmtBox(reacquired.boundingBox)}")
+            reacquisitionHops++
+            dualLog(Log.INFO, "REACQUIRE id=${reacquired.id} label=\"${reacquired.label}\" after $framesLost frames (lockedLabel=\"$lockedLabel\") hop=$reacquisitionHops/${MAX_REACQUISITION_HOPS} box=${fmtBox(reacquired.boundingBox)}")
             lockedId = reacquired.id
             updateFromMatch(reacquired)
             return reacquired
@@ -271,7 +283,13 @@ class ReacquisitionEngine(
 
         val positionScore = if (posThreshold > 0f) (1f - (distance / posThreshold)).coerceIn(0f, 1f) else 1f
         val sizeScore = (1f - ((sizeRatio - 1f) / (effectiveSizeThreshold - 1f).coerceAtLeast(0.01f))).coerceIn(0f, 1f)
-        val labelScore = if (lockedLabel != null && candidate.label == lockedLabel) 1f else 0f
+        // Label match: full bonus for match, penalty for mismatch (prevents
+        // wrong-category objects from scoring high on color/position alone)
+        val labelScore = when {
+            lockedLabel == null -> 0.5f  // unknown label, neutral
+            candidate.label == lockedLabel -> 1f  // exact match
+            else -> -0.5f  // wrong label penalty
+        }
 
         // Color histogram similarity — cheap but very effective for same-category discrimination
         val hasColor = lockedColorHistogram != null && candidate.colorHistogram != null
@@ -292,9 +310,9 @@ class ReacquisitionEngine(
             // Attributes are highly discriminative for persons (gender, clothing, accessories).
             val basePositionWeight = 0.15f
             val baseSizeWeight = 0.10f
-            val baseLabelWeight = if (hasAttrs) 0.05f else 0.10f  // attrs subsume label for persons
+            val baseLabelWeight = if (hasAttrs) 0.10f else 0.20f  // 600 OIV7 classes are reliable
             val baseAttrWeight = if (hasAttrs) 0.15f else 0f
-            val baseAppearanceWeight = if (hasAttrs) 0.30f else 0.40f
+            val baseAppearanceWeight = if (hasAttrs) 0.25f else 0.30f
             val baseColorWeight = if (hasColor) (if (hasAttrs) 0.15f else 0.25f) else 0f
             // Redistribute unused weights to appearance
             val unusedBase = 1f - basePositionWeight - baseSizeWeight - baseLabelWeight -
@@ -308,7 +326,7 @@ class ReacquisitionEngine(
             val attrRedistShare = if (hasAttrs) 0.15f else 0f
             val colorRedistShare = if (hasColor) 0.20f else 0f
             val sizeRedistShare = 0.10f
-            val labelRedistShare = 0.05f
+            val labelRedistShare = 0.15f
             val appearRedistShare = 1f - sizeRedistShare - labelRedistShare - attrRedistShare - colorRedistShare
             val effectiveSizeWeight = baseSizeWeight + redistributed * sizeRedistShare
             val effectiveLabelWeight = baseLabelWeight + redistributed * labelRedistShare
@@ -324,9 +342,9 @@ class ReacquisitionEngine(
                    (colorScore * effectiveColorWeight)
         } else {
             // Fallback: no embedding available, use original weights
-            val basePositionWeight = 0.45f
-            val baseSizeWeight = 0.25f
-            val baseLabelWeight = 0.30f
+            val basePositionWeight = 0.40f
+            val baseSizeWeight = 0.20f
+            val baseLabelWeight = 0.40f
 
             val effectivePositionWeight = basePositionWeight * positionConfidence
             val redistributed = basePositionWeight * (1f - positionConfidence)

@@ -26,6 +26,7 @@ class ObjectTracker(
 ) {
 
     private val detector: ObjectDetector
+    private val labelEnricher: Yolov8Detector = Yolov8Detector(context)
 
     // Keep last frame for computing embedding when user taps to lock
     private val lastFrameLock = Any()
@@ -79,22 +80,25 @@ class ObjectTracker(
                 return
             }
 
+            // Enrich coarse COCO label with finer OIV7 label (one-shot, ~270ms)
+            val enrichedLabel = labelEnricher.enrichLabel(bmp, boundingBox, label) ?: label
+
             val augResult = appearanceEmbedder.embedWithAugmentations(bmp, boundingBox)
             // Compute color histogram on the masked crop (single segmentation pass)
             val colorHist = if (augResult.maskedCrop != null) {
                 val fullBox = RectF(0f, 0f, 1f, 1f) // crop is already the object
                 computeColorHistogram(augResult.maskedCrop, fullBox).also { augResult.maskedCrop.recycle() }
             } else computeColorHistogram(bmp, boundingBox)
-            // Classify person attributes at lock time
+            // Classify person attributes at lock time (use original COCO label for "person" check)
             val personAttrs = personClassifier.classify(bmp, boundingBox, label)
-            reacquisition.lock(trackingId, boundingBox, label, augResult.embeddings, colorHist, personAttrs)
+            reacquisition.lock(trackingId, boundingBox, enrichedLabel, augResult.embeddings, colorHist, personAttrs)
             visualTracker.init(bmp, boundingBox)
 
-            debugCapture.startSession(label, trackingId)
+            debugCapture.startSession(enrichedLabel, trackingId)
             val attrStr = personAttrs?.summary() ?: "n/a"
-            debugCapture.log("LOCK id=$trackingId label=$label box=${boundingBox} gallery=${augResult.embeddings.size} colorHist=${colorHist != null} attrs=\"$attrStr\"")
+            debugCapture.log("LOCK id=$trackingId label=$enrichedLabel (coco=$label) box=${boundingBox} gallery=${augResult.embeddings.size} colorHist=${colorHist != null} attrs=\"$attrStr\"")
 
-            val locked = TrackedObject(trackingId, boundingBox, label)
+            val locked = TrackedObject(trackingId, boundingBox, enrichedLabel)
             debugCapture.capture(DebugEvent.LOCK, bmp, listOf(locked), lockedObject = locked,
                 extraInfo = "id=$trackingId label=$label gallery=${augResult.embeddings.size}")
         }
@@ -220,9 +224,22 @@ class ObjectTracker(
             // handoff). Without embeddings, two same-label objects are indistinguishable.
             val needEmbeddings = reacquisition.hasEmbeddings &&
                 (reacquisition.isSearching || (reacquisition.isLocked && reacquisition.framesLost == 0))
+
+            // Enrich labels with YOLOv8 during search (every 10 frames, not every frame)
+            val searchFrame = reacquisition.framesLost
+            val shouldEnrichLabels = reacquisition.isSearching && tracked.isNotEmpty() &&
+                (searchFrame <= 1 || searchFrame % 10 == 0)
+            val enrichedIds = if (shouldEnrichLabels) labelEnricher.enrichLabels(bitmap, tracked) else emptyMap()
+            val withLabels = if (enrichedIds.isNotEmpty()) {
+                tracked.map { obj ->
+                    val enriched = enrichedIds[obj.id]
+                    if (enriched != null) obj.copy(label = enriched) else obj
+                }
+            } else tracked
+
             val withEmbeddings = if (needEmbeddings) {
                 // First pass: compute embeddings + histograms for all candidates
-                val withVisual = tracked.map { obj ->
+                val withVisual = withLabels.map { obj ->
                     val result = appearanceEmbedder.embedAndCrop(bitmap, obj.boundingBox)
                     val hist = if (result.maskedCrop != null) {
                         val fullBox = RectF(0f, 0f, 1f, 1f)
@@ -244,7 +261,7 @@ class ObjectTracker(
                         obj.copy(personAttributes = attrs)
                     } else obj
                 }
-            } else tracked
+            } else withLabels
 
             // Snapshot state before processing
             val wasSearching = reacquisition.isSearching
@@ -403,6 +420,8 @@ class ObjectTracker(
     fun shutdown() {
         debugCapture.endSession()
         detector.close()
+        labelEnricher.close()
+        personClassifier.shutdown()
         appearanceEmbedder.shutdown()
         visualTracker.stop()
         synchronized(lastFrameLock) {
