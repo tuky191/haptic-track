@@ -10,6 +10,11 @@ enum class TrackingStatus {
     LOST
 }
 
+enum class CaptureMode {
+    VIDEO,
+    PHOTO
+}
+
 /**
  * Person attributes from Crossroad-0230 classifier.
  * All boolean fields use threshold > 0.5 on model output probabilities.
@@ -148,5 +153,10 @@ data class TrackingUiState(
     /** Source image height (post-rotation, i.e. portrait height). */
     val sourceImageHeight: Int = 0,
     /** Contour points of the locked object in normalized [0,1] coordinates. */
-    val lockedContour: List<PointF> = emptyList()
+    val lockedContour: List<PointF> = emptyList(),
+    val captureMode: CaptureMode = CaptureMode.VIDEO,
+    /** True when zoom indicator should be visible (during/after pinch). */
+    val showZoomIndicator: Boolean = false,
+    /** Stealth mode: preview hidden, screen stays black. */
+    val stealthMode: Boolean = false
 )

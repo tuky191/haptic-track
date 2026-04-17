@@ -4,10 +4,36 @@ import android.graphics.RectF
 
 class ZoomController(
     private val targetFrameOccupancy: Float = 0.15f,
-    private val zoomSpeed: Float = 0.05f
+    private val zoomSpeed: Float = 0.10f
 ) {
 
     private var currentZoom = 1f
+
+    /** When true, [calculateZoom] returns the current zoom unchanged (manual pinch active). */
+    var manualOverride: Boolean = false
+        private set
+
+    private var manualOverrideExpiry: Long = 0L
+
+    companion object {
+        /** Object touching frame edge — actively zoom out. */
+        private const val CLIP_THRESHOLD = 0.02f
+        /** Object near frame edge — stop zooming in. */
+        private const val EDGE_MARGIN = 0.08f
+        /** How long manual zoom holds after the last pinch gesture (ms). */
+        private const val MANUAL_OVERRIDE_DURATION_MS = 2000L
+    }
+
+    /**
+     * Set zoom directly from a pinch gesture.
+     * Activates manual override that pauses auto-zoom for [MANUAL_OVERRIDE_DURATION_MS].
+     */
+    fun setManualZoom(ratio: Float, minZoom: Float, maxZoom: Float): Float {
+        currentZoom = ratio.coerceIn(minZoom, maxZoom)
+        manualOverride = true
+        manualOverrideExpiry = System.currentTimeMillis() + MANUAL_OVERRIDE_DURATION_MS
+        return currentZoom
+    }
 
     /**
      * Calculate the desired zoom ratio based on the subject's bounding box.
@@ -18,6 +44,12 @@ class ZoomController(
      * @return Target zoom ratio
      */
     fun calculateZoom(boundingBox: RectF, minZoom: Float, maxZoom: Float): Float {
+        // Check if manual override has expired
+        if (manualOverride && System.currentTimeMillis() > manualOverrideExpiry) {
+            manualOverride = false
+        }
+        if (manualOverride) return currentZoom
+
         val boxArea = boundingBox.width() * boundingBox.height()
         val targetArea = targetFrameOccupancy
 
@@ -40,13 +72,6 @@ class ZoomController(
 
         currentZoom = (currentZoom + zoomAdjustment).coerceIn(minZoom, maxZoom)
         return currentZoom
-    }
-
-    companion object {
-        /** Object touching frame edge — actively zoom out. */
-        private const val CLIP_THRESHOLD = 0.02f
-        /** Object near frame edge — stop zooming in. */
-        private const val EDGE_MARGIN = 0.08f
     }
 
     /**
@@ -75,5 +100,9 @@ class ZoomController(
 
     fun reset() {
         currentZoom = 1f
+        manualOverride = false
     }
+
+    /** Current zoom level (for pinch gesture to use as baseline). */
+    fun getCurrentZoom(): Float = currentZoom
 }

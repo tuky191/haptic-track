@@ -118,6 +118,18 @@ class ObjectTracker(
         }
     }
 
+    /**
+     * Prepare for a camera rebind. Stops visual tracker and forces
+     * re-acquisition engine into search mode so it recovers on the
+     * first frame after the camera restarts.
+     */
+    fun prepareForRebind() {
+        if (!reacquisition.isLocked) return
+        visualTracker.stop()
+        vtUnconfirmedFrames = 0
+        reacquisition.prepareForRebind()
+    }
+
     fun clearLock() {
         scenarioRecorder.recordEvent("CLEAR")
         scenarioRecorder.stop()
@@ -135,13 +147,25 @@ class ObjectTracker(
         processImage(imageProxy)
     }
 
+    /**
+     * Process a display-oriented bitmap from PreviewView.getBitmap().
+     * Unlike the ImageProxy path, the bitmap is already in screen orientation —
+     * no rotation is applied, and detector coordinates are used as-is (deviceRot=0).
+     */
+    fun processBitmap(bitmap: Bitmap) {
+        processBitmapInternal(bitmap, deviceRotation = 0, imageProxy = null)
+    }
+
     private fun processImage(imageProxy: ImageProxy) {
         val bitmap = imageProxyToBitmap(imageProxy)
         if (bitmap == null) {
             imageProxy.close()
             return
         }
+        processBitmapInternal(bitmap, deviceRotation = deviceRotationProvider?.invoke() ?: 0, imageProxy = imageProxy)
+    }
 
+    private fun processBitmapInternal(bitmap: Bitmap, deviceRotation: Int, imageProxy: ImageProxy?) {
         val frameWidth = bitmap.width
         val frameHeight = bitmap.height
 
@@ -153,12 +177,12 @@ class ObjectTracker(
                 val vtResult = visualTracker.update(bitmap)
                 if (vtResult != null) {
                     // Run detector anyway to validate and for display
-                    val detections = runDetector(bitmap, frameWidth, frameHeight)
+                    val detections = runDetector(bitmap, frameWidth, frameHeight, deviceRotation)
                     val tracked = frameTracker.assignIds(detections)
 
                     // VT returns coords in rotated-image space; unmap to screen space
                     // to match detector boxes (which are already unmapped).
-                    val deviceRot = deviceRotationProvider?.invoke() ?: 0
+                    val deviceRot = deviceRotation
                     val rawBox = vtResult.boundingBox
                     val vtBox = unmapRotation(rawBox.left, rawBox.top, rawBox.right, rawBox.bottom, deviceRot)
                     val confirmed = tracked.any { det ->
@@ -238,7 +262,7 @@ class ObjectTracker(
             }
 
             // --- Detector path: detection + re-acquisition ---
-            val detections = runDetector(bitmap, frameWidth, frameHeight)
+            val detections = runDetector(bitmap, frameWidth, frameHeight, deviceRotation)
             val tracked = frameTracker.assignIds(detections)
 
             // Compute embeddings when searching OR when the direct ID match might
@@ -333,7 +357,7 @@ class ObjectTracker(
 
             // Update contour on re-acquire or periodically (gated — disabled until UI uses it)
             if (contourEnabled) {
-                val deviceRot = deviceRotationProvider?.invoke() ?: 0
+                val deviceRot = deviceRotation
                 if (lockedObject != null && reacquisition.framesLost == 0) {
                     contourFrameCount++
                     if (contourFrameCount % CONTOUR_UPDATE_INTERVAL_DET == 0 || (wasSearching && reacquisition.framesLost == 0)) {
@@ -352,15 +376,14 @@ class ObjectTracker(
 
             onDetectionResult?.invoke(displayObjects, lockedObject, frameWidth, frameHeight, cachedContour)
         } finally {
-            imageProxy.close()
+            imageProxy?.close()
             bitmap.recycle()
         }
     }
 
-    private fun runDetector(bitmap: Bitmap, frameWidth: Int, frameHeight: Int): List<TrackedObject> {
+    private fun runDetector(bitmap: Bitmap, frameWidth: Int, frameHeight: Int, deviceRot: Int): List<TrackedObject> {
         val mpImage = BitmapImageBuilder(bitmap).build()
         val result: ObjectDetectorResult = detector.detect(mpImage)
-        val deviceRot = deviceRotationProvider?.invoke() ?: 0
 
         return result.detections().map { detection ->
             val box = detection.boundingBox()

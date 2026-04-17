@@ -10,6 +10,9 @@ import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
+import androidx.camera.video.FallbackStrategy
 import androidx.camera.video.Quality
 import androidx.camera.video.QualitySelector
 import androidx.camera.video.Recorder
@@ -18,6 +21,7 @@ import androidx.camera.view.PreviewView
 import androidx.lifecycle.LifecycleOwner
 import android.os.Handler
 import android.os.Looper
+import android.util.Size
 import java.util.concurrent.Executors
 
 class CameraManager(private val context: Context) {
@@ -44,18 +48,42 @@ class CameraManager(private val context: Context) {
     var isFrontCamera: Boolean = false
         private set
 
+    /** When true, ImageAnalysis is unbound to free a stream for higher video resolution. */
+    private var recordingMode: Boolean = false
+
+    /** Whether ImageAnalysis is currently active (false during recording). */
+    var analysisActive: Boolean = true
+        private set
+
     val preview = Preview.Builder().build()
 
     val imageAnalysis: ImageAnalysis = ImageAnalysis.Builder()
         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+        .setResolutionSelector(
+            ResolutionSelector.Builder()
+                .setResolutionStrategy(
+                    ResolutionStrategy(Size(640, 480), ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER)
+                )
+                .build()
+        )
         .build()
 
-    private val recorder = Recorder.Builder()
-        .setQualitySelector(QualitySelector.from(Quality.HIGHEST))
-        .setExecutor(Executors.newSingleThreadExecutor())
-        .build()
+    private val videoExecutor = Executors.newSingleThreadExecutor()
+    var videoCapture = createVideoCapture()
+        private set
 
-    val videoCapture = VideoCapture.withOutput(recorder)
+    private fun createVideoCapture(): VideoCapture<Recorder> {
+        val recorder = Recorder.Builder()
+            .setQualitySelector(
+                QualitySelector.fromOrderedList(
+                    listOf(Quality.UHD, Quality.FHD, Quality.HD),
+                    FallbackStrategy.higherQualityOrLowerThan(Quality.FHD)
+                )
+            )
+            .setExecutor(videoExecutor)
+            .build()
+        return VideoCapture.withOutput(recorder)
+    }
 
     init {
         opticalZoomMax = detectOpticalZoomMax()
@@ -84,25 +112,57 @@ class CameraManager(private val context: Context) {
         Log.i(TAG, "Switched to ${if (isFrontCamera) "front" else "back"} camera")
     }
 
+    /**
+     * Switch to recording mode (2 streams: preview + video → higher video resolution).
+     * Analysis frames must be obtained via PreviewView.getBitmap().
+     */
+    fun enterRecordingMode() {
+        if (recordingMode) return
+        recordingMode = true
+        val owner = lifecycleOwnerRef ?: return
+        val view = previewViewRef ?: return
+        bindUseCases(owner, view)
+    }
+
+    /**
+     * Switch back to tracking mode (3 streams: preview + analysis + video).
+     * ImageAnalysis provides full-quality frames for detection.
+     */
+    fun exitRecordingMode() {
+        if (!recordingMode) return
+        recordingMode = false
+        val owner = lifecycleOwnerRef ?: return
+        val view = previewViewRef ?: return
+        bindUseCases(owner, view)
+    }
+
     private fun bindUseCases(lifecycleOwner: LifecycleOwner, previewView: PreviewView) {
         val provider = cameraProvider ?: return
         provider.unbindAll()
+
+        // Recreate VideoCapture to avoid resolution mismatch when switching modes
+        videoCapture = createVideoCapture()
 
         preview.surfaceProvider = previewView.surfaceProvider
 
         val selector = if (isFrontCamera) CameraSelector.DEFAULT_FRONT_CAMERA
                        else CameraSelector.DEFAULT_BACK_CAMERA
 
-        val camera = provider.bindToLifecycle(
-            lifecycleOwner,
-            selector,
-            preview,
-            imageAnalysis,
-            videoCapture
-        )
+        val camera = if (recordingMode) {
+            // 2 streams: preview + video → 4K video, analysis via getBitmap()
+            provider.bindToLifecycle(lifecycleOwner, selector, preview, videoCapture)
+        } else {
+            // 3 streams: preview + analysis + video → full-quality analysis
+            provider.bindToLifecycle(lifecycleOwner, selector, preview, imageAnalysis, videoCapture)
+        }
+        analysisActive = !recordingMode
 
         cameraControl = camera.cameraControl
         cameraInfo = camera.cameraInfo
+
+        val previewRes = preview.resolutionInfo?.resolution
+        val analysisRes = if (!recordingMode) imageAnalysis.resolutionInfo?.resolution else null
+        Log.i(TAG, "Bound use cases — preview: $previewRes, analysis: $analysisRes, mode: ${if (recordingMode) "recording (2-stream)" else "tracking (3-stream)"}")
     }
 
     fun setZoomRatio(ratio: Float) {
