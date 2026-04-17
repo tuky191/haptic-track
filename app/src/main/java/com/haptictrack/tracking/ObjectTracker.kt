@@ -135,13 +135,25 @@ class ObjectTracker(
         processImage(imageProxy)
     }
 
+    /**
+     * Process a pre-rotated bitmap from PreviewView.getBitmap().
+     * Unlike the ImageProxy path, the bitmap is already in screen orientation
+     * and does NOT need rotation correction.
+     */
+    fun processBitmap(bitmap: Bitmap) {
+        processBitmapInternal(bitmap, needsRotation = false, imageProxy = null)
+    }
+
     private fun processImage(imageProxy: ImageProxy) {
         val bitmap = imageProxyToBitmap(imageProxy)
         if (bitmap == null) {
             imageProxy.close()
             return
         }
+        processBitmapInternal(bitmap, needsRotation = true, imageProxy = imageProxy)
+    }
 
+    private fun processBitmapInternal(bitmap: Bitmap, needsRotation: Boolean, imageProxy: ImageProxy?) {
         val frameWidth = bitmap.width
         val frameHeight = bitmap.height
 
@@ -352,7 +364,7 @@ class ObjectTracker(
 
             onDetectionResult?.invoke(displayObjects, lockedObject, frameWidth, frameHeight, cachedContour)
         } finally {
-            imageProxy.close()
+            imageProxy?.close()
             bitmap.recycle()
         }
     }

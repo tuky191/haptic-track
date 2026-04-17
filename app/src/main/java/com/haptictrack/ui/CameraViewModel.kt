@@ -1,11 +1,15 @@
 package com.haptictrack.ui
 
 import android.app.Application
+import android.graphics.Bitmap
+import android.graphics.Matrix
 import android.graphics.RectF
+import android.util.Log
 import androidx.camera.video.VideoRecordEvent
 import androidx.camera.view.PreviewView
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.viewModelScope
 import com.haptictrack.camera.CameraManager
 import com.haptictrack.camera.DeviceOrientationListener
 import com.haptictrack.camera.RecordingManager
@@ -16,10 +20,15 @@ import com.haptictrack.tracking.TrackedObject
 import com.haptictrack.tracking.TrackingStatus
 import com.haptictrack.tracking.TrackingUiState
 import com.haptictrack.zoom.ZoomController
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 class CameraViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -32,6 +41,18 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     private val _uiState = MutableStateFlow(TrackingUiState())
     val uiState: StateFlow<TrackingUiState> = _uiState.asStateFlow()
+
+    /** Coroutine job for getBitmap() analysis loop during recording. */
+    private var bitmapAnalysisJob: Job? = null
+    private var previewViewRef: PreviewView? = null
+
+    companion object {
+        private const val TAG = "CameraVM"
+        /** Tap target padding in normalized coordinates (~3% of screen on each side). */
+        private const val TAP_PADDING = 0.03f
+        /** Target interval between getBitmap() analysis frames (ms). */
+        private const val BITMAP_ANALYSIS_INTERVAL_MS = 50L // ~20fps
+    }
 
     /** Smooths idle detections by keeping objects alive for a few frames after they disappear. */
     private val recentDetections = mutableMapOf<Int, Pair<TrackedObject, Int>>() // id → (object, framesRemaining)
@@ -100,6 +121,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun startCamera(lifecycleOwner: LifecycleOwner, previewView: PreviewView) {
+        previewViewRef = previewView
         cameraManager.startCamera(lifecycleOwner, previewView)
     }
 
@@ -142,11 +164,6 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         stale.forEach { recentDetections.remove(it) }
 
         return recentDetections.values.map { it.first }
-    }
-
-    companion object {
-        /** Tap target padding in normalized coordinates (~3% of screen on each side). */
-        private const val TAP_PADDING = 0.03f
     }
 
     /**
@@ -235,21 +252,67 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     fun toggleRecording() {
         if (recordingManager.isRecording) {
             recordingManager.stopRecording()
-            _uiState.update { it.copy(isRecording = false) }
+            stopBitmapAnalysis()
+            // Don't exit recording mode here — wait for Finalize callback
+            // so the recording file is properly closed before rebinding
         } else {
+            // Switch to 2-stream mode for higher video resolution
+            cameraManager.enterRecordingMode()
+            startBitmapAnalysis()
             recordingManager.startRecording(cameraManager.videoCapture) { event ->
                 when (event) {
                     is VideoRecordEvent.Start ->
                         _uiState.update { it.copy(isRecording = true) }
-                    is VideoRecordEvent.Finalize ->
+                    is VideoRecordEvent.Finalize -> {
                         _uiState.update { it.copy(isRecording = false) }
+                        // Now safe to rebind with 3 streams
+                        cameraManager.exitRecordingMode()
+                    }
                 }
             }
         }
     }
 
+    /**
+     * Start a coroutine loop that pulls bitmaps from PreviewView for analysis.
+     * Used during recording when ImageAnalysis is unbound.
+     */
+    private fun startBitmapAnalysis() {
+        bitmapAnalysisJob?.cancel()
+        bitmapAnalysisJob = viewModelScope.launch {
+            Log.i(TAG, "Bitmap analysis loop started")
+            while (isActive) {
+                // getBitmap() must be called on main thread
+                val preview = previewViewRef
+                val bitmap = preview?.bitmap
+                if (bitmap != null) {
+                    // Process off main thread
+                    launch(Dispatchers.Default) {
+                        val deviceRot = orientationListener.deviceRotation
+                        val rotated = if (deviceRot != 0) {
+                            val matrix = Matrix().apply { postRotate(deviceRot.toFloat()) }
+                            val r = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+                            if (r !== bitmap) bitmap.recycle()
+                            r
+                        } else bitmap
+
+                        objectTracker.processBitmap(rotated)
+                    }
+                }
+                delay(BITMAP_ANALYSIS_INTERVAL_MS)
+            }
+            Log.i(TAG, "Bitmap analysis loop stopped")
+        }
+    }
+
+    private fun stopBitmapAnalysis() {
+        bitmapAnalysisJob?.cancel()
+        bitmapAnalysisJob = null
+    }
+
     override fun onCleared() {
         super.onCleared()
+        stopBitmapAnalysis()
         orientationListener.stop()
         objectTracker.shutdown()
         hapticManager.shutdown()
