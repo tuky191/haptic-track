@@ -23,7 +23,7 @@ import java.nio.ByteOrder
  * Used for person-vs-person discrimination when a face is visible.
  * The embedding is added to the lock attributes progressively — not required at lock time.
  */
-class FaceEmbedder(context: Context) {
+class FaceEmbedder(context: Context, sharedFaceDetector: FaceDetector? = null) {
 
     companion object {
         private const val TAG = "FaceEmbed"
@@ -36,6 +36,7 @@ class FaceEmbedder(context: Context) {
 
     private val interpreter: Interpreter
     private val faceDetector: FaceDetector
+    private val ownsFaceDetector: Boolean
 
     // Pre-allocated buffers — this MobileFaceNet variant has fixed batch=2
     private val inputBuffer: ByteBuffer = ByteBuffer.allocateDirect(4 * 2 * INPUT_SIZE * INPUT_SIZE * 3).apply {
@@ -47,13 +48,19 @@ class FaceEmbedder(context: Context) {
         val model = loadTfliteModel(context, MODEL_ASSET)
         interpreter = Interpreter(model, Interpreter.Options().apply { setNumThreads(2) })
 
-        val faceOptions = FaceDetector.FaceDetectorOptions.builder()
-            .setBaseOptions(BaseOptions.builder().setModelAssetPath(FACE_MODEL_ASSET).build())
-            .setMinDetectionConfidence(FACE_MIN_CONFIDENCE)
-            .build()
-        faceDetector = FaceDetector.createFromOptions(context, faceOptions)
+        if (sharedFaceDetector != null) {
+            faceDetector = sharedFaceDetector
+            ownsFaceDetector = false
+        } else {
+            val faceOptions = FaceDetector.FaceDetectorOptions.builder()
+                .setBaseOptions(BaseOptions.builder().setModelAssetPath(FACE_MODEL_ASSET).build())
+                .setMinDetectionConfidence(FACE_MIN_CONFIDENCE)
+                .build()
+            faceDetector = FaceDetector.createFromOptions(context, faceOptions)
+            ownsFaceDetector = true
+        }
 
-        Log.i(TAG, "Loaded MobileFaceNet (${EMBEDDING_DIM}-dim) + BlazeFace")
+        Log.i(TAG, "Loaded MobileFaceNet (${EMBEDDING_DIM}-dim)${if (ownsFaceDetector) " + BlazeFace" else " (shared BlazeFace)"}")
     }
 
     /**
@@ -75,6 +82,7 @@ class FaceEmbedder(context: Context) {
      * Compute face embedding from an already-cropped person bitmap.
      * Returns null if no face is found. Does NOT recycle [personCrop].
      */
+    @Synchronized
     fun embedFaceFromCrop(personCrop: Bitmap): FloatArray? {
         if (personCrop.width < 30 || personCrop.height < 30) return null
         try {
@@ -103,9 +111,9 @@ class FaceEmbedder(context: Context) {
 
             // L2 normalize the embedding
             val embedding = outputArray[0].copyOf()
-            l2Normalize(embedding)
+            com.haptictrack.tracking.l2Normalize(embedding)
 
-            Log.d(TAG, "Face embedding computed (norm after L2: ${"%.2f".format(norm(embedding))})")
+            Log.d(TAG, "Face embedding computed (norm after L2: ${"%.2f".format(l2Norm(embedding))})")
             return embedding
         } catch (e: Exception) {
             Log.w(TAG, "Face embedding failed: ${e.message}")
@@ -115,7 +123,7 @@ class FaceEmbedder(context: Context) {
 
     fun close() {
         interpreter.close()
-        faceDetector.close()
+        if (ownsFaceDetector) faceDetector.close()
     }
 
     /** InsightFace preprocessing: (pixel - 127.5) / 128.0 → [-1, +1]. Fills both batch slots. */
@@ -134,14 +142,4 @@ class FaceEmbedder(context: Context) {
         inputBuffer.rewind()
     }
 
-    private fun l2Normalize(arr: FloatArray) {
-        val n = norm(arr)
-        if (n > 1e-6f) for (i in arr.indices) arr[i] /= n
-    }
-
-    private fun norm(arr: FloatArray): Float {
-        var sum = 0f
-        for (v in arr) sum += v * v
-        return kotlin.math.sqrt(sum)
-    }
 }

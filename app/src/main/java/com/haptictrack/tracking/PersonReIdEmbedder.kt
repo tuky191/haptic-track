@@ -77,6 +77,7 @@ class PersonReIdEmbedder(context: Context) {
      * Compute a re-ID embedding from an already-cropped person bitmap.
      * Does NOT recycle [personCrop].
      */
+    @Synchronized
     fun embedFromCrop(personCrop: Bitmap): FloatArray? {
         if (personCrop.width < 10 || personCrop.height < 20) return null
         try {
@@ -87,7 +88,7 @@ class PersonReIdEmbedder(context: Context) {
             interpreter.run(inputBuffer, outputArray)
 
             val embedding = outputArray[0].copyOf()
-            l2Normalize(embedding)
+            com.haptictrack.tracking.l2Normalize(embedding)
 
             Log.d(TAG, "Re-ID embedding computed (${EMBEDDING_DIM}-dim)")
             return embedding
@@ -114,14 +115,4 @@ class PersonReIdEmbedder(context: Context) {
         inputBuffer.rewind()
     }
 
-    private fun l2Normalize(arr: FloatArray) {
-        val n = norm(arr)
-        if (n > 1e-6f) for (i in arr.indices) arr[i] /= n
-    }
-
-    private fun norm(arr: FloatArray): Float {
-        var sum = 0f
-        for (v in arr) sum += v * v
-        return kotlin.math.sqrt(sum)
-    }
 }

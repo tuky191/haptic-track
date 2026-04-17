@@ -27,7 +27,7 @@ class ObjectTracker(
 
     private val detector: ObjectDetector
     private val labelEnricher: Yolov8Detector = Yolov8Detector(context)
-    private val faceEmbedder: FaceEmbedder = FaceEmbedder(context)
+    private val faceEmbedder: FaceEmbedder = FaceEmbedder(context, personClassifier.faceDetector)
     private val personReId: PersonReIdEmbedder = PersonReIdEmbedder(context)
     private val scenarioRecorder = ScenarioRecorder()
 
@@ -183,8 +183,9 @@ class ObjectTracker(
                                 android.util.Log.d("AppearEmbed", "Gallery +1 → ${reacquisition.embeddingGallery.size} (accumulated)")
                             }
                             // Progressive face embedding: try to capture face during tracking
+                            // Use rawBox (rotated-image coords) since bitmap is the rotated image
                             if (reacquisition.lockedFaceEmbedding == null && reacquisition.lockedReIdEmbedding != null) {
-                                val faceEmb = faceEmbedder.embedFace(bitmap, vtBox)
+                                val faceEmb = faceEmbedder.embedFace(bitmap, rawBox)
                                 if (faceEmb != null) reacquisition.addFaceEmbedding(faceEmb)
                             }
                         }

@@ -43,7 +43,8 @@ class PersonAttributeClassifier(context: Context) {
 
     private val bodyInterpreter: Interpreter
     private val ageGenderInterpreter: Interpreter
-    private val faceDetector: FaceDetector
+    /** Exposed for sharing with [FaceEmbedder] to avoid duplicate model loading. */
+    val faceDetector: FaceDetector
 
     init {
         val bodyModel = loadTfliteModel(context, BODY_MODEL_ASSET)
