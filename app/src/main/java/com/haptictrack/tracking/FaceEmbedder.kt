@@ -87,7 +87,7 @@ class FaceEmbedder(context: Context, sharedFaceDetector: FaceDetector? = null) {
         if (personCrop.width < 30 || personCrop.height < 30) return null
         try {
             val mpImage = BitmapImageBuilder(personCrop).build()
-            val faces = faceDetector.detect(mpImage)
+            val faces = synchronized(faceDetector) { faceDetector.detect(mpImage) }
             if (faces.detections().isEmpty()) return null
 
             // Use the largest face
