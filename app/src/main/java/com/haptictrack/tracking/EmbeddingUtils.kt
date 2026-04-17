@@ -1,9 +1,13 @@
 package com.haptictrack.tracking
 
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.RectF
 import android.util.Log
+import java.io.FileInputStream
+import java.nio.MappedByteBuffer
+import java.nio.channels.FileChannel
 
 /**
  * Shared utilities for embedding comparison and image cropping.
@@ -118,6 +122,37 @@ fun computeColorHistogram(bitmap: Bitmap, normalizedBox: RectF): FloatArray? {
     for (i in combined.indices) combined[i] /= sum
 
     return combined
+}
+
+/**
+ * Load a TFLite model from an asset file into a memory-mapped buffer.
+ */
+fun loadTfliteModel(context: Context, assetName: String): MappedByteBuffer {
+    val fd = context.assets.openFd(assetName)
+    return fd.use {
+        FileInputStream(it.fileDescriptor).use { input ->
+            input.channel.map(FileChannel.MapMode.READ_ONLY, it.startOffset, it.declaredLength)
+        }
+    }
+}
+
+/**
+ * IoU (Intersection over Union) between two bounding boxes.
+ */
+fun computeIou(a: RectF, b: RectF): Float {
+    val interLeft = maxOf(a.left, b.left)
+    val interTop = maxOf(a.top, b.top)
+    val interRight = minOf(a.right, b.right)
+    val interBottom = minOf(a.bottom, b.bottom)
+
+    if (interLeft >= interRight || interTop >= interBottom) return 0f
+
+    val interArea = (interRight - interLeft) * (interBottom - interTop)
+    val aArea = a.width() * a.height()
+    val bArea = b.width() * b.height()
+    val unionArea = aArea + bArea - interArea
+
+    return if (unionArea > 0f) interArea / unionArea else 0f
 }
 
 /**

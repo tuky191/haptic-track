@@ -40,6 +40,9 @@ class ReacquisitionEngine(
         private set
     var lockedLabel: String? = null
         private set
+    /** Original COCO label before enrichment — used for label matching during search. */
+    var lockedCocoLabel: String? = null
+        private set
     /** Gallery of reference embeddings — augmented at lock time, accumulated during tracking. */
     private var _embeddingGallery: MutableList<FloatArray> = mutableListOf()
     val embeddingGallery: List<FloatArray> get() = _embeddingGallery
@@ -73,9 +76,11 @@ class ReacquisitionEngine(
     }
 
     fun lock(trackingId: Int, boundingBox: RectF, label: String?, embeddings: List<FloatArray>,
-             colorHist: FloatArray? = null, personAttrs: PersonAttributes? = null) {
+             colorHist: FloatArray? = null, personAttrs: PersonAttributes? = null,
+             cocoLabel: String? = null) {
         lockedId = trackingId
         lockedLabel = label
+        lockedCocoLabel = cocoLabel
         _embeddingGallery = embeddings.map { it.copyOf() }.toMutableList()
         lockedColorHistogram = colorHist?.copyOf()
         lockedPersonAttributes = personAttrs
@@ -102,9 +107,10 @@ class ReacquisitionEngine(
     }
 
     fun clear() {
-        dualLog(Log.INFO, "CLEAR (was id=$lockedId label=\"$lockedLabel\")")
+        dualLog(Log.INFO, "CLEAR (was id=$lockedId label=\"$lockedLabel\" coco=\"$lockedCocoLabel\")")
         lockedId = null
         lockedLabel = null
+        lockedCocoLabel = null
         _embeddingGallery.clear()
         lockedColorHistogram = null
         lockedPersonAttributes = null
@@ -157,8 +163,14 @@ class ReacquisitionEngine(
 
         val reacquired = findBestCandidate(detections)
         if (reacquired != null) {
-            reacquisitionHops++
-            dualLog(Log.INFO, "REACQUIRE id=${reacquired.id} label=\"${reacquired.label}\" after $framesLost frames (lockedLabel=\"$lockedLabel\") hop=$reacquisitionHops/${MAX_REACQUISITION_HOPS} box=${fmtBox(reacquired.boundingBox)}")
+            // Only count as a hop if this looks like a different object.
+            // High embedding similarity = likely same object after VT death, not a real hop.
+            val sim = if (hasEmbeddings && reacquired.embedding != null) {
+                bestGallerySimilarity(reacquired.embedding!!)
+            } else 0f
+            val isSameObject = sim >= APPEARANCE_OVERRIDE_THRESHOLD
+            if (!isSameObject) reacquisitionHops++
+            dualLog(Log.INFO, "REACQUIRE id=${reacquired.id} label=\"${reacquired.label}\" after $framesLost frames (lockedLabel=\"$lockedLabel\") hop=$reacquisitionHops/${MAX_REACQUISITION_HOPS} sim=${fmtF(sim)}${if (isSameObject) " (same-object)" else ""} box=${fmtBox(reacquired.boundingBox)}")
             lockedId = reacquired.id
             updateFromMatch(reacquired)
             return reacquired
@@ -284,10 +296,15 @@ class ReacquisitionEngine(
         val positionScore = if (posThreshold > 0f) (1f - (distance / posThreshold)).coerceIn(0f, 1f) else 1f
         val sizeScore = (1f - ((sizeRatio - 1f) / (effectiveSizeThreshold - 1f).coerceAtLeast(0.01f))).coerceIn(0f, 1f)
         // Label match: full bonus for match, penalty for mismatch (prevents
-        // wrong-category objects from scoring high on color/position alone)
+        // wrong-category objects from scoring high on color/position alone).
+        // Matches against both the enriched label and the original COCO label,
+        // since candidates may carry either depending on enrichment timing.
+        val labelMatches = lockedLabel != null && (
+            candidate.label == lockedLabel || candidate.label == lockedCocoLabel
+        )
         val labelScore = when {
             lockedLabel == null -> 0.5f  // unknown label, neutral
-            candidate.label == lockedLabel -> 1f  // exact match
+            labelMatches -> 1f  // exact or COCO-parent match
             else -> -0.5f  // wrong label penalty
         }
 

@@ -897,6 +897,188 @@ class ReacquisitionEngineTest {
         assertTrue("Score without attrs should be reasonable: $score", score!! > 0.4f)
     }
 
+    // --- Re-acquisition hop limit ---
+
+    @Test
+    fun `reacquisitionHops starts at zero on lock`() {
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "chair")
+        assertEquals(0, engine.reacquisitionHops)
+    }
+
+    @Test
+    fun `reacquisitionHops increments on each reacquire`() {
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "chair")
+
+        // Lose and reacquire 3 times
+        repeat(3) { hop ->
+            engine.processFrame(emptyList()) // lose
+            val candidate = obj(id = 100 + hop, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "chair")
+            engine.processFrame(listOf(candidate))
+            assertEquals(hop + 1, engine.reacquisitionHops)
+        }
+    }
+
+    @Test
+    fun `gives up after MAX_REACQUISITION_HOPS`() {
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "chair")
+
+        // Exhaust all hops
+        repeat(ReacquisitionEngine.MAX_REACQUISITION_HOPS) { hop ->
+            engine.processFrame(emptyList())
+            val candidate = obj(id = 100 + hop, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "chair")
+            engine.processFrame(listOf(candidate))
+        }
+
+        // Lose again — should give up, not search
+        engine.processFrame(emptyList())
+        val candidate = obj(id = 200, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "chair")
+        val result = engine.processFrame(listOf(candidate))
+        assertNull("Should give up after max hops", result)
+        assertTrue("Should be in timeout state", engine.hasTimedOut)
+    }
+
+    @Test
+    fun `reacquisitionHops resets on clear`() {
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "chair")
+        engine.processFrame(emptyList())
+        engine.processFrame(listOf(
+            obj(id = 100, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "chair")
+        ))
+        assertEquals(1, engine.reacquisitionHops)
+
+        engine.clear()
+        assertEquals(0, engine.reacquisitionHops)
+    }
+
+    @Test
+    fun `reacquisitionHops resets on new lock`() {
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "chair")
+        engine.processFrame(emptyList())
+        engine.processFrame(listOf(
+            obj(id = 100, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "chair")
+        ))
+        assertEquals(1, engine.reacquisitionHops)
+
+        engine.lock(50, RectF(0.3f, 0.3f, 0.5f, 0.5f), "person")
+        assertEquals(0, engine.reacquisitionHops)
+    }
+
+    @Test
+    fun `high similarity reacquire does not count as hop`() {
+        val emb = floatArrayOf(0.9f, 0.3f, 0.1f)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "bottle", emb)
+
+        // Lose and reacquire with high similarity (same object, VT just died)
+        engine.processFrame(emptyList())
+        val sameObject = obj(id = 100, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "bottle", embedding = floatArrayOf(0.85f, 0.35f, 0.1f)) // sim ~0.99
+        engine.processFrame(listOf(sameObject))
+
+        assertEquals("High-similarity reacquire should not count as hop", 0, engine.reacquisitionHops)
+    }
+
+    @Test
+    fun `low similarity reacquire counts as hop`() {
+        val emb = floatArrayOf(0.9f, 0.3f, 0.1f)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "bottle", emb)
+
+        // Lose and reacquire with low similarity (different object)
+        engine.processFrame(emptyList())
+        val differentObject = obj(id = 100, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "bottle", embedding = floatArrayOf(0.1f, 0.1f, 0.9f)) // sim ~0.24
+        engine.processFrame(listOf(differentObject))
+
+        assertEquals("Low-similarity reacquire should count as hop", 1, engine.reacquisitionHops)
+    }
+
+    // --- COCO label fallback matching ---
+
+    @Test
+    fun `candidate matching cocoLabel scores as label match`() {
+        val emb = floatArrayOf(0.5f, 0.5f, 0.5f, 0.5f)
+        // Enriched to "flowerpot", COCO parent is "potted plant"
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "flowerpot",
+            listOf(emb), null, null, cocoLabel = "potted plant")
+        engine.processFrame(emptyList())
+
+        // Candidate has COCO label "potted plant" — should match via cocoLabel
+        val cocoCandidate = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "potted plant", embedding = emb)
+        // Candidate has enriched label "flowerpot" — should match via lockedLabel
+        val enrichedCandidate = obj(id = 66, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "flowerpot", embedding = emb)
+        // Candidate has wrong label — should get penalty
+        val wrongCandidate = obj(id = 77, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "bowl", embedding = emb)
+
+        val cocoScore = engine.scoreCandidate(cocoCandidate, engine.lastKnownBox!!)!!
+        val enrichedScore = engine.scoreCandidate(enrichedCandidate, engine.lastKnownBox!!)!!
+        val wrongScore = engine.scoreCandidate(wrongCandidate, engine.lastKnownBox!!)!!
+
+        assertEquals("COCO and enriched label should score identically",
+            cocoScore, enrichedScore, 0.001f)
+        assertTrue("Matching labels ($cocoScore) should beat wrong label ($wrongScore)",
+            cocoScore > wrongScore)
+    }
+
+    @Test
+    fun `cocoLabel null falls back to enriched label only`() {
+        val emb = floatArrayOf(0.5f, 0.5f, 0.5f, 0.5f)
+        // No COCO label stored (e.g. old lock path)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "chair",
+            listOf(emb), null, null, cocoLabel = null)
+        engine.processFrame(emptyList())
+
+        val match = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "chair", embedding = emb)
+        val wrong = obj(id = 66, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "table", embedding = emb)
+
+        val matchScore = engine.scoreCandidate(match, engine.lastKnownBox!!)!!
+        val wrongScore = engine.scoreCandidate(wrong, engine.lastKnownBox!!)!!
+
+        assertTrue("Exact label match should still beat wrong label",
+            matchScore > wrongScore)
+    }
+
+    // --- Label penalty scoring ---
+
+    @Test
+    fun `wrong label gets negative score penalty`() {
+        val emb = floatArrayOf(0.5f, 0.5f, 0.5f, 0.5f)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "chair", emb)
+        engine.processFrame(emptyList())
+
+        val sameLabel = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "chair", embedding = emb)
+        val wrongLabel = obj(id = 66, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "person", embedding = emb)
+
+        val sameScore = engine.scoreCandidate(sameLabel, engine.lastKnownBox!!)!!
+        val wrongScore = engine.scoreCandidate(wrongLabel, engine.lastKnownBox!!)!!
+
+        assertTrue("Same-label ($sameScore) should score much higher than wrong-label ($wrongScore)",
+            sameScore - wrongScore > 0.15f)
+    }
+
+    @Test
+    fun `null locked label gives neutral score`() {
+        val emb = floatArrayOf(0.5f, 0.5f, 0.5f, 0.5f)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), null, emb)
+        engine.processFrame(emptyList())
+
+        val candidateA = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "chair", embedding = emb)
+        val candidateB = obj(id = 66, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "person", embedding = emb)
+
+        val scoreA = engine.scoreCandidate(candidateA, engine.lastKnownBox!!)!!
+        val scoreB = engine.scoreCandidate(candidateB, engine.lastKnownBox!!)!!
+
+        assertEquals("With null locked label, different labels should score the same",
+            scoreA, scoreB, 0.001f)
+    }
+
     // --- Helpers ---
 
     private fun obj(

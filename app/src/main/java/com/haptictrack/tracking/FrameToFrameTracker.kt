@@ -64,20 +64,7 @@ class FrameToFrameTracker(
     }
 
     companion object {
-        fun computeIou(a: RectF, b: RectF): Float {
-            val interLeft = maxOf(a.left, b.left)
-            val interTop = maxOf(a.top, b.top)
-            val interRight = minOf(a.right, b.right)
-            val interBottom = minOf(a.bottom, b.bottom)
-
-            if (interLeft >= interRight || interTop >= interBottom) return 0f
-
-            val interArea = (interRight - interLeft) * (interBottom - interTop)
-            val aArea = a.width() * a.height()
-            val bArea = b.width() * b.height()
-            val unionArea = aArea + bArea - interArea
-
-            return if (unionArea > 0f) interArea / unionArea else 0f
-        }
+        /** Delegates to the shared top-level [computeIou] in EmbeddingUtils. */
+        fun computeIou(a: RectF, b: RectF): Float = com.haptictrack.tracking.computeIou(a, b)
     }
 }

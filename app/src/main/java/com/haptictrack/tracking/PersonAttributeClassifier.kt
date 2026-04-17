@@ -9,11 +9,8 @@ import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.vision.facedetector.FaceDetector
 import org.tensorflow.lite.Interpreter
-import java.io.FileInputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.nio.MappedByteBuffer
-import java.nio.channels.FileChannel
 
 /**
  * Person attribute classifier combining two models:
@@ -49,10 +46,10 @@ class PersonAttributeClassifier(context: Context) {
     private val faceDetector: FaceDetector
 
     init {
-        val bodyModel = loadModelFile(context, BODY_MODEL_ASSET)
+        val bodyModel = loadTfliteModel(context, BODY_MODEL_ASSET)
         bodyInterpreter = Interpreter(bodyModel, Interpreter.Options().apply { setNumThreads(2) })
 
-        val ageGenderModel = loadModelFile(context, AGE_GENDER_MODEL_ASSET)
+        val ageGenderModel = loadTfliteModel(context, AGE_GENDER_MODEL_ASSET)
         ageGenderInterpreter = Interpreter(ageGenderModel, Interpreter.Options().apply { setNumThreads(2) })
 
         val faceOptions = FaceDetector.FaceDetectorOptions.builder()
@@ -293,12 +290,6 @@ class PersonAttributeClassifier(context: Context) {
         return dominant
     }
 
-    private fun loadModelFile(context: Context, assetName: String): MappedByteBuffer {
-        val fd = context.assets.openFd(assetName)
-        val input = FileInputStream(fd.fileDescriptor)
-        val channel = input.channel
-        return channel.map(FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength)
-    }
 }
 
 /**

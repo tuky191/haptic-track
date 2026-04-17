@@ -91,7 +91,8 @@ class ObjectTracker(
             } else computeColorHistogram(bmp, boundingBox)
             // Classify person attributes at lock time (use original COCO label for "person" check)
             val personAttrs = personClassifier.classify(bmp, boundingBox, label)
-            reacquisition.lock(trackingId, boundingBox, enrichedLabel, augResult.embeddings, colorHist, personAttrs)
+            reacquisition.lock(trackingId, boundingBox, enrichedLabel, augResult.embeddings, colorHist, personAttrs,
+                cocoLabel = label)
             visualTracker.init(bmp, boundingBox)
 
             debugCapture.startSession(enrichedLabel, trackingId)

@@ -2,14 +2,12 @@ package com.haptictrack.tracking
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Color
 import android.graphics.RectF
 import android.util.Log
 import org.tensorflow.lite.Interpreter
-import java.io.FileInputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.nio.MappedByteBuffer
-import java.nio.channels.FileChannel
 
 /**
  * YOLOv8n-oiv7 label enricher: 601 Open Images classes via TFLite.
@@ -29,7 +27,7 @@ class Yolov8Detector(context: Context) {
         private const val MODEL_ASSET = "yolov8n_oiv7.tflite"
         private const val LABELS_ASSET = "oiv7_labels.txt"
         private const val INPUT_SIZE = 640
-        private const val NUM_CHANNELS = 605  // 4 box + 601 classes
+        private const val OUTPUT_FEATURES = 605  // 4 box coords + 601 class scores
         private const val NUM_ANCHORS = 8400
         private const val NUM_CLASSES = 601
         private const val CONFIDENCE_THRESHOLD = 0.25f
@@ -57,14 +55,17 @@ class Yolov8Detector(context: Context) {
     private val interpreter: Interpreter
     private val labels: List<String>
 
-    // Pre-allocated output buffer
-    private val outputArray = Array(1) { Array(NUM_CHANNELS) { FloatArray(NUM_ANCHORS) } }
+    // Pre-allocated buffers
+    private val inputBuffer: ByteBuffer = ByteBuffer.allocateDirect(4 * INPUT_SIZE * INPUT_SIZE * 3).apply {
+        order(ByteOrder.nativeOrder())
+    }
+    private val outputArray = Array(1) { Array(OUTPUT_FEATURES) { FloatArray(NUM_ANCHORS) } }
 
     init {
-        val model = loadModelFile(context, MODEL_ASSET)
+        val model = loadTfliteModel(context, MODEL_ASSET)
         interpreter = Interpreter(model, Interpreter.Options().apply { setNumThreads(4) })
 
-        labels = context.assets.open(LABELS_ASSET).bufferedReader().readLines()
+        labels = context.assets.open(LABELS_ASSET).bufferedReader().use { it.readLines() }
         Log.i(TAG, "Loaded YOLOv8n-oiv7: ${labels.size} classes, input ${INPUT_SIZE}x${INPUT_SIZE}")
     }
 
@@ -75,27 +76,14 @@ class Yolov8Detector(context: Context) {
      * Returns the finer OIV7 label (lowercased), or the original label if no match.
      */
     fun enrichLabel(bitmap: Bitmap, box: RectF, coarseLabel: String?): String? {
-        val detections = detect(bitmap)
-        val candidates = detections
-            .filter { it.label !in BODY_PART_LABELS }
-            .filter { iou(it.box, box) > ENRICH_IOU_THRESHOLD }
-            .sortedByDescending { iou(it.box, box) }
-
-        // For "person" detections, only accept person-compatible OIV7 labels
-        // (prevents "person" being overridden by "chair" when sitting)
-        val isPerson = coarseLabel == "person"
-        val best = if (isPerson) {
-            candidates.firstOrNull { it.label in PERSON_ENRICHMENTS }
-        } else {
-            candidates.firstOrNull()
-        }
-
-        if (best != null) {
-            val enriched = best.label.lowercase()
-            Log.d(TAG, "Enriched '$coarseLabel' → '$enriched' (conf=${best.confidence}, iou=${"%.2f".format(iou(best.box, box))})")
+        val dummy = TrackedObject(id = -1, boundingBox = box, label = coarseLabel)
+        val result = enrichLabels(bitmap, listOf(dummy))
+        val enriched = result[-1]
+        if (enriched != null) {
+            Log.d(TAG, "Enriched '$coarseLabel' → '$enriched'")
             return enriched
         }
-        Log.d(TAG, "No enrichment for '$coarseLabel' (${detections.size} OIV7 detections, ${candidates.size} IoU-matched)")
+        Log.d(TAG, "No enrichment for '$coarseLabel'")
         return coarseLabel
     }
 
@@ -107,21 +95,25 @@ class Yolov8Detector(context: Context) {
         val detections = detect(bitmap)
         val enriched = mutableMapOf<Int, String>()
 
-        for (obj in objects) {
-            val candidates = detections
-                .filter { it.label !in BODY_PART_LABELS }
-                .filter { iou(it.box, obj.boundingBox) > ENRICH_IOU_THRESHOLD }
-                .sortedByDescending { iou(it.box, obj.boundingBox) }
+        // Pre-filter body parts once
+        val usable = detections.filter { it.label !in BODY_PART_LABELS }
 
-            val isPerson = obj.label == "person"
-            val best = if (isPerson) {
-                candidates.firstOrNull { it.label in PERSON_ENRICHMENTS }
-            } else {
-                candidates.firstOrNull()
-            }
+        for (obj in objects) {
+            // Compute IoU once per candidate, sort by it
+            val best = usable
+                .map { det -> det to computeIou(det.box, obj.boundingBox) }
+                .filter { (_, iou) -> iou > ENRICH_IOU_THRESHOLD }
+                .sortedByDescending { (_, iou) -> iou }
+                .let { ranked ->
+                    if (obj.label == "person") {
+                        ranked.firstOrNull { (det, _) -> det.label in PERSON_ENRICHMENTS }
+                    } else {
+                        ranked.firstOrNull()
+                    }
+                }
 
             if (best != null) {
-                enriched[obj.id] = best.label.lowercase()
+                enriched[obj.id] = best.first.label.lowercase()
             }
         }
 
@@ -143,7 +135,7 @@ class Yolov8Detector(context: Context) {
 
     private fun detect(bitmap: Bitmap): List<Detection> {
         val resized = Bitmap.createScaledBitmap(bitmap, INPUT_SIZE, INPUT_SIZE, true)
-        val inputBuffer = bitmapToByteBuffer(resized)
+        fillInputBuffer(resized)
         if (resized !== bitmap) resized.recycle()
 
         interpreter.run(inputBuffer, outputArray)
@@ -197,7 +189,7 @@ class Yolov8Detector(context: Context) {
             for (j in i + 1 until sorted.size) {
                 if (suppressed[j]) continue
                 if (sorted[i].label == sorted[j].label &&
-                    iou(sorted[i].box, sorted[j].box) > NMS_IOU_THRESHOLD) {
+                    computeIou(sorted[i].box, sorted[j].box) > NMS_IOU_THRESHOLD) {
                     suppressed[j] = true
                 }
             }
@@ -205,40 +197,15 @@ class Yolov8Detector(context: Context) {
         return kept
     }
 
-    private fun iou(a: RectF, b: RectF): Float {
-        val interLeft = maxOf(a.left, b.left)
-        val interTop = maxOf(a.top, b.top)
-        val interRight = minOf(a.right, b.right)
-        val interBottom = minOf(a.bottom, b.bottom)
-
-        val interArea = maxOf(0f, interRight - interLeft) * maxOf(0f, interBottom - interTop)
-        val aArea = a.width() * a.height()
-        val bArea = b.width() * b.height()
-        val union = aArea + bArea - interArea
-
-        return if (union > 0f) interArea / union else 0f
-    }
-
-    private fun bitmapToByteBuffer(bitmap: Bitmap): ByteBuffer {
-        val buffer = ByteBuffer.allocateDirect(4 * INPUT_SIZE * INPUT_SIZE * 3)
-        buffer.order(ByteOrder.nativeOrder())
-
+    private fun fillInputBuffer(bitmap: Bitmap) {
+        inputBuffer.rewind()
         val pixels = IntArray(INPUT_SIZE * INPUT_SIZE)
         bitmap.getPixels(pixels, 0, INPUT_SIZE, 0, 0, INPUT_SIZE, INPUT_SIZE)
-
         for (pixel in pixels) {
-            buffer.putFloat(android.graphics.Color.red(pixel) / 255f)
-            buffer.putFloat(android.graphics.Color.green(pixel) / 255f)
-            buffer.putFloat(android.graphics.Color.blue(pixel) / 255f)
+            inputBuffer.putFloat(Color.red(pixel) / 255f)
+            inputBuffer.putFloat(Color.green(pixel) / 255f)
+            inputBuffer.putFloat(Color.blue(pixel) / 255f)
         }
-        buffer.rewind()
-        return buffer
-    }
-
-    private fun loadModelFile(context: Context, assetName: String): MappedByteBuffer {
-        val fd = context.assets.openFd(assetName)
-        val input = FileInputStream(fd.fileDescriptor)
-        val channel = input.channel
-        return channel.map(FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength)
+        inputBuffer.rewind()
     }
 }
