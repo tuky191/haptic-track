@@ -118,6 +118,18 @@ class ObjectTracker(
         }
     }
 
+    /**
+     * Prepare for a camera rebind. Stops visual tracker and forces
+     * re-acquisition engine into search mode so it recovers on the
+     * first frame after the camera restarts.
+     */
+    fun prepareForRebind() {
+        if (!reacquisition.isLocked) return
+        visualTracker.stop()
+        vtUnconfirmedFrames = 0
+        reacquisition.prepareForRebind()
+    }
+
     fun clearLock() {
         scenarioRecorder.recordEvent("CLEAR")
         scenarioRecorder.stop()
@@ -136,12 +148,18 @@ class ObjectTracker(
     }
 
     /**
-     * Process a pre-rotated bitmap from PreviewView.getBitmap().
-     * Unlike the ImageProxy path, the bitmap is already in screen orientation
-     * and does NOT need rotation correction.
+     * Process a display-oriented bitmap from PreviewView.getBitmap().
+     * Unlike the ImageProxy path, the bitmap is already in screen orientation —
+     * no rotation is applied, and detector coordinates are used as-is (deviceRot=0).
      */
     fun processBitmap(bitmap: Bitmap) {
-        processBitmapInternal(bitmap, needsRotation = false, imageProxy = null)
+        val savedProvider = deviceRotationProvider
+        deviceRotationProvider = { 0 } // getBitmap is already display-oriented
+        try {
+            processBitmapInternal(bitmap, needsRotation = false, imageProxy = null)
+        } finally {
+            deviceRotationProvider = savedProvider
+        }
     }
 
     private fun processImage(imageProxy: ImageProxy) {

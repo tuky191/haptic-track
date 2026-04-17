@@ -1,8 +1,6 @@
 package com.haptictrack.ui
 
 import android.app.Application
-import android.graphics.Bitmap
-import android.graphics.Matrix
 import android.graphics.RectF
 import android.util.Log
 import androidx.camera.video.VideoRecordEvent
@@ -52,6 +50,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         private const val TAP_PADDING = 0.03f
         /** Target interval between getBitmap() analysis frames (ms). */
         private const val BITMAP_ANALYSIS_INTERVAL_MS = 50L // ~20fps
+        /** Downscale getBitmap to this width for analysis (matches ImageAnalysis res). */
+        private const val ANALYSIS_TARGET_WIDTH = 640
     }
 
     /** Smooths idle detections by keeping objects alive for a few frames after they disappear. */
@@ -234,6 +234,20 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun toggleStealthMode() {
+        val entering = !_uiState.value.stealthMode
+        _uiState.update { it.copy(stealthMode = entering) }
+        // Prepare tracker for camera rebind so it recovers quickly
+        objectTracker.prepareForRebind()
+        if (entering) {
+            cameraManager.enterRecordingMode()
+            startBitmapAnalysis()
+        } else {
+            stopBitmapAnalysis()
+            cameraManager.exitRecordingMode()
+        }
+    }
+
     fun switchCamera() {
         clearTracking()
         cameraManager.switchCamera()
@@ -244,29 +258,34 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         zoomController.reset()
         hapticManager.updateTrackingStatus(TrackingStatus.IDLE)
         _uiState.update {
-            TrackingUiState(status = TrackingStatus.IDLE, isRecording = it.isRecording, captureMode = it.captureMode)
+            TrackingUiState(status = TrackingStatus.IDLE, isRecording = it.isRecording, captureMode = it.captureMode, stealthMode = it.stealthMode)
         }
     }
 
     @android.annotation.SuppressLint("MissingPermission")
     fun toggleRecording() {
+        val inStealth = _uiState.value.stealthMode
+
         if (recordingManager.isRecording) {
             recordingManager.stopRecording()
-            stopBitmapAnalysis()
+            if (!inStealth) stopBitmapAnalysis()
             // Don't exit recording mode here — wait for Finalize callback
-            // so the recording file is properly closed before rebinding
         } else {
-            // Switch to 2-stream mode for higher video resolution
-            cameraManager.enterRecordingMode()
-            startBitmapAnalysis()
+            if (!inStealth) {
+                objectTracker.prepareForRebind()
+                cameraManager.enterRecordingMode()
+                startBitmapAnalysis()
+            }
             recordingManager.startRecording(cameraManager.videoCapture) { event ->
                 when (event) {
                     is VideoRecordEvent.Start ->
                         _uiState.update { it.copy(isRecording = true) }
                     is VideoRecordEvent.Finalize -> {
                         _uiState.update { it.copy(isRecording = false) }
-                        // Now safe to rebind with 3 streams
-                        cameraManager.exitRecordingMode()
+                        if (!inStealth) {
+                            objectTracker.prepareForRebind()
+                            cameraManager.exitRecordingMode()
+                        }
                     }
                 }
             }
@@ -286,17 +305,20 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 val preview = previewViewRef
                 val bitmap = preview?.bitmap
                 if (bitmap != null) {
-                    // Process off main thread
-                    launch(Dispatchers.Default) {
-                        val deviceRot = orientationListener.deviceRotation
-                        val rotated = if (deviceRot != 0) {
-                            val matrix = Matrix().apply { postRotate(deviceRot.toFloat()) }
-                            val r = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
-                            if (r !== bitmap) bitmap.recycle()
-                            r
+                    kotlinx.coroutines.withContext(Dispatchers.Default) {
+                        // Downscale to ~640px wide to match ImageAnalysis resolution.
+                        // Full screen resolution (1440x3200) is 15x more pixels and
+                        // takes ~500ms per frame vs ~30ms at 640px.
+                        val scale = ANALYSIS_TARGET_WIDTH.toFloat() / bitmap.width
+                        val scaled = if (scale < 0.9f) {
+                            val w = (bitmap.width * scale).toInt()
+                            val h = (bitmap.height * scale).toInt()
+                            android.graphics.Bitmap.createScaledBitmap(bitmap, w, h, true).also {
+                                bitmap.recycle()
+                            }
                         } else bitmap
 
-                        objectTracker.processBitmap(rotated)
+                        objectTracker.processBitmap(scaled)
                     }
                 }
                 delay(BITMAP_ANALYSIS_INTERVAL_MS)

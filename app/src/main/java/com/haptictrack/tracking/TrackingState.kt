@@ -156,5 +156,7 @@ data class TrackingUiState(
     val lockedContour: List<PointF> = emptyList(),
     val captureMode: CaptureMode = CaptureMode.VIDEO,
     /** True when zoom indicator should be visible (during/after pinch). */
-    val showZoomIndicator: Boolean = false
+    val showZoomIndicator: Boolean = false,
+    /** Stealth mode: preview hidden, screen stays black. */
+    val stealthMode: Boolean = false
 )

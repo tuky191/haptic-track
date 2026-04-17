@@ -237,7 +237,7 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
         var isScaling by remember { mutableStateOf(false) }
 
         Box(modifier = Modifier.fillMaxSize()) {
-            // Camera preview
+            // Camera preview (always full size — getBitmap needs rendered pixels)
             AndroidView(
                 factory = { previewView },
                 modifier = Modifier
@@ -274,6 +274,11 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                         }
                     }
             )
+
+            // Stealth mode: black overlay hides preview but keeps it rendering for getBitmap
+            if (uiState.stealthMode) {
+                Box(modifier = Modifier.fillMaxSize().background(Color.Black))
+            }
 
             // Bounding box / contour overlay
             TrackingOverlay(
@@ -348,7 +353,7 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
             }
 
             // Switch camera button
-            if (uiState.status == TrackingStatus.IDLE) {
+            if (uiState.status == TrackingStatus.IDLE && !uiState.stealthMode) {
                 Button(
                     onClick = { viewModel.switchCamera() },
                     modifier = Modifier
@@ -358,6 +363,23 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                 ) {
                     Text("\u21BB", color = Color.White, fontSize = 18.sp)
                 }
+            }
+
+            // Stealth mode toggle
+            Button(
+                onClick = { viewModel.toggleStealthMode() },
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(top = if (uiState.stealthMode || uiState.status != TrackingStatus.IDLE) 64.dp else 112.dp, start = 16.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (uiState.stealthMode) HapticRed.copy(alpha = 0.7f) else Color.Black.copy(alpha = 0.5f)
+                )
+            ) {
+                Text(
+                    if (uiState.stealthMode) "EXIT" else "STEALTH",
+                    color = Color.White,
+                    fontSize = 12.sp
+                )
             }
         }
     } else {
