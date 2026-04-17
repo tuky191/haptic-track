@@ -112,11 +112,15 @@ data class TrackedObject(
     val confidence: Float = 0f,
     val embedding: FloatArray? = null,
     val colorHistogram: FloatArray? = null,
-    val personAttributes: PersonAttributes? = null
+    val personAttributes: PersonAttributes? = null,
+    /** OSNet person re-ID embedding (512-dim). Only computed for person candidates. */
+    val reIdEmbedding: FloatArray? = null,
+    /** MobileFaceNet face embedding (192-dim). Only computed when face is visible. */
+    val faceEmbedding: FloatArray? = null
 ) {
-    // INVARIANT: embedding, colorHistogram, and personAttributes are excluded from
-    // equals/hashCode. These are transient ML output, not part of the object's
-    // identity for UI diffing and collection operations.
+    // INVARIANT: embedding, colorHistogram, personAttributes, reIdEmbedding, and
+    // faceEmbedding are excluded from equals/hashCode. These are transient ML output,
+    // not part of the object's identity for UI diffing and collection operations.
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is TrackedObject) return false

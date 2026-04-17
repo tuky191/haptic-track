@@ -43,7 +43,8 @@ class PersonAttributeClassifier(context: Context) {
 
     private val bodyInterpreter: Interpreter
     private val ageGenderInterpreter: Interpreter
-    private val faceDetector: FaceDetector
+    /** Exposed for sharing with [FaceEmbedder] to avoid duplicate model loading. */
+    val faceDetector: FaceDetector
 
     init {
         val bodyModel = loadTfliteModel(context, BODY_MODEL_ASSET)
@@ -149,7 +150,7 @@ class PersonAttributeClassifier(context: Context) {
         if (personCrop.width < 30 || personCrop.height < 30) return null
         try {
             val mpImage = BitmapImageBuilder(personCrop).build()
-            val faces = faceDetector.detect(mpImage)
+            val faces = synchronized(faceDetector) { faceDetector.detect(mpImage) }
 
             if (faces.detections().isEmpty()) return null
 

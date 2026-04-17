@@ -1078,6 +1078,97 @@ class ReacquisitionEngineTest {
 
     // --- Helpers ---
 
+    // --- Face and re-ID scoring tiers ---
+
+    @Test
+    fun `face tier scores matching face higher than mismatching`() {
+        val emb = floatArrayOf(0.5f, 0.5f)
+        val faceEmb = floatArrayOf(0.9f, 0.3f, 0.1f)
+        val reIdEmb = floatArrayOf(0.5f, 0.5f, 0.5f, 0.5f)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
+            listOf(emb), null, null, cocoLabel = "person",
+            reIdEmbedding = reIdEmb, faceEmbedding = faceEmb)
+        engine.processFrame(emptyList())
+
+        val matchFace = obj(id = 10, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "person", embedding = emb, reIdEmbedding = reIdEmb,
+            faceEmbedding = floatArrayOf(0.88f, 0.32f, 0.12f)) // high face sim
+        val wrongFace = obj(id = 11, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "person", embedding = emb, reIdEmbedding = reIdEmb,
+            faceEmbedding = floatArrayOf(0.1f, 0.1f, 0.9f)) // low face sim
+
+        val matchScore = engine.scoreCandidate(matchFace, engine.lastKnownBox!!)!!
+        val wrongScore = engine.scoreCandidate(wrongFace, engine.lastKnownBox!!)!!
+
+        assertTrue("Matching face ($matchScore) should beat mismatching ($wrongScore)",
+            matchScore > wrongScore)
+    }
+
+    @Test
+    fun `reId tier scores matching body higher than mismatching`() {
+        val emb = floatArrayOf(0.5f, 0.5f)
+        val reIdEmb = floatArrayOf(0.9f, 0.3f, 0.1f, 0.2f)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
+            listOf(emb), null, null, cocoLabel = "person",
+            reIdEmbedding = reIdEmb)
+        engine.processFrame(emptyList())
+
+        val matchBody = obj(id = 10, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "person", embedding = emb,
+            reIdEmbedding = floatArrayOf(0.88f, 0.32f, 0.12f, 0.22f)) // high re-ID sim
+        val wrongBody = obj(id = 11, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "person", embedding = emb,
+            reIdEmbedding = floatArrayOf(0.1f, 0.1f, 0.9f, 0.1f)) // low re-ID sim
+
+        val matchScore = engine.scoreCandidate(matchBody, engine.lastKnownBox!!)!!
+        val wrongScore = engine.scoreCandidate(wrongBody, engine.lastKnownBox!!)!!
+
+        assertTrue("Matching re-ID ($matchScore) should beat mismatching ($wrongScore)",
+            matchScore > wrongScore)
+    }
+
+    @Test
+    fun `face tier takes precedence over reId tier`() {
+        val emb = floatArrayOf(0.5f, 0.5f)
+        val reIdEmb = floatArrayOf(0.5f, 0.5f, 0.5f, 0.5f)
+        val faceEmb = floatArrayOf(0.9f, 0.3f, 0.1f)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
+            listOf(emb), null, null, cocoLabel = "person",
+            reIdEmbedding = reIdEmb, faceEmbedding = faceEmb)
+        engine.processFrame(emptyList())
+
+        // Good face, bad re-ID
+        val goodFace = obj(id = 10, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "person", embedding = emb,
+            reIdEmbedding = floatArrayOf(0.1f, 0.1f, 0.1f, 0.9f), // bad re-ID
+            faceEmbedding = floatArrayOf(0.88f, 0.32f, 0.12f)) // good face
+        // Bad face, good re-ID
+        val goodBody = obj(id = 11, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "person", embedding = emb,
+            reIdEmbedding = floatArrayOf(0.48f, 0.52f, 0.48f, 0.52f), // good re-ID
+            faceEmbedding = floatArrayOf(0.1f, 0.1f, 0.9f)) // bad face
+
+        val faceScore = engine.scoreCandidate(goodFace, engine.lastKnownBox!!)!!
+        val bodyScore = engine.scoreCandidate(goodBody, engine.lastKnownBox!!)!!
+
+        assertTrue("Good face ($faceScore) should beat good body ($bodyScore) — face takes precedence",
+            faceScore > bodyScore)
+    }
+
+    @Test
+    fun `no reId or face falls back to generic embedding tier`() {
+        val emb = floatArrayOf(0.9f, 0.3f)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person", emb)
+        engine.processFrame(emptyList())
+
+        val candidate = obj(id = 10, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "person", embedding = floatArrayOf(0.85f, 0.35f)) // good generic sim, no re-ID/face
+
+        val score = engine.scoreCandidate(candidate, engine.lastKnownBox!!)
+        assertNotNull("Should score via generic embedding fallback", score)
+        assertTrue("Score should be reasonable: $score", score!! > 0.4f)
+    }
+
     private fun obj(
         id: Int,
         left: Float = 0f,
@@ -1088,7 +1179,9 @@ class ReacquisitionEngineTest {
         confidence: Float = 0.8f,
         embedding: FloatArray? = null,
         colorHistogram: FloatArray? = null,
-        personAttributes: PersonAttributes? = null
+        personAttributes: PersonAttributes? = null,
+        reIdEmbedding: FloatArray? = null,
+        faceEmbedding: FloatArray? = null
     ) = TrackedObject(
         id = id,
         boundingBox = RectF(left, top, right, bottom),
@@ -1096,6 +1189,8 @@ class ReacquisitionEngineTest {
         confidence = confidence,
         embedding = embedding,
         colorHistogram = colorHistogram,
-        personAttributes = personAttributes
+        personAttributes = personAttributes,
+        reIdEmbedding = reIdEmbedding,
+        faceEmbedding = faceEmbedding
     )
 }

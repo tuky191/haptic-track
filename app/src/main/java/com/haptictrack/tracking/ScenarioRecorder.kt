@@ -166,6 +166,8 @@ class ScenarioRecorder {
             put("embedding", obj.embedding?.let { floatArrayToBase64(it) } ?: JSONObject.NULL)
             put("colorHistogram", obj.colorHistogram?.let { floatArrayToBase64(it) } ?: JSONObject.NULL)
             put("personAttributes", obj.personAttributes?.let { attrsToJson(it) } ?: JSONObject.NULL)
+            put("reIdEmbedding", obj.reIdEmbedding?.let { floatArrayToBase64(it) } ?: JSONObject.NULL)
+            put("faceEmbedding", obj.faceEmbedding?.let { floatArrayToBase64(it) } ?: JSONObject.NULL)
         }
     }
 
@@ -247,6 +249,8 @@ fun jsonToTrackedObject(obj: JSONObject): TrackedObject {
         boundingBox = jsonToBox(obj.getJSONArray("boundingBox")),
         embedding = if (!obj.isNull("embedding")) base64ToFloatArray(obj.getString("embedding")) else null,
         colorHistogram = if (!obj.isNull("colorHistogram")) base64ToFloatArray(obj.getString("colorHistogram")) else null,
-        personAttributes = if (!obj.isNull("personAttributes")) jsonToPersonAttributes(obj.getJSONObject("personAttributes")) else null
+        personAttributes = if (!obj.isNull("personAttributes")) jsonToPersonAttributes(obj.getJSONObject("personAttributes")) else null,
+        reIdEmbedding = if (obj.has("reIdEmbedding") && !obj.isNull("reIdEmbedding")) base64ToFloatArray(obj.getString("reIdEmbedding")) else null,
+        faceEmbedding = if (obj.has("faceEmbedding") && !obj.isNull("faceEmbedding")) base64ToFloatArray(obj.getString("faceEmbedding")) else null
     )
 }

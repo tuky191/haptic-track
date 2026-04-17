@@ -27,6 +27,8 @@ class ObjectTracker(
 
     private val detector: ObjectDetector
     private val labelEnricher: Yolov8Detector = Yolov8Detector(context)
+    private val faceEmbedder: FaceEmbedder = FaceEmbedder(context, personClassifier.faceDetector)
+    private val personReId: PersonReIdEmbedder = PersonReIdEmbedder(context)
     private val scenarioRecorder = ScenarioRecorder()
 
     // Keep last frame for computing embedding when user taps to lock
@@ -92,8 +94,12 @@ class ObjectTracker(
             } else computeColorHistogram(bmp, boundingBox)
             // Classify person attributes at lock time (use original COCO label for "person" check)
             val personAttrs = personClassifier.classify(bmp, boundingBox, label)
+            // Person re-ID + face embeddings (only for person labels)
+            val isPerson = label == "person"
+            val reIdEmb = if (isPerson) personReId.embed(bmp, boundingBox) else null
+            val faceEmb = if (isPerson) faceEmbedder.embedFace(bmp, boundingBox) else null
             reacquisition.lock(trackingId, boundingBox, enrichedLabel, augResult.embeddings, colorHist, personAttrs,
-                cocoLabel = label)
+                cocoLabel = label, reIdEmbedding = reIdEmb, faceEmbedding = faceEmb)
             visualTracker.init(bmp, boundingBox)
 
             debugCapture.startSession(enrichedLabel, trackingId)
@@ -175,6 +181,12 @@ class ObjectTracker(
                             if (emb != null) {
                                 reacquisition.addEmbedding(emb)
                                 android.util.Log.d("AppearEmbed", "Gallery +1 → ${reacquisition.embeddingGallery.size} (accumulated)")
+                            }
+                            // Progressive face embedding: try to capture face during tracking
+                            // Use rawBox (rotated-image coords) since bitmap is the rotated image
+                            if (reacquisition.lockedFaceEmbedding == null && reacquisition.lockedReIdEmbedding != null) {
+                                val faceEmb = faceEmbedder.embedFace(bitmap, rawBox)
+                                if (faceEmb != null) reacquisition.addFaceEmbedding(faceEmb)
                             }
                         }
                     } else {
@@ -268,7 +280,12 @@ class ObjectTracker(
                 withVisual.map { obj ->
                     if (obj.id in personCandidates) {
                         val attrs = personClassifier.classify(bitmap, obj.boundingBox, obj.label)
-                        obj.copy(personAttributes = attrs)
+                        // Compute re-ID + face embeddings for person candidates
+                        val reIdEmb = personReId.embed(bitmap, obj.boundingBox)
+                        val faceEmb = if (reacquisition.lockedFaceEmbedding != null) {
+                            faceEmbedder.embedFace(bitmap, obj.boundingBox)
+                        } else null
+                        obj.copy(personAttributes = attrs, reIdEmbedding = reIdEmb, faceEmbedding = faceEmb)
                     } else obj
                 }
             } else withLabels
@@ -448,6 +465,8 @@ class ObjectTracker(
         debugCapture.endSession()
         detector.close()
         labelEnricher.close()
+        faceEmbedder.close()
+        personReId.close()
         personClassifier.shutdown()
         appearanceEmbedder.shutdown()
         visualTracker.stop()

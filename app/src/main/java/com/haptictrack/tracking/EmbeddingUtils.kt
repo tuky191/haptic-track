@@ -155,6 +155,19 @@ fun computeIou(a: RectF, b: RectF): Float {
     return if (unionArea > 0f) interArea / unionArea else 0f
 }
 
+/** L2 norm of a float array. */
+fun l2Norm(arr: FloatArray): Float {
+    var sum = 0f
+    for (v in arr) sum += v * v
+    return kotlin.math.sqrt(sum)
+}
+
+/** L2-normalize a float array in place. */
+fun l2Normalize(arr: FloatArray) {
+    val n = l2Norm(arr)
+    if (n > 1e-6f) for (i in arr.indices) arr[i] /= n
+}
+
 /**
  * Histogram correlation — measures how similar two color distributions are.
  * Returns a value in [-1, 1] where 1 = identical distributions.
