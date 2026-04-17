@@ -53,6 +53,12 @@ class ReacquisitionEngine(
     /** Reference person attributes from lock time. */
     var lockedPersonAttributes: PersonAttributes? = null
         private set
+    /** OSNet person re-ID embedding from lock time. */
+    var lockedReIdEmbedding: FloatArray? = null
+        private set
+    /** MobileFaceNet face embedding — added progressively when face first appears. */
+    var lockedFaceEmbedding: FloatArray? = null
+        private set
     var lastKnownBox: RectF? = null
         private set
     var lastKnownLabel: String? = null
@@ -72,19 +78,30 @@ class ReacquisitionEngine(
 
     fun lock(trackingId: Int, boundingBox: RectF, label: String?, embeddings: List<FloatArray>,
              colorHist: FloatArray? = null, personAttrs: PersonAttributes? = null,
-             cocoLabel: String? = null) {
+             cocoLabel: String? = null, reIdEmbedding: FloatArray? = null,
+             faceEmbedding: FloatArray? = null) {
         lockedId = trackingId
         lockedLabel = label
         lockedCocoLabel = cocoLabel
         _embeddingGallery = embeddings.map { it.copyOf() }.toMutableList()
         lockedColorHistogram = colorHist?.copyOf()
         lockedPersonAttributes = personAttrs
+        lockedReIdEmbedding = reIdEmbedding?.copyOf()
+        lockedFaceEmbedding = faceEmbedding?.copyOf()
         lastKnownBox = RectF(boundingBox)
         lastKnownLabel = label
         lastKnownSize = boundingBox.width() * boundingBox.height()
         framesLost = 0
         val attrStr = personAttrs?.summary() ?: "n/a"
         dualLog(Log.INFO, "LOCK id=$trackingId label=\"$label\" box=${fmtBox(boundingBox)} size=${fmtF(lastKnownSize)} gallery=${embeddingGallery.size} colorHist=${colorHist != null} attrs=\"$attrStr\"")
+    }
+
+    /** Add a face embedding progressively (e.g. when face first appears during tracking). */
+    fun addFaceEmbedding(embedding: FloatArray) {
+        if (lockedFaceEmbedding == null) {
+            lockedFaceEmbedding = embedding.copyOf()
+            dualLog(Log.INFO, "FACE_EMBED added (${embedding.size}-dim)")
+        }
     }
 
     /** Add a new embedding to the gallery (e.g. from a confirmed visual tracker frame). */
@@ -108,6 +125,8 @@ class ReacquisitionEngine(
         _embeddingGallery.clear()
         lockedColorHistogram = null
         lockedPersonAttributes = null
+        lockedReIdEmbedding = null
+        lockedFaceEmbedding = null
         lastKnownBox = null
         lastKnownLabel = null
         lastKnownSize = 0f
@@ -155,7 +174,13 @@ class ReacquisitionEngine(
             val sim = if (hasEmbeddings && reacquired.embedding != null) {
                 bestGallerySimilarity(reacquired.embedding!!)
             } else 0f
-            dualLog(Log.INFO, "REACQUIRE id=${reacquired.id} label=\"${reacquired.label}\" after $framesLost frames (lockedLabel=\"$lockedLabel\") sim=${fmtF(sim)} box=${fmtBox(reacquired.boundingBox)}")
+            val reIdSim = if (lockedReIdEmbedding != null && reacquired.reIdEmbedding != null) {
+                " reId=${fmtF(cosineSimilarity(lockedReIdEmbedding!!, reacquired.reIdEmbedding!!))}"
+            } else ""
+            val faceSim = if (lockedFaceEmbedding != null && reacquired.faceEmbedding != null) {
+                " face=${fmtF(cosineSimilarity(lockedFaceEmbedding!!, reacquired.faceEmbedding!!))}"
+            } else ""
+            dualLog(Log.INFO, "REACQUIRE id=${reacquired.id} label=\"${reacquired.label}\" after $framesLost frames (lockedLabel=\"$lockedLabel\") sim=${fmtF(sim)}$reIdSim$faceSim box=${fmtBox(reacquired.boundingBox)}")
             lockedId = reacquired.id
             updateFromMatch(reacquired)
             return reacquired
@@ -215,7 +240,13 @@ class ReacquisitionEngine(
                     val attrStr = if (lockedPersonAttributes != null && candidate.personAttributes != null) {
                         " attrs=${fmtF(lockedPersonAttributes!!.similarity(candidate.personAttributes!!))}"
                     } else ""
-                    dualLog(Log.DEBUG, "  scored id=${candidate.id} label=\"${candidate.label}\" score=${fmtF(score)} sim=${sim?.let { fmtF(it) } ?: "n/a"} color=${colorSim?.let { fmtF(it) } ?: "n/a"}$attrStr (min=${fmtF(minScoreThreshold)})")
+                    val reIdStr = if (lockedReIdEmbedding != null && candidate.reIdEmbedding != null) {
+                        " reId=${fmtF(cosineSimilarity(lockedReIdEmbedding!!, candidate.reIdEmbedding!!))}"
+                    } else ""
+                    val faceStr = if (lockedFaceEmbedding != null && candidate.faceEmbedding != null) {
+                        " face=${fmtF(cosineSimilarity(lockedFaceEmbedding!!, candidate.faceEmbedding!!))}"
+                    } else ""
+                    dualLog(Log.DEBUG, "  scored id=${candidate.id} label=\"${candidate.label}\" score=${fmtF(score)} sim=${sim?.let { fmtF(it) } ?: "n/a"} color=${colorSim?.let { fmtF(it) } ?: "n/a"}$attrStr$reIdStr$faceStr (min=${fmtF(minScoreThreshold)})")
                 }
                 Pair(candidate, score)
             } else {
@@ -306,18 +337,65 @@ class ReacquisitionEngine(
             lockedPersonAttributes!!.similarity(candidate.personAttributes!!)
         } else 0f
 
+        // Face embedding: strongest identity signal for persons (when available)
+        val hasFace = lockedFaceEmbedding != null && candidate.faceEmbedding != null
+        val faceScore = if (hasFace) {
+            cosineSimilarity(lockedFaceEmbedding!!, candidate.faceEmbedding!!).coerceIn(0f, 1f)
+        } else 0f
+
+        // Re-ID embedding: strong person identity signal (when available)
+        val hasReId = lockedReIdEmbedding != null && candidate.reIdEmbedding != null
+        val reIdScore = if (hasReId) {
+            cosineSimilarity(lockedReIdEmbedding!!, candidate.reIdEmbedding!!).coerceIn(0f, 1f)
+        } else 0f
+
         // Small bonus for exact label match (vs passing via embedding override)
         val labelBonus = if (lockedLabel != null && labelMatches) 0.05f else 0f
 
-        if (hasAppearance) {
-            // Embedding-primary ranking: appearance is the dominant signal,
-            // position/size/color/attrs are tiebreakers
+        if (hasFace) {
+            // Face available: strongest identity signal, dominates ranking.
+            // Re-ID and generic embedding are secondary.
+            val baseFaceW = 0.45f
+            val baseReIdW = if (hasReId) 0.20f else 0f
+            val baseEmbW = if (hasAppearance) 0.10f else 0f
+            val basePosW = 0.05f * positionConfidence
+            val baseColorW = if (hasColor) 0.10f else 0f
+            val baseAttrW = if (hasAttrs) 0.05f else 0f
+            val unused = (1f - baseFaceW - baseReIdW - baseEmbW - basePosW - baseColorW - baseAttrW).coerceAtLeast(0f)
+            val effFaceW = baseFaceW + unused
+
+            return (faceScore * effFaceW) +
+                   (reIdScore * baseReIdW) +
+                   (appearanceScore * baseEmbW) +
+                   (positionScore * basePosW) +
+                   (colorScore * baseColorW) +
+                   (attrScore * baseAttrW) +
+                   labelBonus
+        } else if (hasReId) {
+            // Re-ID available but no face: re-ID is primary, generic embedding secondary
+            val baseReIdW = 0.40f
+            val baseEmbW = if (hasAppearance) 0.20f else 0f
+            val basePosW = 0.10f * positionConfidence
+            val baseSizeW = 0.05f
+            val baseColorW = if (hasColor) 0.15f else 0f
+            val baseAttrW = if (hasAttrs) 0.10f else 0f
+            val unused = (1f - baseReIdW - baseEmbW - basePosW - baseSizeW - baseColorW - baseAttrW).coerceAtLeast(0f)
+            val effReIdW = baseReIdW + unused
+
+            return (reIdScore * effReIdW) +
+                   (appearanceScore * baseEmbW) +
+                   (positionScore * basePosW) +
+                   (sizeScore * baseSizeW) +
+                   (colorScore * baseColorW) +
+                   (attrScore * baseAttrW) +
+                   labelBonus
+        } else if (hasAppearance) {
+            // Generic embedding only (non-person, or person without re-ID)
             val baseEmbW = 0.50f
             val basePosW = 0.15f * positionConfidence
             val baseSizeW = 0.10f
             val baseColorW = if (hasColor) 0.15f else 0f
             val baseAttrW = if (hasAttrs) 0.10f else 0f
-            // Redistribute unused weight (no color, no attrs, decayed position) to embedding
             val unused = (1f - baseEmbW - basePosW - baseSizeW - baseColorW - baseAttrW).coerceAtLeast(0f)
             val effEmbW = baseEmbW + unused
 
@@ -329,7 +407,6 @@ class ReacquisitionEngine(
                    labelBonus
         } else {
             // No embedding fallback: position + size only
-            // All survivors already passed label gate, so base score reflects that
             val basePosW = 0.50f * positionConfidence
             val baseSizeW = 0.25f
             val redistributed = 0.50f * (1f - positionConfidence)
