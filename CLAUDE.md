@@ -6,7 +6,7 @@ Hands-free camera tracking Android app. Uses on-device object detection + haptic
 
 All changes follow this flow — never commit directly to master:
 
-1. **Branch** — create a feature/fix branch from master (or staging if one exists)
+1. **Branch** — create a feature/fix branch from master
 2. **PR** — push and open a pull request
 3. **Device test** — build, install via ADB, test on physical device
 4. **Capture scenario** — every device test should produce a `scenario.json` for replay testing
@@ -263,18 +263,17 @@ Position (50%, decays) + size (25%) + base bonus (25%). All survivors already pa
 
 ## Current Work (may be stale — verify with git/GitHub)
 
-**Active branches:**
-- `staging/yolov8-oiv7` — staging branch with PR #29 (two-stage detection + review fixes). Not yet merged to master.
-- `feature/cascade-replay-testing` — branched from staging for #30 (this work). Has Phase 1 complete (scenario recorder + replay harness).
+**Recently merged to master:**
+- PR #29 — Two-stage detection (EfficientDet-Lite2 + YOLOv8n-oiv7 label enrichment), COCO label fallback, smart hop counter, DRY cleanup
+- PR #31 — Cascade scoring refactor (#30 phases 1+2), scenario recorder + replay harness
 
 **Open issues:**
-- **#30** — Reproducible re-acquisition testing + scoring simplification. Phase 1 (recorder + replay) done. Phase 2 (cascade refactor) not started. Phase 3 (validate with captured scenarios) blocked on Phase 2.
+- **#30** — Phase 3 remaining: capture more real-world scenarios (chair, potted plant, bottle) for broader replay test coverage. Phases 1 (recorder) and 2 (cascade) are done and merged.
 - **#14** — Manual camera controls
 - **#20** — Upside-down tracking
 - **#21** — Image stabilization
 - **#27** — Clothing color accuracy
-
-**Merge order:** PR #29 needs to merge to master first (via staging), then #30 work builds on top. #30 will heavily rewrite `scoreCandidate()` which PR #29 also modified.
+- **Hop counter tuning** — no issue yet. The hop limit (3) is too aggressive for objects that look different from new angles (cup session hit GIVE_UP despite always reacquiring the correct cup). Consider raising threshold or using a different metric.
 
 ## Key Design Decisions
 
