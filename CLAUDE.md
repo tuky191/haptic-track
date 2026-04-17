@@ -213,51 +213,52 @@ FloatArrays are encoded as base64 little-endian IEEE 754 (compact: ~1KB for 256-
 - `assertTimesOut(result)` — assert the scenario results in timeout
 - `buildSyntheticScenario(...)` — build scenarios programmatically without a device
 
-## Re-acquisition Scoring (how it works and why it's problematic)
+## Re-acquisition Scoring (cascade gates)
 
-`ReacquisitionEngine.scoreCandidate()` computes a weighted average of 6 signals. This is the core logic that #30 aims to replace with a cascade.
+`ReacquisitionEngine.scoreCandidate()` uses DeepSORT-style cascade gates instead of a weighted average. Wrong-category candidates are rejected outright — no amount of color or position similarity can rescue them.
 
-### The 6 signals
+### Gate A: Geometric hard filters
 
-| Signal | Base weight | What it measures | Range |
-|---|---|---|---|
-| Position | 15% (decays to 0) | Distance from last known box center | 0-1 (1=same spot) |
-| Size | 10% | Size ratio vs last known box | 0-1 (1=same size) |
-| Label | 10-20% | Does candidate label match locked label? | -0.5 (mismatch), 0.5 (null), 1.0 (match) |
-| Appearance | 25-30% | Best cosine similarity vs embedding gallery | 0-1 |
-| Color | 15-25% | Histogram correlation vs locked color | 0-1 |
-| Person attrs | 0-15% | Attribute similarity (only for persons) | 0-1 |
-
-### Weight redistribution
-
-Weights are dynamic — they depend on what signals are available:
-
-1. **Position decays**: as `framesLost` increases (0→30 frames), position weight drops from 15% to 0%. The freed weight is redistributed to other signals proportionally.
-2. **No color histogram**: if locked object had no histogram, color weight is 0 and redistributed to appearance.
-3. **No person attributes**: if not a person, attr weight is 0 and redistributed.
-4. **No embeddings at all**: falls back to position (40%) + size (20%) + label (40%) only.
-
-### Hard filters (before scoring)
-
-Candidates are rejected outright if they fail geometric checks — unless appearance override kicks in:
+Candidates are rejected if they fail position/size checks (unless embedding override):
 
 - **Position**: center distance > `effectivePositionThreshold` → reject (threshold expands from 0.25 to 1.5 over 30 frames)
 - **Size**: size ratio > `effectiveSizeRatioThreshold` → reject (threshold expands over time)
-- **Override**: if embedding similarity > 0.7, both position and size hard filters are bypassed
+- **Override**: if embedding similarity > 0.7, both position and size filters are bypassed
 
-### Why this is problematic
+### Gate B: Label gate
 
-The weighted average lets strong signals in one dimension compensate for bad signals in another:
-- A **person** with high color similarity to a locked **chair** can score above threshold because color (0.93) + position (0.8) overrides the label mismatch (-0.5)
-- Two **chairs** of different colors are hard to distinguish because label (1.0) + position (0.9) overrides color mismatch (0.1)
-- Tuning one weight to fix one scenario breaks another — classic whack-a-mole
+Wrong-label candidates are hard-rejected:
 
-Production trackers (DeepSORT, ByteTrack) use cascading gates instead: pass/fail on appearance → pass/fail on label → rank by similarity. A person never passes the appearance gate for a chair.
+| Condition | Result |
+|---|---|
+| `lockedLabel == null` | Pass (no label constraint) |
+| Label matches `lockedLabel` or `lockedCocoLabel` | Pass |
+| Embedding similarity > 0.7 | Pass (label flicker override) |
+| Otherwise | **Reject** |
+
+This is the key behavioral difference from the old weighted average: a person with high color similarity to a locked chair is always rejected (unless embedding says it's actually the same object).
+
+### Ranking (among gate survivors)
+
+Survivors are ranked with embedding as the primary signal:
+
+**With embeddings:**
+| Signal | Weight | Notes |
+|---|---|---|
+| Embedding similarity | 50% (+ unused weight) | Primary identity signal |
+| Position distance | 15% (decays to 0) | Tiebreaker, meaningless after camera moves |
+| Size similarity | 10% | Tiebreaker |
+| Color histogram | 15% (when available) | Same-category discrimination |
+| Person attributes | 10% (when available) | Same-person discrimination |
+| Label bonus | +0.05 | Exact match preferred over embedding-override pass |
+
+**Without embeddings (fallback):**
+Position (50%, decays) + size (25%) + base bonus (25%). All survivors already passed the label gate.
 
 ### Where the code lives
 
-- `ReacquisitionEngine.scoreCandidate()` — the 110-line weighted average (~line 250)
-- `ReacquisitionEngine.findBestCandidate()` — hard filter + scoring loop (~line 200)
+- `ReacquisitionEngine.scoreCandidate()` — cascade gates + ranking (~line 259)
+- `ReacquisitionEngine.findBestCandidate()` — scoring loop, picks highest-ranking survivor (~line 206)
 - `ReacquisitionEngine.processFrame()` — top-level: direct match → lost → search → reacquire (~line 124)
 
 ## Current Work (may be stale — verify with git/GitHub)
@@ -289,8 +290,8 @@ VitTracker (OpenCV) follows the locked object by pixel correlation — no classi
 ### Smart hop counter (decided 2026-04-17)
 `reacquisitionHops` only increments when a re-acquired object has low embedding similarity (< 0.7) — indicating a genuinely different object. Same-object re-locks after VT death (sim > 0.7) don't burn hops. Max 3 hops before giving up.
 
-### Label penalty: -0.5 for mismatch (decided 2026-04-17)
-Wrong-label candidates get a -0.5 score (was 0 neutral). This prevents cross-category leakage where a high color/position score on a wrong-label object (e.g. person with similar color to locked chair) overrides identity. Null locked label gives 0.5 (neutral).
+### Cascade scoring: label as gate, not weight (decided 2026-04-17)
+Replaced the 6-signal weighted average with DeepSORT-style cascade gates. Wrong-label candidates are hard-rejected at the label gate (no amount of color/position can rescue them). Only a strong embedding (>0.7) overrides the label gate, handling genuine label flicker. Survivors are ranked with embedding as the primary signal (50%+), not a balanced weight across all signals. This eliminates the chair→person cross-category leakage that plagued the weighted average.
 
 ### Embedding gallery: augmented + accumulated (decided 2026-04-14)
 At lock time, `AppearanceEmbedder` generates 5 embeddings (original + rotated 90/180/270 + horizontal flip) for immediate multi-angle coverage. During confirmed visual tracking, a new real-world embedding is captured every ~1s. Gallery holds up to 12 embeddings. Re-acquisition compares candidates against the best match in the gallery.
@@ -298,8 +299,8 @@ At lock time, `AppearanceEmbedder` generates 5 embeddings (original + rotated 90
 ### Appearance override of geometric filters (decided 2026-04-13)
 When embedding similarity > 0.7, position and size hard thresholds are bypassed. This handles phone rotation (tiny edge-of-frame lock → large centered detection after flip = 12x size ratio) and camera movement (object reappears at completely different screen position).
 
-### Label is a scoring factor, not a gate (decided 2026-04-14)
-EfficientDet labels flicker across frames (bowl↔potted plant↔toilet for the same object). A hard label filter caused more harm than good. Label is now a 20% weight in scoring with -0.5 penalty for mismatch. The embedding handles identity; the label is a bonus.
+### Label is a gate with embedding override (decided 2026-04-17, revised from 2026-04-14)
+Originally label was a soft scoring factor (20% weight) because EfficientDet labels flicker. This led to cross-category leakage. Now label is a hard gate — wrong label is rejected. EfficientDet label flicker is handled by the embedding override: if sim > 0.7, the label gate is bypassed (same object, flickered label).
 
 ### Confirmed-only position sync (decided 2026-04-13)
 `lastKnownBox` only updates from visual tracker when the detector confirms the tracked position. Prevents drifted tracker coordinates from poisoning the re-acquisition search area.
@@ -368,11 +369,11 @@ Auto-prunes to 10 sessions max.
 
 ## Test Suite
 
-162 unit tests, all run via Robolectric (no device needed):
+170 unit tests, all run via Robolectric (no device needed):
 
 | Class | Tests | What it covers |
 |---|---|---|
-| `ReacquisitionEngineTest` | 68 | Lock/clear, direct match, re-acquisition scoring, position decay, label as soft scoring factor (match/mismatch/null), label penalty (-0.5), COCO label fallback matching, size threshold decay, timeout, hop counter (increment, max, reset, smart same-object detection), frame counters, appearance embedding (store/clear, similarity scoring, same-label discrimination, fallback without embeddings, weight after decay), appearance override of geometric filters (size, position, weak embedding), two-truck discrimination, visual tracker handoff, label flicker (strong/weak embedding with mislabeled objects), color histogram scoring, person attribute scoring |
+| `ReacquisitionEngineTest` | 74 | Lock/clear, direct match, cascade gate tests (label gate reject/pass/override, wrong label even with perfect color, embedding ranking, no-embedding fallback, COCO label gate), position decay, size threshold decay, timeout, hop counter (increment, max, reset, smart same-object detection), frame counters, appearance embedding (store/clear, similarity scoring, same-label discrimination, fallback without embeddings, weight after decay), appearance override of geometric filters (size, position, weak embedding), two-truck discrimination, visual tracker handoff, label flicker (strong/weak embedding with mislabeled objects), color histogram scoring, person attribute scoring |
 | `ScenarioReplayTest` | 5 | Replay harness validation (empty frames, reacquisition detection, timeout detection), real captured scenarios (cup reacquisition, wrong-category rejection) |
 | `DetectionFilterTest` | 15 | Confidence cutoff, label requirement, box area limits, aspect ratio limits, negative IDs, edge cases |
 | `OrientationHysteresisTest` | 13 | Hysteresis dead zones, cardinal stability, rapid oscillation, deliberate transitions |
@@ -477,10 +478,11 @@ All in constructor defaults — no settings UI yet:
 - [x] Debug frame capture for on-device diagnostics
 - [x] Scenario recording + deterministic replay testing
 - [x] Off-device model quality testing (Python + MediaPipe)
-- [x] 162 unit tests
+- [x] Cascade scoring (DeepSORT-style label gate + embedding-primary ranking)
+- [x] 170 unit tests
 
 ### Not built yet (from concept doc)
-- [ ] **Cascade scoring refactor (#30)** — replace weighted average scoring with DeepSORT-style cascade gates. Current 6-signal weighted average lets strong color override wrong label. See issue #30.
+- [ ] **Scenario replay validation (#30 phase 3)** — capture more real-world scenarios and validate cascade behavior against them. Phase 1 (recorder) and Phase 2 (cascade) are done.
 - [ ] **Pre-roll buffer** — continuously capture last 30-60s so you never miss the moment before recording started
 - [ ] **Quick-start gesture** — double-tap volume button to begin tracking + recording instantly
 - [ ] **Settings UI** — all tunable parameters are constructor defaults with no runtime configuration
@@ -488,7 +490,7 @@ All in constructor defaults — no settings UI yet:
 - [ ] **Battery/thermal management** — continuous ML + camera + haptics drains battery fast
 
 ### Known issues
-- Weighted average scoring lets strong signals in one dimension override bad matches in others (chair→person with high color similarity). Issue #30 addresses this with cascade refactoring.
+- Wrong-label candidates with strong embedding (>0.7) still pass the label gate — this handles genuine label flicker but could theoretically allow cross-category matches if the embedder is confused. In practice, sim>0.7 across categories is rare.
 - Visual tracker (VitTracker) dies quickly on small/transparent objects (bottles, glasses) — confidence drops below 0.25 within 2-3s, forcing unnecessary re-acquisition cycles.
 - Multiple visually similar objects of the same label (several bottles in a bathroom) are hard to distinguish — embedding similarity alone isn't enough.
 - EfficientDet-Lite2 labels flicker across frames (bowl↔potted plant↔toilet). Mitigated by soft label scoring + embedding identity + YOLOv8 enrichment.

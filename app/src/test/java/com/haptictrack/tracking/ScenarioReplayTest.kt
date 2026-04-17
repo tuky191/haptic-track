@@ -145,6 +145,29 @@ class ScenarioReplayTest {
         assertNeverReacquiresLabel(result, "laptop")
     }
 
+    @Test
+    fun `mouse cascade - always reacquires mouse never wrong category`() {
+        val scenario = loadScenario("mouse_cascade_reacquisition.json")
+        val result = replay(scenario)
+
+        val reacqEvents = result.events.filter { it.type == "REACQUIRE" }
+        assertTrue("Should reacquire multiple times", reacqEvents.size >= 4)
+        reacqEvents.forEach { event ->
+            assertEquals("Every reacquisition should be mouse", "mouse", event.label)
+        }
+    }
+
+    @Test
+    fun `mouse cascade - never locks on keyboard tv or person`() {
+        val scenario = loadScenario("mouse_cascade_reacquisition.json")
+        val result = replay(scenario)
+
+        assertNeverReacquiresLabel(result, "keyboard")
+        assertNeverReacquiresLabel(result, "tv")
+        assertNeverReacquiresLabel(result, "person")
+        assertNeverReacquiresLabel(result, "scissors")
+    }
+
     // --- Helpers for building synthetic scenarios ---
 
     data class SyntheticDetection(

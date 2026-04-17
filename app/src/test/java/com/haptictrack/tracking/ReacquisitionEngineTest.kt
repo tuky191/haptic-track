@@ -136,22 +136,22 @@ class ReacquisitionEngineTest {
     // --- Hard label filter ---
 
     @Test
-    fun `different label scores lower than same label`() {
+    fun `wrong label without embedding is hard-rejected by label gate`() {
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup")
 
         val sameLabel = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "cup")
         val diffLabel = obj(id = 66, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "laptop")
 
-        val sameScore = engine.scoreCandidate(sameLabel, engine.lastKnownBox!!)!!
-        val diffScore = engine.scoreCandidate(diffLabel, engine.lastKnownBox!!)!!
+        val sameScore = engine.scoreCandidate(sameLabel, engine.lastKnownBox!!)
+        val diffScore = engine.scoreCandidate(diffLabel, engine.lastKnownBox!!)
 
-        assertTrue("Same label ($sameScore) should score higher than different ($diffScore)",
-            sameScore > diffScore)
+        assertNotNull("Same label should pass gate", sameScore)
+        assertNull("Wrong label without embedding should be rejected by label gate", diffScore)
     }
 
     @Test
-    fun `different label can still reacquire if only candidate`() {
-        // Label is soft — a nearby different-label object should not be hard-rejected
+    fun `wrong label is rejected even as only candidate`() {
+        // Label gate rejects wrong-label candidates — no amount of proximity rescues them
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup")
 
         val detections = listOf(
@@ -159,9 +159,8 @@ class ReacquisitionEngineTest {
         )
         // Lose the locked id first
         engine.processFrame(emptyList())
-        val score = engine.scoreCandidate(detections[0], engine.lastKnownBox!!)
-        // Score may be low, but the candidate was not hard-rejected (score != null)
-        assertNotNull("Different-label candidate should not be hard-rejected", score)
+        val result = engine.processFrame(detections)
+        assertNull("Wrong-label candidate should be rejected by label gate", result)
     }
 
     @Test
@@ -343,40 +342,35 @@ class ReacquisitionEngineTest {
     }
 
     @Test
-    fun `scoreCandidate boosts same-label match`() {
+    fun `label gate rejects wrong label and passes same label`() {
         val refBox = RectF(0.4f, 0.4f, 0.6f, 0.6f)
         engine.lock(42, refBox, "Food")
 
-        val withLabel = obj(id = 1, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "Food")
-        val noLabel = obj(id = 2, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "Home good")
+        val sameLabel = obj(id = 1, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "Food")
+        val wrongLabel = obj(id = 2, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "Home good")
 
-        val labelScore = engine.scoreCandidate(withLabel, refBox)!!
-        val noLabelScore = engine.scoreCandidate(noLabel, refBox)!!
+        val sameScore = engine.scoreCandidate(sameLabel, refBox)
+        val wrongScore = engine.scoreCandidate(wrongLabel, refBox)
 
-        assertTrue("Same label ($labelScore) should score higher ($noLabelScore)",
-            labelScore > noLabelScore)
+        assertNotNull("Same label should pass gate", sameScore)
+        assertNull("Wrong label should be rejected by gate", wrongScore)
     }
 
     @Test
-    fun `label weight increases after position decay`() {
+    fun `wrong label always rejected regardless of position decay`() {
         val refBox = RectF(0.4f, 0.4f, 0.6f, 0.6f)
         engine.lock(42, refBox, "Food")
 
-        val candidate = obj(id = 1, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "Food")
         val candidateWrong = obj(id = 2, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "Home good")
 
-        // Early: label bonus
-        val earlyGap = engine.scoreCandidate(candidate, refBox)!! -
-                       engine.scoreCandidate(candidateWrong, refBox)!!
+        // Early frames: wrong label rejected
+        val earlyScore = engine.scoreCandidate(candidateWrong, refBox)
+        assertNull("Wrong label should be rejected early", earlyScore)
 
-        // Lose frames so position decays
+        // After position decay: still rejected
         repeat(engine.positionDecayFrames) { engine.processFrame(emptyList()) }
-
-        val lateGap = engine.scoreCandidate(candidate, refBox)!! -
-                      engine.scoreCandidate(candidateWrong, refBox)!!
-
-        assertTrue("Label should matter more after decay: earlyGap=$earlyGap, lateGap=$lateGap",
-            lateGap > earlyGap)
+        val lateScore = engine.scoreCandidate(candidateWrong, refBox)
+        assertNull("Wrong label should be rejected after decay too", lateScore)
     }
 
     // --- Appearance embedding scoring ---
@@ -537,7 +531,7 @@ class ReacquisitionEngineTest {
     }
 
     @Test
-    fun `weak embedding with wrong label scores lower than strong with right label`() {
+    fun `weak embedding with wrong label is rejected by label gate`() {
         val lockedEmb = floatArrayOf(0.8f, 0.5f, 0.2f)
         engine.lock(42, RectF(0.3f, 0.3f, 0.7f, 0.7f), "bowl", lockedEmb)
 
@@ -546,13 +540,13 @@ class ReacquisitionEngineTest {
         val strongRight = obj(id = 55, left = 0.32f, top = 0.32f, right = 0.68f, bottom = 0.68f, label = "bowl")
             .copy(embedding = floatArrayOf(0.75f, 0.55f, 0.2f))  // high sim, right label
         val weakWrong = obj(id = 66, left = 0.32f, top = 0.32f, right = 0.68f, bottom = 0.68f, label = "chair")
-            .copy(embedding = floatArrayOf(0f, 0f, 1f))  // low sim, wrong label
+            .copy(embedding = floatArrayOf(0f, 0f, 1f))  // low sim (0.0), wrong label
 
-        val strongScore = engine.scoreCandidate(strongRight, engine.lastKnownBox!!)!!
-        val weakScore = engine.scoreCandidate(weakWrong, engine.lastKnownBox!!)!!
+        val strongScore = engine.scoreCandidate(strongRight, engine.lastKnownBox!!)
+        val weakScore = engine.scoreCandidate(weakWrong, engine.lastKnownBox!!)
 
-        assertTrue("Strong+right ($strongScore) should beat weak+wrong ($weakScore)",
-            strongScore > weakScore)
+        assertNotNull("Strong+right should pass gate", strongScore)
+        assertNull("Weak+wrong should be rejected by label gate (sim too low to override)", weakScore)
     }
 
     @Test
@@ -982,10 +976,10 @@ class ReacquisitionEngineTest {
         val emb = floatArrayOf(0.9f, 0.3f, 0.1f)
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "bottle", emb)
 
-        // Lose and reacquire with low similarity (different object)
+        // Lose and reacquire with moderate similarity (different object, below override threshold)
         engine.processFrame(emptyList())
         val differentObject = obj(id = 100, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
-            label = "bottle", embedding = floatArrayOf(0.1f, 0.1f, 0.9f)) // sim ~0.24
+            label = "bottle", embedding = floatArrayOf(0.5f, 0.5f, 0.5f)) // sim ~0.57 (below 0.7 override, above scoring threshold)
         engine.processFrame(listOf(differentObject))
 
         assertEquals("Low-similarity reacquire should count as hop", 1, engine.reacquisitionHops)
@@ -1044,21 +1038,22 @@ class ReacquisitionEngineTest {
     // --- Label penalty scoring ---
 
     @Test
-    fun `wrong label gets negative score penalty`() {
+    fun `same label gets ranking bonus over embedding-override candidate`() {
         val emb = floatArrayOf(0.5f, 0.5f, 0.5f, 0.5f)
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "chair", emb)
         engine.processFrame(emptyList())
 
         val sameLabel = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
             label = "chair", embedding = emb)
+        // Wrong label but same embedding (sim=1.0) — passes gate via override
         val wrongLabel = obj(id = 66, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
             label = "person", embedding = emb)
 
         val sameScore = engine.scoreCandidate(sameLabel, engine.lastKnownBox!!)!!
         val wrongScore = engine.scoreCandidate(wrongLabel, engine.lastKnownBox!!)!!
 
-        assertTrue("Same-label ($sameScore) should score much higher than wrong-label ($wrongScore)",
-            sameScore - wrongScore > 0.15f)
+        assertTrue("Same-label ($sameScore) should score higher than override-pass ($wrongScore) via label bonus",
+            sameScore > wrongScore)
     }
 
     @Test
@@ -1077,6 +1072,101 @@ class ReacquisitionEngineTest {
 
         assertEquals("With null locked label, different labels should score the same",
             scoreA, scoreB, 0.001f)
+    }
+
+    // --- Cascade gate tests ---
+
+    @Test
+    fun `label gate rejects wrong label with weak embedding`() {
+        val emb = floatArrayOf(0.9f, 0.3f, 0.1f)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", emb)
+        engine.processFrame(emptyList())
+
+        // Wrong label, weak embedding (sim ~0.3) — below override threshold
+        val candidate = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "chair", embedding = floatArrayOf(0.3f, 0.1f, 0.9f))
+
+        assertNull("Wrong label with weak embedding should be rejected",
+            engine.scoreCandidate(candidate, engine.lastKnownBox!!))
+    }
+
+    @Test
+    fun `label gate passes wrong label with strong embedding`() {
+        val emb = floatArrayOf(0.9f, 0.3f, 0.1f)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", emb)
+        engine.processFrame(emptyList())
+
+        // Wrong label but very similar embedding (sim ~0.98) — label flicker scenario
+        val candidate = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "potted plant", embedding = floatArrayOf(0.88f, 0.32f, 0.12f))
+
+        assertNotNull("Wrong label with strong embedding should pass gate (label flicker)",
+            engine.scoreCandidate(candidate, engine.lastKnownBox!!))
+    }
+
+    @Test
+    fun `cascade rejects wrong label even with perfect position and color`() {
+        // THE motivating scenario: chair locked, person at exact same position
+        // with identical color histogram — should still be rejected
+        val colorHist = FloatArray(COLOR_HISTOGRAM_SIZE).also { it[5] = 1f }
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "chair",
+            emptyList(), colorHist)
+        engine.processFrame(emptyList())
+
+        val person = obj(id = 55, left = 0.41f, top = 0.41f, right = 0.61f, bottom = 0.61f,
+            label = "person", colorHistogram = colorHist) // same position, same color
+
+        assertNull("Wrong label should be rejected even with perfect position and color",
+            engine.scoreCandidate(person, engine.lastKnownBox!!))
+    }
+
+    @Test
+    fun `same-label candidates ranked by embedding similarity`() {
+        val emb = floatArrayOf(0.9f, 0.3f, 0.1f)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", emb)
+        engine.processFrame(emptyList())
+
+        val bestMatch = obj(id = 10, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "cup", embedding = floatArrayOf(0.88f, 0.32f, 0.12f))  // sim ~0.98
+        val midMatch = obj(id = 11, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "cup", embedding = floatArrayOf(0.6f, 0.6f, 0.3f))  // sim ~0.75
+        val weakMatch = obj(id = 12, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "cup", embedding = floatArrayOf(0.3f, 0.3f, 0.8f))  // sim ~0.42
+
+        val bestScore = engine.scoreCandidate(bestMatch, engine.lastKnownBox!!)!!
+        val midScore = engine.scoreCandidate(midMatch, engine.lastKnownBox!!)!!
+        val weakScore = engine.scoreCandidate(weakMatch, engine.lastKnownBox!!)!!
+
+        assertTrue("Best ($bestScore) > mid ($midScore)", bestScore > midScore)
+        assertTrue("Mid ($midScore) > weak ($weakScore)", midScore > weakScore)
+    }
+
+    @Test
+    fun `no-embedding fallback works with label gate`() {
+        // No embedding at lock or candidate — falls back to position+size ranking
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup")
+        engine.processFrame(emptyList())
+
+        val candidate = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "cup")
+        val score = engine.scoreCandidate(candidate, engine.lastKnownBox!!)
+
+        assertNotNull("Same-label candidate without embedding should pass gate and score", score)
+        assertTrue("Score should be above threshold: $score", score!! >= engine.minScoreThreshold)
+    }
+
+    @Test
+    fun `label gate with COCO fallback passes matching candidates`() {
+        val emb = floatArrayOf(0.5f, 0.5f, 0.5f)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "flowerpot",
+            listOf(emb), null, null, cocoLabel = "potted plant")
+        engine.processFrame(emptyList())
+
+        // Candidate has COCO label — should pass gate via cocoLabel match
+        val candidate = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "potted plant", embedding = emb)
+
+        assertNotNull("COCO label 'potted plant' should match locked cocoLabel and pass gate",
+            engine.scoreCandidate(candidate, engine.lastKnownBox!!))
     }
 
     // --- Helpers ---
