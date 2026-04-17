@@ -10,6 +10,7 @@ import com.haptictrack.camera.CameraManager
 import com.haptictrack.camera.DeviceOrientationListener
 import com.haptictrack.camera.RecordingManager
 import com.haptictrack.haptics.HapticFeedbackManager
+import com.haptictrack.tracking.CaptureMode
 import com.haptictrack.tracking.ObjectTracker
 import com.haptictrack.tracking.TrackedObject
 import com.haptictrack.tracking.TrackingStatus
@@ -148,6 +149,74 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         private const val TAP_PADDING = 0.03f
     }
 
+    /**
+     * Handle pinch-to-zoom gesture. [scaleFactor] is the incremental scale from the gesture
+     * (e.g. 1.05 = 5% zoom in, 0.95 = 5% zoom out).
+     */
+    fun onPinchZoom(scaleFactor: Float) {
+        val currentZoom = zoomController.getCurrentZoom()
+        val newZoom = currentZoom * scaleFactor
+        val appliedZoom = zoomController.setManualZoom(
+            newZoom, cameraManager.getMinZoom(), cameraManager.getMaxZoom()
+        )
+        cameraManager.setZoomRatio(appliedZoom)
+        _uiState.update { it.copy(currentZoomRatio = appliedZoom, showZoomIndicator = true) }
+    }
+
+    /** Called when pinch gesture ends — starts the fade-out timer for the zoom indicator. */
+    fun onPinchEnd() {
+        // The indicator fade-out is handled by LaunchedEffect in CameraScreen
+    }
+
+    /** Hide the zoom indicator (called after fade-out delay). */
+    fun hideZoomIndicator() {
+        _uiState.update { it.copy(showZoomIndicator = false) }
+    }
+
+    /**
+     * Volume-down handler — three-stage cycle:
+     * 1. Idle → lock on center object
+     * 2. Tracking (not recording) → start recording
+     * 3. Recording → stop recording + clear tracking
+     */
+    fun onVolumeDown() {
+        val state = _uiState.value
+
+        if (state.isRecording) {
+            // Stage 3: stop recording and clear
+            toggleRecording()
+            clearTracking()
+            return
+        }
+
+        if (state.status != TrackingStatus.IDLE) {
+            // Stage 2: tracking but not recording — start recording
+            toggleRecording()
+            return
+        }
+
+        // Stage 1: idle — lock on center
+        val objects = state.detectedObjects.filter { it.id >= 0 }
+        if (objects.isEmpty()) return
+
+        val closest = objects.minByOrNull { obj ->
+            val cx = obj.boundingBox.centerX() - 0.5f
+            val cy = obj.boundingBox.centerY() - 0.5f
+            cx * cx + cy * cy
+        } ?: return
+
+        objectTracker.lockOnObject(closest.id, closest.boundingBox, closest.label)
+        _uiState.update { it.copy(status = TrackingStatus.LOCKED, trackedObject = closest) }
+    }
+
+    fun toggleCaptureMode() {
+        _uiState.update { current ->
+            current.copy(
+                captureMode = if (current.captureMode == CaptureMode.VIDEO) CaptureMode.PHOTO else CaptureMode.VIDEO
+            )
+        }
+    }
+
     fun switchCamera() {
         clearTracking()
         cameraManager.switchCamera()
@@ -158,7 +227,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         zoomController.reset()
         hapticManager.updateTrackingStatus(TrackingStatus.IDLE)
         _uiState.update {
-            TrackingUiState(status = TrackingStatus.IDLE, isRecording = it.isRecording)
+            TrackingUiState(status = TrackingStatus.IDLE, isRecording = it.isRecording, captureMode = it.captureMode)
         }
     }
 

@@ -10,6 +10,9 @@ import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
+import androidx.camera.video.FallbackStrategy
 import androidx.camera.video.Quality
 import androidx.camera.video.QualitySelector
 import androidx.camera.video.Recorder
@@ -18,6 +21,7 @@ import androidx.camera.view.PreviewView
 import androidx.lifecycle.LifecycleOwner
 import android.os.Handler
 import android.os.Looper
+import android.util.Size
 import java.util.concurrent.Executors
 
 class CameraManager(private val context: Context) {
@@ -48,10 +52,22 @@ class CameraManager(private val context: Context) {
 
     val imageAnalysis: ImageAnalysis = ImageAnalysis.Builder()
         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+        .setResolutionSelector(
+            ResolutionSelector.Builder()
+                .setResolutionStrategy(
+                    ResolutionStrategy(Size(640, 480), ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER)
+                )
+                .build()
+        )
         .build()
 
     private val recorder = Recorder.Builder()
-        .setQualitySelector(QualitySelector.from(Quality.HIGHEST))
+        .setQualitySelector(
+            QualitySelector.fromOrderedList(
+                listOf(Quality.UHD, Quality.FHD, Quality.HD),
+                FallbackStrategy.higherQualityOrLowerThan(Quality.FHD)
+            )
+        )
         .setExecutor(Executors.newSingleThreadExecutor())
         .build()
 
@@ -103,6 +119,10 @@ class CameraManager(private val context: Context) {
 
         cameraControl = camera.cameraControl
         cameraInfo = camera.cameraInfo
+
+        val previewRes = preview.resolutionInfo?.resolution
+        val analysisRes = imageAnalysis.resolutionInfo?.resolution
+        Log.i(TAG, "Bound use cases — preview: $previewRes, analysis: $analysisRes")
     }
 
     fun setZoomRatio(ratio: Float) {

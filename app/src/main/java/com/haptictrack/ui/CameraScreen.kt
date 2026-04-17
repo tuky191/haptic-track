@@ -2,6 +2,7 @@ package com.haptictrack.ui
 
 import android.graphics.RectF
 import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import androidx.camera.view.PreviewView
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -10,8 +11,11 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
@@ -44,13 +48,17 @@ import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.pointerInteropFilter
+import kotlin.math.abs
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import com.haptictrack.tracking.CaptureMode
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
@@ -201,6 +209,33 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
             previousLockedId = currentId
         }
 
+        // --- Zoom indicator fade-out ---
+        val zoomIndicatorOpacity = remember { Animatable(0f) }
+        LaunchedEffect(uiState.showZoomIndicator) {
+            if (uiState.showZoomIndicator) {
+                zoomIndicatorOpacity.snapTo(1f)
+            } else {
+                // Fade out over 500ms
+                zoomIndicatorOpacity.animateTo(0f, tween(500, easing = FastOutSlowInEasing))
+            }
+        }
+
+        // Pinch-to-zoom detector — lives outside recomposition
+        val scaleDetector = remember {
+            ScaleGestureDetector(context, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                override fun onScale(detector: ScaleGestureDetector): Boolean {
+                    viewModel.onPinchZoom(detector.scaleFactor)
+                    return true
+                }
+                override fun onScaleEnd(detector: ScaleGestureDetector) {
+                    // Start the fade-out after a short hold
+                    viewModel.hideZoomIndicator()
+                }
+            })
+        }
+        // Track whether a scale gesture is in progress to suppress tap-on-release
+        var isScaling by remember { mutableStateOf(false) }
+
         Box(modifier = Modifier.fillMaxSize()) {
             // Camera preview
             AndroidView(
@@ -208,18 +243,35 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                 modifier = Modifier
                     .fillMaxSize()
                     .pointerInteropFilter { event ->
-                        if (event.action == MotionEvent.ACTION_DOWN) {
-                            val transform = computeFillCenterTransform(
-                                previewView.width.toFloat(),
-                                previewView.height.toFloat(),
-                                uiState.sourceImageWidth,
-                                uiState.sourceImageHeight
-                            )
-                            val normalizedX = transform.toNormalizedX(event.x)
-                            val normalizedY = transform.toNormalizedY(event.y)
-                            viewModel.onTapToLock(normalizedX, normalizedY)
-                            true
-                        } else false
+                        scaleDetector.onTouchEvent(event)
+
+                        if (scaleDetector.isInProgress) {
+                            isScaling = true
+                            return@pointerInteropFilter true
+                        }
+
+                        when (event.action) {
+                            MotionEvent.ACTION_DOWN -> {
+                                isScaling = false
+                                true
+                            }
+                            MotionEvent.ACTION_UP -> {
+                                if (!isScaling && event.pointerCount <= 1) {
+                                    val transform = computeFillCenterTransform(
+                                        previewView.width.toFloat(),
+                                        previewView.height.toFloat(),
+                                        uiState.sourceImageWidth,
+                                        uiState.sourceImageHeight
+                                    )
+                                    val normalizedX = transform.toNormalizedX(event.x)
+                                    val normalizedY = transform.toNormalizedY(event.y)
+                                    viewModel.onTapToLock(normalizedX, normalizedY)
+                                }
+                                isScaling = false
+                                true
+                            }
+                            else -> true
+                        }
                     }
             )
 
@@ -243,9 +295,39 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                     .padding(top = 64.dp)
             )
 
+            // Zoom level indicator — always visible when tracking, fades after pinch otherwise
+            val showZoomAlways = uiState.status == TrackingStatus.LOCKED || uiState.status == TrackingStatus.LOST
+            val zoomAlpha = if (showZoomAlways) 1f else zoomIndicatorOpacity.value
+            if (zoomAlpha > 0.01f) {
+                Text(
+                    text = "×${"%.1f".format(uiState.currentZoomRatio)}",
+                    color = Color.White.copy(alpha = zoomAlpha),
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Medium,
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = 100.dp)
+                        .background(
+                            Color.Black.copy(alpha = 0.5f * zoomAlpha),
+                            RoundedCornerShape(16.dp)
+                        )
+                        .padding(horizontal = 12.dp, vertical = 4.dp)
+                )
+            }
+
+            // Capture mode selector (swipeable)
+            CaptureModePill(
+                captureMode = uiState.captureMode,
+                onToggle = { viewModel.toggleCaptureMode() },
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 132.dp)
+            )
+
             // Record button
             RecordButton(
                 isRecording = uiState.isRecording,
+                captureMode = uiState.captureMode,
                 onClick = { viewModel.toggleRecording() },
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
@@ -548,19 +630,82 @@ private fun StatusBadge(state: TrackingUiState, modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun RecordButton(isRecording: Boolean, onClick: () -> Unit, modifier: Modifier = Modifier) {
+private fun RecordButton(
+    isRecording: Boolean,
+    captureMode: CaptureMode = CaptureMode.VIDEO,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
     Button(
         onClick = onClick,
         modifier = modifier.size(72.dp),
         shape = CircleShape,
         colors = ButtonDefaults.buttonColors(
-            containerColor = if (isRecording) HapticRed else Color.White
+            containerColor = when {
+                isRecording -> HapticRed
+                captureMode == CaptureMode.PHOTO -> Color.White
+                else -> Color.White
+            }
         )
     ) {
         if (isRecording) {
             Canvas(modifier = Modifier.size(24.dp)) {
                 drawRect(color = Color.White)
             }
+        } else if (captureMode == CaptureMode.PHOTO) {
+            // Inner circle for photo mode (camera shutter style)
+            Canvas(modifier = Modifier.size(28.dp)) {
+                drawCircle(color = Color.White)
+                drawCircle(color = Color.Black.copy(alpha = 0.15f), radius = size.minDimension / 2f * 0.85f)
+            }
         }
     }
+}
+
+@Composable
+private fun CaptureModePill(
+    captureMode: CaptureMode,
+    onToggle: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    var totalDrag by remember { mutableStateOf(0f) }
+
+    Row(
+        modifier = modifier
+            .background(Color.Black.copy(alpha = 0.4f), RoundedCornerShape(16.dp))
+            .padding(horizontal = 4.dp, vertical = 2.dp)
+            .pointerInput(Unit) {
+                detectHorizontalDragGestures(
+                    onDragEnd = {
+                        if (abs(totalDrag) > 50f) {
+                            onToggle()
+                        }
+                        totalDrag = 0f
+                    },
+                    onHorizontalDrag = { _, dragAmount ->
+                        totalDrag += dragAmount
+                    }
+                )
+            },
+        horizontalArrangement = Arrangement.spacedBy(2.dp)
+    ) {
+        ModeLabel("VIDEO", selected = captureMode == CaptureMode.VIDEO)
+        ModeLabel("PHOTO", selected = captureMode == CaptureMode.PHOTO)
+    }
+}
+
+@Composable
+private fun ModeLabel(text: String, selected: Boolean) {
+    Text(
+        text = text,
+        color = if (selected) Color.White else Color.White.copy(alpha = 0.5f),
+        fontSize = 12.sp,
+        fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+        modifier = Modifier
+            .background(
+                if (selected) Color.White.copy(alpha = 0.15f) else Color.Transparent,
+                RoundedCornerShape(12.dp)
+            )
+            .padding(horizontal = 12.dp, vertical = 4.dp)
+    )
 }
