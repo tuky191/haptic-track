@@ -117,6 +117,19 @@ class ScenarioReplayTest {
     // --- Real captured scenarios ---
 
     @Test
+    fun `cup no hop limit - reacquires many times without giving up`() {
+        val scenario = loadScenario("cup_no_hop_limit.json")
+        val result = replay(scenario)
+
+        val reacqEvents = result.events.filter { it.type == "REACQUIRE" }
+        assertTrue("Should reacquire at least 6 times (previously hit hop limit at 3)", reacqEvents.size >= 6)
+        reacqEvents.forEach { event ->
+            assertEquals("Every reacquisition should be cup", "cup", event.label)
+        }
+        assertFalse("Should not timeout", result.events.any { it.type == "TIMEOUT" })
+    }
+
+    @Test
     fun `cup reacquisition - replays recorded events`() {
         val scenario = loadScenario("cup_reacquisition.json")
         val result = replay(scenario)

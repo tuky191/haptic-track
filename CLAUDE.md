@@ -273,7 +273,6 @@ Position (50%, decays) + size (25%) + base bonus (25%). All survivors already pa
 - **#20** — Upside-down tracking
 - **#21** — Image stabilization
 - **#27** — Clothing color accuracy
-- **Hop counter tuning** — no issue yet. The hop limit (3) is too aggressive for objects that look different from new angles (cup session hit GIVE_UP despite always reacquiring the correct cup). Consider raising threshold or using a different metric.
 
 ## Key Design Decisions
 
@@ -286,8 +285,6 @@ VitTracker (OpenCV) follows the locked object by pixel correlation — no classi
 ### COCO label stored alongside enriched label (decided 2026-04-17)
 `lockedCocoLabel` is stored at lock time alongside the enriched label. Label matching accepts either: a candidate labeled "potted plant" (COCO) matches a lock of "flowerpot" (OIV7) because the COCO parent is "potted plant". Without this, enrichment-timing mismatches cause the correct object to get the -0.5 label penalty.
 
-### Smart hop counter (decided 2026-04-17)
-`reacquisitionHops` only increments when a re-acquired object has low embedding similarity (< 0.7) — indicating a genuinely different object. Same-object re-locks after VT death (sim > 0.7) don't burn hops. Max 3 hops before giving up.
 
 ### Cascade scoring: label as gate, not weight (decided 2026-04-17)
 Replaced the 6-signal weighted average with DeepSORT-style cascade gates. Wrong-label candidates are hard-rejected at the label gate (no amount of color/position can rescue them). Only a strong embedding (>0.7) overrides the label gate, handling genuine label flicker. Survivors are ranked with embedding as the primary signal (50%+), not a balanced weight across all signals. This eliminates the chair→person cross-category leakage that plagued the weighted average.
@@ -451,7 +448,6 @@ All in constructor defaults — no settings UI yet:
 | `minScoreThreshold` | ReacquisitionEngine | 0.45 | Minimum score to accept a candidate |
 | `APPEARANCE_OVERRIDE_THRESHOLD` | ReacquisitionEngine | 0.7 | Embedding similarity to bypass geometric filters + smart hop threshold |
 | `MAX_GALLERY_SIZE` | ReacquisitionEngine | 12 | Maximum embeddings in the reference gallery |
-| `MAX_REACQUISITION_HOPS` | ReacquisitionEngine | 3 | Max different-object re-acquisitions before giving up |
 | `ENRICH_IOU_THRESHOLD` | Yolov8Detector | 0.3 | Min IoU to match YOLOv8 detection to EfficientDet box |
 | `minConfidence` | DetectionFilter | 0.5 | Minimum ML confidence to show detection |
 | `minIou` | FrameToFrameTracker | 0.2 | Minimum IoU to match across frames |
