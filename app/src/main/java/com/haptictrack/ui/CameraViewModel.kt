@@ -180,11 +180,6 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         _uiState.update { it.copy(currentZoomRatio = appliedZoom, showZoomIndicator = true) }
     }
 
-    /** Called when pinch gesture ends — starts the fade-out timer for the zoom indicator. */
-    fun onPinchEnd() {
-        // The indicator fade-out is handled by LaunchedEffect in CameraScreen
-    }
-
     /** Hide the zoom indicator (called after fade-out delay). */
     fun hideZoomIndicator() {
         _uiState.update { it.copy(showZoomIndicator = false) }
@@ -236,8 +231,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     fun toggleStealthMode() {
         val entering = !_uiState.value.stealthMode
+        if (!entering && _uiState.value.isRecording) {
+            // Stop recording before exiting stealth — rebind would kill VideoCapture
+            recordingManager.stopRecording()
+        }
         _uiState.update { it.copy(stealthMode = entering) }
-        // Prepare tracker for camera rebind so it recovers quickly
         objectTracker.prepareForRebind()
         if (entering) {
             cameraManager.enterRecordingMode()
@@ -264,14 +262,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     @android.annotation.SuppressLint("MissingPermission")
     fun toggleRecording() {
-        val inStealth = _uiState.value.stealthMode
-
         if (recordingManager.isRecording) {
             recordingManager.stopRecording()
-            if (!inStealth) stopBitmapAnalysis()
-            // Don't exit recording mode here — wait for Finalize callback
+            if (!_uiState.value.stealthMode) stopBitmapAnalysis()
         } else {
-            if (!inStealth) {
+            if (!_uiState.value.stealthMode) {
                 objectTracker.prepareForRebind()
                 cameraManager.enterRecordingMode()
                 startBitmapAnalysis()
@@ -282,7 +277,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                         _uiState.update { it.copy(isRecording = true) }
                     is VideoRecordEvent.Finalize -> {
                         _uiState.update { it.copy(isRecording = false) }
-                        if (!inStealth) {
+                        // Read stealth state at callback time, not at call time
+                        if (!_uiState.value.stealthMode) {
                             objectTracker.prepareForRebind()
                             cameraManager.exitRecordingMode()
                         }

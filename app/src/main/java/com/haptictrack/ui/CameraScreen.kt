@@ -663,11 +663,7 @@ private fun RecordButton(
         modifier = modifier.size(72.dp),
         shape = CircleShape,
         colors = ButtonDefaults.buttonColors(
-            containerColor = when {
-                isRecording -> HapticRed
-                captureMode == CaptureMode.PHOTO -> Color.White
-                else -> Color.White
-            }
+            containerColor = if (isRecording) HapticRed else Color.White
         )
     ) {
         if (isRecording) {
