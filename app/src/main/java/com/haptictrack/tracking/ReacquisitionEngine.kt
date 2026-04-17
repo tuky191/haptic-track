@@ -32,8 +32,6 @@ class ReacquisitionEngine(
         const val APPEARANCE_OVERRIDE_THRESHOLD = 0.7f
         /** Maximum embeddings to keep in gallery. */
         const val MAX_GALLERY_SIZE = 12
-        /** Max times we re-acquire different objects before giving up. */
-        const val MAX_REACQUISITION_HOPS = 3
     }
 
     var lockedId: Int? = null
@@ -63,9 +61,6 @@ class ReacquisitionEngine(
         private set
     var framesLost: Int = 0
         private set
-    /** Number of times we've re-acquired a different object since the original lock. */
-    var reacquisitionHops: Int = 0
-        private set
 
     val isLocked: Boolean get() = lockedId != null
     val isSearching: Boolean get() = lockedId != null && framesLost > 0 && framesLost <= maxFramesLost
@@ -88,7 +83,6 @@ class ReacquisitionEngine(
         lastKnownLabel = label
         lastKnownSize = boundingBox.width() * boundingBox.height()
         framesLost = 0
-        reacquisitionHops = 0
         val attrStr = personAttrs?.summary() ?: "n/a"
         dualLog(Log.INFO, "LOCK id=$trackingId label=\"$label\" box=${fmtBox(boundingBox)} size=${fmtF(lastKnownSize)} gallery=${embeddingGallery.size} colorHist=${colorHist != null} attrs=\"$attrStr\"")
     }
@@ -118,7 +112,6 @@ class ReacquisitionEngine(
         lastKnownLabel = null
         lastKnownSize = 0f
         framesLost = 0
-        reacquisitionHops = 0
     }
 
     fun processFrame(detections: List<TrackedObject>): TrackedObject? {
@@ -139,13 +132,9 @@ class ReacquisitionEngine(
         if (framesLost == 1) {
             dualLog(Log.WARN, "LOST id=$lockId (lockedLabel=\"$lockedLabel\") — starting search. ${detections.size} candidates in frame")
         }
-        if (framesLost > maxFramesLost || reacquisitionHops >= MAX_REACQUISITION_HOPS) {
+        if (framesLost > maxFramesLost) {
             if (framesLost == maxFramesLost + 1) {
                 dualLog(Log.WARN, "TIMEOUT after $maxFramesLost frames. Giving up on lockedLabel=\"$lockedLabel\"")
-            }
-            if (reacquisitionHops >= MAX_REACQUISITION_HOPS && framesLost == 1) {
-                dualLog(Log.WARN, "GIVE_UP after $reacquisitionHops re-acquisition hops — original object is gone")
-                framesLost = maxFramesLost + 1  // force timeout state
             }
             return null
         }
@@ -163,14 +152,10 @@ class ReacquisitionEngine(
 
         val reacquired = findBestCandidate(detections)
         if (reacquired != null) {
-            // Only count as a hop if this looks like a different object.
-            // High embedding similarity = likely same object after VT death, not a real hop.
             val sim = if (hasEmbeddings && reacquired.embedding != null) {
                 bestGallerySimilarity(reacquired.embedding!!)
             } else 0f
-            val isSameObject = sim >= APPEARANCE_OVERRIDE_THRESHOLD
-            if (!isSameObject) reacquisitionHops++
-            dualLog(Log.INFO, "REACQUIRE id=${reacquired.id} label=\"${reacquired.label}\" after $framesLost frames (lockedLabel=\"$lockedLabel\") hop=$reacquisitionHops/${MAX_REACQUISITION_HOPS} sim=${fmtF(sim)}${if (isSameObject) " (same-object)" else ""} box=${fmtBox(reacquired.boundingBox)}")
+            dualLog(Log.INFO, "REACQUIRE id=${reacquired.id} label=\"${reacquired.label}\" after $framesLost frames (lockedLabel=\"$lockedLabel\") sim=${fmtF(sim)} box=${fmtBox(reacquired.boundingBox)}")
             lockedId = reacquired.id
             updateFromMatch(reacquired)
             return reacquired
