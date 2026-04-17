@@ -1001,7 +1001,7 @@ class ReacquisitionEngineTest {
         // Candidate has enriched label "flowerpot" — should match via lockedLabel
         val enrichedCandidate = obj(id = 66, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
             label = "flowerpot", embedding = emb)
-        // Candidate has wrong label — should get penalty
+        // Candidate has wrong label — passes gate via embedding override (sim=1.0), loses label bonus
         val wrongCandidate = obj(id = 77, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
             label = "bowl", embedding = emb)
 
@@ -1025,17 +1025,18 @@ class ReacquisitionEngineTest {
 
         val match = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
             label = "chair", embedding = emb)
+        // "table" passes gate via embedding override (sim=1.0), loses label bonus
         val wrong = obj(id = 66, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
             label = "table", embedding = emb)
 
         val matchScore = engine.scoreCandidate(match, engine.lastKnownBox!!)!!
         val wrongScore = engine.scoreCandidate(wrong, engine.lastKnownBox!!)!!
 
-        assertTrue("Exact label match should still beat wrong label",
+        assertTrue("Exact label match should beat embedding-override via label bonus",
             matchScore > wrongScore)
     }
 
-    // --- Label penalty scoring ---
+    // --- Label gate: ranking bonus ---
 
     @Test
     fun `same label gets ranking bonus over embedding-override candidate`() {

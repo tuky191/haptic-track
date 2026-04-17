@@ -67,8 +67,7 @@ class ScenarioReplayTest {
     /** Assert that the scenario times out (no successful reacquisition). */
     private fun assertTimesOut(result: ReplayResult, message: String? = null) {
         val timeout = result.events.any { it.type == "TIMEOUT" }
-        val reacquire = result.events.any { it.type == "REACQUIRE" }
-        assertTrue("${message ?: "Expected TIMEOUT"} but got events: ${result.events}", timeout || !reacquire)
+        assertTrue("${message ?: "Expected TIMEOUT"} but got events: ${result.events}", timeout)
     }
 
     // --- Synthetic scenario tests (validate the harness itself) ---

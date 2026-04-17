@@ -444,6 +444,7 @@ class ObjectTracker(
     }
 
     fun shutdown() {
+        scenarioRecorder.stop()
         debugCapture.endSession()
         detector.close()
         labelEnricher.close()

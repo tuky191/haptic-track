@@ -19,8 +19,13 @@ import java.nio.ByteOrder
  *
  * Output: scenario.json in the session's debug directory.
  *
- * Replay: [ScenarioReplayTest] reads the JSON, feeds frames through a fresh
- * ReacquisitionEngine, and asserts the same events fire at the same frames.
+ * Note: only frames processed via the detector path (ObjectTracker.processImage) are recorded.
+ * Visual tracker frames are not captured — replayed scenarios test ReacquisitionEngine only.
+ *
+ * Thread safety: all methods are synchronized. Called from UI thread (lock/clear)
+ * and camera thread (recordFrame/recordEvent).
+ *
+ * Serialization is deferred to [stop] to keep the camera thread fast.
  */
 class ScenarioRecorder {
 
@@ -30,17 +35,30 @@ class ScenarioRecorder {
 
     private var recording = false
     private var lockState: JSONObject? = null
-    private val frames = JSONArray()
-    private val events = JSONArray()
+    private var rawFrames = mutableListOf<FrameData>()
+    private var rawEvents = mutableListOf<EventData>()
     private var frameIndex = 0
     private var outputFile: File? = null
 
     val isRecording: Boolean get() = recording
 
+    /** Per-frame snapshot — stored raw, serialized lazily in [stop]. */
+    private data class FrameData(
+        val index: Int,
+        val detections: List<TrackedObject>
+    )
+
+    private data class EventData(
+        val frame: Int,
+        val type: String,
+        val details: JSONObject?
+    )
+
     /**
      * Start recording. Call after ReacquisitionEngine.lock().
      * [sessionDir] is the debug session directory where scenario.json will be written.
      */
+    @Synchronized
     fun start(
         sessionDir: File,
         trackingId: Int,
@@ -62,8 +80,8 @@ class ScenarioRecorder {
             put("colorHistogram", colorHistogram?.let { floatArrayToBase64(it) } ?: JSONObject.NULL)
             put("personAttributes", personAttributes?.let { attrsToJson(it) } ?: JSONObject.NULL)
         }
-        frames.let { while (it.length() > 0) it.remove(0) }
-        events.let { while (it.length() > 0) it.remove(0) }
+        rawFrames = mutableListOf()
+        rawEvents = mutableListOf()
         frameIndex = 0
         outputFile = File(sessionDir, "scenario.json")
         recording = true
@@ -72,50 +90,63 @@ class ScenarioRecorder {
 
     /**
      * Record one frame of detections. Call with the same list passed to processFrame().
+     * Stores references only — serialization is deferred to [stop].
      */
+    @Synchronized
     fun recordFrame(detections: List<TrackedObject>) {
         if (!recording) return
-        val frame = JSONObject().apply {
-            put("index", frameIndex)
-            put("detections", JSONArray().apply {
-                detections.forEach { put(trackedObjectToJson(it)) }
-            })
-        }
-        frames.put(frame)
+        rawFrames.add(FrameData(frameIndex, detections.toList()))
         frameIndex++
     }
 
     /**
      * Record an event that happened on the current frame.
      */
+    @Synchronized
     fun recordEvent(type: String, details: JSONObject? = null) {
         if (!recording) return
-        val event = JSONObject().apply {
-            put("frame", frameIndex - 1) // event happened on the last recorded frame
-            put("type", type)
-            if (details != null) put("details", details)
-        }
-        events.put(event)
+        rawEvents.add(EventData(frameIndex - 1, type, details))
     }
 
     /**
-     * Stop recording and flush to disk.
+     * Stop recording and flush to disk. Serialization happens here, off the camera thread.
      */
+    @Synchronized
     fun stop() {
         if (!recording) return
         recording = false
         flush()
-        Log.d(TAG, "Recording stopped: $frameIndex frames, ${events.length()} events → ${outputFile?.name}")
+        Log.d(TAG, "Recording stopped: $frameIndex frames, ${rawEvents.size} events → ${outputFile?.name}")
     }
 
     private fun flush() {
         val file = outputFile ?: return
         val lock = lockState ?: return
+
+        val framesJson = JSONArray()
+        for (frame in rawFrames) {
+            framesJson.put(JSONObject().apply {
+                put("index", frame.index)
+                put("detections", JSONArray().apply {
+                    frame.detections.forEach { put(trackedObjectToJson(it)) }
+                })
+            })
+        }
+
+        val eventsJson = JSONArray()
+        for (event in rawEvents) {
+            eventsJson.put(JSONObject().apply {
+                put("frame", event.frame)
+                put("type", event.type)
+                if (event.details != null) put("details", event.details)
+            })
+        }
+
         val scenario = JSONObject().apply {
             put("version", 1)
             put("lock", lock)
-            put("frames", frames)
-            put("events", events)
+            put("frames", framesJson)
+            put("events", eventsJson)
         }
         try {
             file.writeText(scenario.toString())
@@ -201,8 +232,8 @@ fun jsonToPersonAttributes(obj: JSONObject): PersonAttributes {
         hasLongPants = obj.getBoolean("hasLongPants"),
         hasLongHair = obj.getBoolean("hasLongHair"),
         hasCoatJacket = obj.getBoolean("hasCoatJacket"),
-        upperColor = obj.optString("upperColor", null).takeIf { it != "null" },
-        lowerColor = obj.optString("lowerColor", null).takeIf { it != "null" },
+        upperColor = if (!obj.isNull("upperColor")) obj.getString("upperColor") else null,
+        lowerColor = if (!obj.isNull("lowerColor")) obj.getString("lowerColor") else null,
         rawProbabilities = if (!obj.isNull("rawProbabilities")) base64ToFloatArray(obj.getString("rawProbabilities")) else null
     )
 }
