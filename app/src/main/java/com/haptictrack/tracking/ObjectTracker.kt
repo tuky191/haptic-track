@@ -27,6 +27,7 @@ class ObjectTracker(
 
     private val detector: ObjectDetector
     private val labelEnricher: Yolov8Detector = Yolov8Detector(context)
+    private val scenarioRecorder = ScenarioRecorder()
 
     // Keep last frame for computing embedding when user taps to lock
     private val lastFrameLock = Any()
@@ -99,6 +100,12 @@ class ObjectTracker(
             val attrStr = personAttrs?.summary() ?: "n/a"
             debugCapture.log("LOCK id=$trackingId label=$enrichedLabel (coco=$label) box=${boundingBox} gallery=${augResult.embeddings.size} colorHist=${colorHist != null} attrs=\"$attrStr\"")
 
+            // Start scenario recording for replay testing
+            debugCapture.sessionDir?.let { dir ->
+                scenarioRecorder.start(dir, trackingId, enrichedLabel, label,
+                    boundingBox, augResult.embeddings, colorHist, personAttrs)
+            }
+
             val locked = TrackedObject(trackingId, boundingBox, enrichedLabel)
             debugCapture.capture(DebugEvent.LOCK, bmp, listOf(locked), lockedObject = locked,
                 extraInfo = "id=$trackingId label=$label gallery=${augResult.embeddings.size}")
@@ -106,6 +113,8 @@ class ObjectTracker(
     }
 
     fun clearLock() {
+        scenarioRecorder.recordEvent("CLEAR")
+        scenarioRecorder.stop()
         debugCapture.log("CLEAR by user")
         debugCapture.endSession()
         reacquisition.clear()
@@ -268,8 +277,24 @@ class ObjectTracker(
             val wasSearching = reacquisition.isSearching
             val prevLost = reacquisition.framesLost
 
+            // Record frame for scenario replay (before processFrame consumes it)
+            scenarioRecorder.recordFrame(withEmbeddings)
+
             // Re-acquisition
             val lockedObject = reacquisition.processFrame(withEmbeddings)
+
+            // Record events for scenario replay
+            val nowLost = reacquisition.framesLost
+            when {
+                wasSearching && lockedObject != null && nowLost == 0 ->
+                    scenarioRecorder.recordEvent("REACQUIRE", org.json.JSONObject().apply {
+                        put("id", lockedObject.id); put("label", lockedObject.label ?: "null")
+                    })
+                nowLost == 1 && prevLost == 0 ->
+                    scenarioRecorder.recordEvent("LOST")
+                reacquisition.hasTimedOut && prevLost <= reacquisition.maxFramesLost ->
+                    scenarioRecorder.recordEvent("TIMEOUT").also { scenarioRecorder.stop() }
+            }
 
             // If re-acquired, re-initialize visual tracker
             if (wasSearching && lockedObject != null && reacquisition.framesLost == 0) {
@@ -419,6 +444,7 @@ class ObjectTracker(
     }
 
     fun shutdown() {
+        scenarioRecorder.stop()
         debugCapture.endSession()
         detector.close()
         labelEnricher.close()

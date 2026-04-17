@@ -210,10 +210,9 @@ class ReacquisitionEngine(
         val posConf = positionConfidence()
         val posThreshold = effectivePositionThreshold()
 
-        // No hard label filter — label is a scoring factor, not a gate.
-        // EfficientDet-Lite0 labels flicker (bowl↔potted plant↔toilet) so
-        // blocking by label causes more harm than good. The embedding handles
-        // identity; the label just adds a bonus to the score.
+        // Label is a gate inside scoreCandidate(), not a pre-filter here.
+        // Wrong-label candidates are rejected by the label gate unless a
+        // strong embedding (>0.7) overrides — handles label flicker.
         val validCandidates = candidates.filter { it.id >= 0 }
 
         val logThis = framesLost % 10 == 1 || validCandidates.isNotEmpty()
@@ -264,16 +263,14 @@ class ReacquisitionEngine(
     ): Float? {
         val candBox = candidate.boundingBox
 
-        // Compute appearance similarity early — a strong visual match can
-        // override geometric hard filters (position, size). This handles
-        // scenarios like phone rotation where the last-known box is meaningless.
+        // --- Appearance signal (computed early for override checks) ---
         val hasAppearance = hasEmbeddings && candidate.embedding != null
         val appearanceScore = if (hasAppearance) {
-            bestGallerySimilarity(candidate.embedding!!)
-                .coerceIn(0f, 1f)
+            bestGallerySimilarity(candidate.embedding!!).coerceIn(0f, 1f)
         } else 0f
         val strongVisualMatch = hasAppearance && appearanceScore > APPEARANCE_OVERRIDE_THRESHOLD
 
+        // --- GATE A: Position hard filter (with time decay) ---
         val dx = candBox.centerX() - refBox.centerX()
         val dy = candBox.centerY() - refBox.centerY()
         val distance = kotlin.math.sqrt(dx * dx + dy * dy)
@@ -283,6 +280,7 @@ class ReacquisitionEngine(
             dualLog(Log.DEBUG, "  OVERRIDE position: dist=${fmtF(distance)} > thresh=${fmtF(posThreshold)}, but sim=${fmtF(appearanceScore)}")
         }
 
+        // --- GATE A: Size hard filter (with time decay) ---
         val candSize = candBox.width() * candBox.height()
         val sizeRatio = if (lastKnownSize > 0f && candSize > 0f) {
             if (candSize > lastKnownSize) candSize / lastKnownSize else lastKnownSize / candSize
@@ -293,84 +291,70 @@ class ReacquisitionEngine(
             dualLog(Log.DEBUG, "  OVERRIDE size: ratio=${fmtF(sizeRatio)} > thresh=${fmtF(effectiveSizeThreshold)}, but sim=${fmtF(appearanceScore)}")
         }
 
-        val positionScore = if (posThreshold > 0f) (1f - (distance / posThreshold)).coerceIn(0f, 1f) else 1f
-        val sizeScore = (1f - ((sizeRatio - 1f) / (effectiveSizeThreshold - 1f).coerceAtLeast(0.01f))).coerceIn(0f, 1f)
-        // Label match: full bonus for match, penalty for mismatch (prevents
-        // wrong-category objects from scoring high on color/position alone).
-        // Matches against both the enriched label and the original COCO label,
-        // since candidates may carry either depending on enrichment timing.
+        // --- GATE B: Label gate ---
+        // Wrong-label candidates are rejected outright unless a strong embedding
+        // indicates it's the same object with a flickered label. This prevents
+        // cross-category leakage (e.g. person matching a locked chair via color).
         val labelMatches = lockedLabel != null && (
             candidate.label == lockedLabel || candidate.label == lockedCocoLabel
         )
-        val labelScore = when {
-            lockedLabel == null -> 0.5f  // unknown label, neutral
-            labelMatches -> 1f  // exact or COCO-parent match
-            else -> -0.5f  // wrong label penalty
+        when {
+            lockedLabel == null -> { /* pass: no label constraint */ }
+            labelMatches -> { /* pass: correct label */ }
+            strongVisualMatch -> {
+                dualLog(Log.DEBUG, "  OVERRIDE label: \"${candidate.label}\" != \"$lockedLabel\", but sim=${fmtF(appearanceScore)}")
+            }
+            else -> return null  // REJECT: wrong label, no embedding override
         }
 
-        // Color histogram similarity — cheap but very effective for same-category discrimination
+        // --- RANKING: score survivors for selection ---
+        val positionScore = if (posThreshold > 0f) (1f - (distance / posThreshold)).coerceIn(0f, 1f) else 1f
+        val sizeScore = (1f - ((sizeRatio - 1f) / (effectiveSizeThreshold - 1f).coerceAtLeast(0.01f))).coerceIn(0f, 1f)
+
         val hasColor = lockedColorHistogram != null && candidate.colorHistogram != null
         val colorScore = if (hasColor) {
-            histogramCorrelation(lockedColorHistogram!!, candidate.colorHistogram!!)
-                .coerceIn(0f, 1f)
+            histogramCorrelation(lockedColorHistogram!!, candidate.colorHistogram!!).coerceIn(0f, 1f)
         } else 0f
 
-        // Person attribute similarity — very discriminative for same-label "person" candidates
         val hasAttrs = lockedPersonAttributes != null && candidate.personAttributes != null
         val attrScore = if (hasAttrs) {
             lockedPersonAttributes!!.similarity(candidate.personAttributes!!)
         } else 0f
 
-        // Weight distribution depends on available signals.
+        // Small bonus for exact label match (vs passing via embedding override)
+        val labelBonus = if (lockedLabel != null && labelMatches) 0.05f else 0f
+
         if (hasAppearance) {
-            // With person attributes, redistribute some weight from appearance/color to attrs.
-            // Attributes are highly discriminative for persons (gender, clothing, accessories).
-            val basePositionWeight = 0.15f
-            val baseSizeWeight = 0.10f
-            val baseLabelWeight = if (hasAttrs) 0.10f else 0.20f  // 600 OIV7 classes are reliable
-            val baseAttrWeight = if (hasAttrs) 0.15f else 0f
-            val baseAppearanceWeight = if (hasAttrs) 0.25f else 0.30f
-            val baseColorWeight = if (hasColor) (if (hasAttrs) 0.15f else 0.25f) else 0f
-            // Redistribute unused weights to appearance
-            val unusedBase = 1f - basePositionWeight - baseSizeWeight - baseLabelWeight -
-                             baseAttrWeight - baseAppearanceWeight - baseColorWeight
-            val effectiveAppearanceBase = baseAppearanceWeight + unusedBase
+            // Embedding-primary ranking: appearance is the dominant signal,
+            // position/size/color/attrs are tiebreakers
+            val baseEmbW = 0.50f
+            val basePosW = 0.15f * positionConfidence
+            val baseSizeW = 0.10f
+            val baseColorW = if (hasColor) 0.15f else 0f
+            val baseAttrW = if (hasAttrs) 0.10f else 0f
+            // Redistribute unused weight (no color, no attrs, decayed position) to embedding
+            val unused = (1f - baseEmbW - basePosW - baseSizeW - baseColorW - baseAttrW).coerceAtLeast(0f)
+            val effEmbW = baseEmbW + unused
 
-            val effectivePositionWeight = basePositionWeight * positionConfidence
-            val redistributed = basePositionWeight * (1f - positionConfidence)
-            // Redistribute decayed position weight to active signals only.
-            // Shares must sum to 1.0 regardless of which signals are available.
-            val attrRedistShare = if (hasAttrs) 0.15f else 0f
-            val colorRedistShare = if (hasColor) 0.20f else 0f
-            val sizeRedistShare = 0.10f
-            val labelRedistShare = 0.15f
-            val appearRedistShare = 1f - sizeRedistShare - labelRedistShare - attrRedistShare - colorRedistShare
-            val effectiveSizeWeight = baseSizeWeight + redistributed * sizeRedistShare
-            val effectiveLabelWeight = baseLabelWeight + redistributed * labelRedistShare
-            val effectiveAttrWeight = if (hasAttrs) baseAttrWeight + redistributed * attrRedistShare else 0f
-            val effectiveAppearanceWeight = effectiveAppearanceBase + redistributed * appearRedistShare
-            val effectiveColorWeight = if (hasColor) baseColorWeight + redistributed * colorRedistShare else 0f
-
-            return (positionScore * effectivePositionWeight) +
-                   (sizeScore * effectiveSizeWeight) +
-                   (labelScore * effectiveLabelWeight) +
-                   (attrScore * effectiveAttrWeight) +
-                   (appearanceScore * effectiveAppearanceWeight) +
-                   (colorScore * effectiveColorWeight)
+            return (appearanceScore * effEmbW) +
+                   (positionScore * basePosW) +
+                   (sizeScore * baseSizeW) +
+                   (colorScore * baseColorW) +
+                   (attrScore * baseAttrW) +
+                   labelBonus
         } else {
-            // Fallback: no embedding available, use original weights
-            val basePositionWeight = 0.40f
-            val baseSizeWeight = 0.20f
-            val baseLabelWeight = 0.40f
+            // No embedding fallback: position + size only
+            // All survivors already passed label gate, so base score reflects that
+            val basePosW = 0.50f * positionConfidence
+            val baseSizeW = 0.25f
+            val redistributed = 0.50f * (1f - positionConfidence)
+            val effSizeW = baseSizeW + redistributed * 0.6f
+            val baseBonus = 0.25f + redistributed * 0.4f
 
-            val effectivePositionWeight = basePositionWeight * positionConfidence
-            val redistributed = basePositionWeight * (1f - positionConfidence)
-            val effectiveSizeWeight = baseSizeWeight + redistributed * 0.4f
-            val effectiveLabelWeight = baseLabelWeight + redistributed * 0.6f
-
-            return (positionScore * effectivePositionWeight) +
-                   (sizeScore * effectiveSizeWeight) +
-                   (labelScore * effectiveLabelWeight)
+            return (positionScore * basePosW) +
+                   (sizeScore * effSizeW) +
+                   baseBonus +
+                   labelBonus
         }
     }
 

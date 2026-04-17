@@ -43,7 +43,9 @@ class DebugFrameCapture(context: Context) {
     private val sessionTimeFormat = DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss")
 
     /** Current session folder and log writer — created on LOCK, closed on CLEAR/TIMEOUT. */
-    private var sessionDir: File? = null
+    /** Current session directory — exposed for ScenarioRecorder to write scenario.json. */
+    var sessionDir: File? = null
+        private set
     private var sessionLog: PrintWriter? = null
 
     // Paint objects (pre-allocated)
