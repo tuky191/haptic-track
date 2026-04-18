@@ -10,6 +10,7 @@ import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.framework.image.ByteBufferExtractor
 import com.google.mediapipe.tasks.components.containers.NormalizedKeypoint
 import com.google.mediapipe.tasks.core.BaseOptions
+import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.vision.interactivesegmenter.InteractiveSegmenter
 import org.opencv.core.CvType
 import org.opencv.core.Mat
@@ -36,17 +37,16 @@ class ObjectSegmenter(context: Context) {
         /** Higher threshold = tighter mask = more discriminative embeddings.
          *  Python tests show 0.85 gives best same-vs-different gap (+0.195). */
         private const val MASK_THRESHOLD = 0.8f
+        /** Max pixels for GPU segmenter input. Adreno 740 returns empty masks above ~100K pixels. */
+        private const val MAX_SEGMENT_PIXELS = 90_000  // ~300x300
     }
 
     private val segmenter: InteractiveSegmenter
 
     init {
-        // GPU delegate breaks InteractiveSegmenter: the calculator graph uses a fixed
-        // timestamp (999999µs) for IMAGE mode, and the GPU pipeline's internal stream
-        // expects strictly increasing timestamps. The second call fails with
-        // "Packet timestamp mismatch". CPU delegate doesn't have this issue.
         val baseOptions = BaseOptions.builder()
             .setModelAssetPath(MODEL_PATH)
+            .setDelegate(Delegate.GPU)
             .build()
 
         val options = InteractiveSegmenter.InteractiveSegmenterOptions.builder()
@@ -89,14 +89,24 @@ class ObjectSegmenter(context: Context) {
                 c.also { cropBitmap = it }
             } else cropBitmap!!
 
-            val mpImage = BitmapImageBuilder(inputCrop).build()
+            // Downscale large crops for GPU segmenter — Adreno 740 returns empty
+            // masks above ~100K pixels. Mask is applied to original-size pixels.
+            val pixels = cw * ch
+            val segInput = if (pixels > MAX_SEGMENT_PIXELS) {
+                val scale = kotlin.math.sqrt(MAX_SEGMENT_PIXELS.toFloat() / pixels)
+                Bitmap.createScaledBitmap(inputCrop, (cw * scale).toInt(), (ch * scale).toInt(), true)
+            } else null
 
-            // Keypoint at center of the crop (pixel coordinates — Android API)
+            val mpImage = BitmapImageBuilder(segInput ?: inputCrop).build()
+
+            // Keypoint at center of the segmenter input
+            val segBitmap = segInput ?: inputCrop
             val roi = InteractiveSegmenter.RegionOfInterest.create(
-                NormalizedKeypoint.create(inputCrop.width / 2f, inputCrop.height / 2f)
+                NormalizedKeypoint.create(segBitmap.width / 2f, segBitmap.height / 2f)
             )
 
             val result = segmenter.segment(mpImage, roi)
+            segInput?.recycle()
 
             val maskPixels = extractConfidenceMask(result)
                 ?: extractCategoryMask(result)
