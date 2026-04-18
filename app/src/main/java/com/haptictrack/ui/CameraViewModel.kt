@@ -63,7 +63,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
         // Load ML models on background thread — takes ~20s with GPU delegate init
         viewModelScope.launch(Dispatchers.Default) {
-            val tracker = ObjectTracker(getApplication())
+            _uiState.update { it.copy(loadingStatus = "Loading ML models...") }
+            val tracker = ObjectTracker(getApplication(), onLoadingStatus = { status ->
+                _uiState.update { it.copy(loadingStatus = status) }
+            })
             tracker.deviceRotationProvider = { orientationListener.deviceRotation }
 
             tracker.onDetectionResult = { allObjects, lockedObject, imgWidth, imgHeight, contour ->
@@ -326,8 +329,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
                         objectTracker.processBitmap(scaled)
                     }
+                } else {
+                    delay(BITMAP_ANALYSIS_INTERVAL_MS)
                 }
-                delay(BITMAP_ANALYSIS_INTERVAL_MS)
             }
             Log.i(TAG, "Bitmap analysis loop stopped")
         }

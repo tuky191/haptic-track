@@ -15,11 +15,10 @@ import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetectorResult
 
 class ObjectTracker(
     context: Context,
+    private val onLoadingStatus: ((String) -> Unit)? = null,
     val reacquisition: ReacquisitionEngine = ReacquisitionEngine(),
     val filter: DetectionFilter = DetectionFilter(),
     private val frameTracker: FrameToFrameTracker = FrameToFrameTracker(),
-    private val appearanceEmbedder: AppearanceEmbedder = AppearanceEmbedder(context),
-    private val personClassifier: PersonAttributeClassifier = PersonAttributeClassifier(context),
     val debugCapture: DebugFrameCapture = DebugFrameCapture(context),
     private val visualTracker: VisualTracker = VisualTracker(context),
     /** Provides physical device orientation; set from ViewModel. */
@@ -27,9 +26,11 @@ class ObjectTracker(
 ) {
 
     private val detector: ObjectDetector
-    private val labelEnricher: Yolov8Detector = Yolov8Detector(context)
-    private val faceEmbedder: FaceEmbedder = FaceEmbedder(context, personClassifier.faceDetector)
-    private val personReId: PersonReIdEmbedder = PersonReIdEmbedder(context)
+    private val labelEnricher: Yolov8Detector
+    private val appearanceEmbedder: AppearanceEmbedder
+    private val personClassifier: PersonAttributeClassifier
+    private val faceEmbedder: FaceEmbedder
+    private val personReId: PersonReIdEmbedder
     private val scenarioRecorder = ScenarioRecorder()
 
     // Keep last frame for computing embedding when user taps to lock
@@ -62,6 +63,13 @@ class ObjectTracker(
     private val CONTOUR_UPDATE_INTERVAL_DET = 3
 
     init {
+        onLoadingStatus?.invoke("Loading embedder (GPU)...")
+        appearanceEmbedder = AppearanceEmbedder(context)
+
+        onLoadingStatus?.invoke("Loading person classifier (GPU)...")
+        personClassifier = PersonAttributeClassifier(context)
+
+        onLoadingStatus?.invoke("Loading detector (GPU)...")
         val baseOptions = BaseOptions.builder()
             .setModelAssetPath("efficientdet-lite2-fp16.tflite")
             .setDelegate(Delegate.GPU)
@@ -75,8 +83,16 @@ class ObjectTracker(
 
         detector = ObjectDetector.createFromOptions(context, options)
 
+        onLoadingStatus?.invoke("Loading YOLOv8 (GPU)...")
+        labelEnricher = Yolov8Detector(context)
+
+        onLoadingStatus?.invoke("Loading face models (GPU)...")
+        faceEmbedder = FaceEmbedder(context, personClassifier.faceDetector)
+        personReId = PersonReIdEmbedder(context)
+
         // Wire ReacquisitionEngine logs to session logger
         reacquisition.sessionLogger = { msg -> debugCapture.log("[Reacq] $msg") }
+        onLoadingStatus?.invoke("Ready")
     }
 
     /**
@@ -310,7 +326,7 @@ class ObjectTracker(
             val withEmbeddings = if (needEmbeddings) {
                 // First pass: compute embeddings + histograms for all candidates
                 val withVisual = withLabels.map { obj ->
-                    val result = appearanceEmbedder.embedAndCrop(bitmap, obj.boundingBox)
+                    val result = appearanceEmbedder.embedAndCrop(bitmap, obj.boundingBox, fallback = true)
                     val hist = if (result.maskedCrop != null) {
                         val fullBox = RectF(0f, 0f, 1f, 1f)
                         computeColorHistogram(result.maskedCrop, fullBox).also { result.maskedCrop.recycle() }

@@ -160,5 +160,7 @@ data class TrackingUiState(
     /** Stealth mode: preview hidden, screen stays black. */
     val stealthMode: Boolean = false,
     /** True once all ML models are loaded and ready. */
-    val isReady: Boolean = false
+    val isReady: Boolean = false,
+    /** Loading status messages shown during model init. */
+    val loadingStatus: String = "Initializing..."
 )

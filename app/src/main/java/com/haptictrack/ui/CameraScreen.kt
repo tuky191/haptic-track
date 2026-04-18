@@ -293,7 +293,7 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         CircularProgressIndicator(color = Color.White)
                         Spacer(modifier = Modifier.height(16.dp))
-                        Text("Loading models...", color = Color.White, fontSize = 14.sp)
+                        Text(uiState.loadingStatus, color = Color.White, fontSize = 14.sp)
                     }
                 }
             }

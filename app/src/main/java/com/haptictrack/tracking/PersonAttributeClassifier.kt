@@ -54,11 +54,16 @@ class PersonAttributeClassifier(context: Context) {
         val ageGenderModel = loadTfliteModel(context, AGE_GENDER_MODEL_ASSET)
         ageGenderInterpreter = createGpuInterpreter(ageGenderModel, cpuThreads = 2)
 
-        val faceOptions = FaceDetector.FaceDetectorOptions.builder()
-            .setBaseOptions(BaseOptions.builder().setModelAssetPath(FACE_MODEL_ASSET).setDelegate(Delegate.GPU).build())
-            .setMinDetectionConfidence(FACE_MIN_CONFIDENCE)
-            .build()
-        faceDetector = FaceDetector.createFromOptions(context, faceOptions)
+        faceDetector = try {
+            FaceDetector.createFromOptions(context, FaceDetector.FaceDetectorOptions.builder()
+                .setBaseOptions(BaseOptions.builder().setModelAssetPath(FACE_MODEL_ASSET).setDelegate(Delegate.GPU).build())
+                .setMinDetectionConfidence(FACE_MIN_CONFIDENCE).build())
+        } catch (e: Exception) {
+            Log.w(TAG, "BlazeFace GPU failed, falling back to CPU: ${e.message}")
+            FaceDetector.createFromOptions(context, FaceDetector.FaceDetectorOptions.builder()
+                .setBaseOptions(BaseOptions.builder().setModelAssetPath(FACE_MODEL_ASSET).build())
+                .setMinDetectionConfidence(FACE_MIN_CONFIDENCE).build())
+        }
 
         Log.i(TAG, "Loaded: Crossroad-0230 (body), BlazeFace (face detect), age-gender-retail-0013 (face classify)")
     }
