@@ -151,4 +151,39 @@ class ZoomControllerTest {
         val proximity = zoom.calculateEdgeProximity(box)
         assertTrue("Corner object should have ~1.0 proximity, got $proximity", proximity > 0.8f)
     }
+
+    // --- Manual zoom (pinch-to-zoom) ---
+
+    @Test
+    fun `manual zoom sets exact ratio`() {
+        val result = zoom.setManualZoom(2.5f, minZoom = 1f, maxZoom = 5f)
+        assertEquals(2.5f, result, 0.001f)
+        assertEquals(2.5f, zoom.getCurrentZoom(), 0.001f)
+    }
+
+    @Test
+    fun `manual zoom clamps to min and max`() {
+        assertEquals(1f, zoom.setManualZoom(0.5f, minZoom = 1f, maxZoom = 5f), 0.001f)
+        assertEquals(5f, zoom.setManualZoom(10f, minZoom = 1f, maxZoom = 5f), 0.001f)
+    }
+
+    @Test
+    fun `manual zoom pauses auto-zoom`() {
+        zoom.setManualZoom(3f, minZoom = 1f, maxZoom = 5f)
+        assertTrue("Manual override should be active", zoom.manualOverride)
+
+        // Auto-zoom should return current zoom unchanged
+        val smallBox = RectF(0.49f, 0.49f, 0.51f, 0.51f) // would normally zoom in
+        val result = zoom.calculateZoom(smallBox, minZoom = 1f, maxZoom = 5f)
+        assertEquals("Auto-zoom should be paused at manual level", 3f, result, 0.001f)
+    }
+
+    @Test
+    fun `reset clears manual override`() {
+        zoom.setManualZoom(3f, minZoom = 1f, maxZoom = 5f)
+        assertTrue(zoom.manualOverride)
+        zoom.reset()
+        assertFalse("Reset should clear manual override", zoom.manualOverride)
+        assertEquals(1f, zoom.getCurrentZoom(), 0.001f)
+    }
 }
