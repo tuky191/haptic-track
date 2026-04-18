@@ -1,17 +1,17 @@
 [versions]
-agp = "8.7.3"
+agp = "8.13.2"
 kotlin = "2.0.21"
-coreKtx = "1.15.0"
-lifecycleRuntime = "2.8.7"
-activityCompose = "1.9.3"
-composeBom = "2024.12.01"
-camerax = "1.4.1"
+coreKtx = "1.18.0"
+lifecycleRuntime = "2.10.0"
+activityCompose = "1.13.0"
+composeBom = "2026.03.01"
+camerax = "1.6.0"
 mediapipeVision = "0.10.33"
 opencv = "4.13.0"
-tensorflowLite = "2.16.1"
-accompanistPermissions = "0.36.0"
+tensorflowLite = "2.17.0"
+accompanistPermissions = "0.37.3"
 junit = "4.13.2"
-robolectric = "4.14.1"
+robolectric = "4.16.1"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
