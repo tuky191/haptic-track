@@ -10,7 +10,6 @@ import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.framework.image.ByteBufferExtractor
 import com.google.mediapipe.tasks.components.containers.NormalizedKeypoint
 import com.google.mediapipe.tasks.core.BaseOptions
-import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.vision.interactivesegmenter.InteractiveSegmenter
 import org.opencv.core.CvType
 import org.opencv.core.Mat
@@ -42,9 +41,12 @@ class ObjectSegmenter(context: Context) {
     private val segmenter: InteractiveSegmenter
 
     init {
+        // GPU delegate breaks InteractiveSegmenter: the calculator graph uses a fixed
+        // timestamp (999999µs) for IMAGE mode, and the GPU pipeline's internal stream
+        // expects strictly increasing timestamps. The second call fails with
+        // "Packet timestamp mismatch". CPU delegate doesn't have this issue.
         val baseOptions = BaseOptions.builder()
             .setModelAssetPath(MODEL_PATH)
-            .setDelegate(Delegate.GPU)
             .build()
 
         val options = InteractiveSegmenter.InteractiveSegmenterOptions.builder()
