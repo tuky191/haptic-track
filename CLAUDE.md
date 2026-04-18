@@ -17,7 +17,7 @@ All changes follow this flow — never commit directly to master:
 
 ```bash
 ./gradlew assembleDebug          # Build debug APK
-./gradlew testDebugUnitTest      # Run unit tests (~3s, 162 tests)
+./gradlew testDebugUnitTest      # Run unit tests (~3s, 183 tests)
 adb install -r app/build/outputs/apk/debug/app-debug.apk  # Deploy to device
 
 adb logcat -d -s "Reacq" -s "VisualTracker" -s "FTFTracker" -s "Yolov8Det"  # Pull tracking logs
@@ -111,6 +111,19 @@ CameraViewModel
   - Once at lock time (~270ms, one-shot)
   - Every 10th search frame during re-acquisition
   - Semantically guarded: COCO "person" can only become Man/Woman/Boy/Girl/Human face
+
+**Recording (4K mode):**
+1. `CameraManager.enterRecordingMode()` unbinds `ImageAnalysis`, rebinds with 2 streams (preview + video) → 4K
+2. `CameraViewModel` starts a coroutine loop calling `PreviewView.getBitmap()` on main thread
+3. Bitmap is downscaled to ~640px width, then fed to `ObjectTracker.processBitmap()` on `Dispatchers.Default`
+4. `processBitmap()` sets `deviceRotation=0` (getBitmap is display-oriented) and processes normally
+5. On recording stop, `Finalize` callback triggers `exitRecordingMode()` → rebinds 3 streams
+6. `prepareForRebind()` called before each rebind: stops VT, forces `framesLost=1` for instant re-acquisition
+
+**Stealth mode:**
+- Black overlay covers full-size PreviewView (preview must render at full size for `getBitmap()`)
+- Same 2-stream mode as recording — 4K video + getBitmap analysis
+- Volume-down cycle still works: lock → record → stop+clear
 
 **Display:**
 1. `DetectionFilter` removes noise before sending to UI
@@ -264,15 +277,19 @@ Position (50%, decays) + size (25%) + base bonus (25%). All survivors already pa
 ## Current Work (may be stale — verify with git/GitHub)
 
 **Recently merged to master:**
-- PR #29 — Two-stage detection (EfficientDet-Lite2 + YOLOv8n-oiv7 label enrichment), COCO label fallback, smart hop counter, DRY cleanup
+- PR #37 — Manual camera controls: pinch zoom, 4K recording via 2/3-stream switching, stealth mode, volume-down hands-free cycle
+- PR #36 — Person identity: face embedding (MobileFaceNet) + body re-ID (OSNet x1.0)
 - PR #31 — Cascade scoring refactor (#30 phases 1+2), scenario recorder + replay harness
+- PR #29 — Two-stage detection (EfficientDet-Lite2 + YOLOv8n-oiv7 label enrichment)
 
 **Open issues:**
-- **#30** — Phase 3 remaining: capture more real-world scenarios (chair, potted plant, bottle) for broader replay test coverage. Phases 1 (recorder) and 2 (cascade) are done and merged.
-- **#14** — Manual camera controls
+- **#35** — Auto-lock on predefined criteria (label + attributes)
+- **#30** — Phase 3 remaining: capture more real-world scenarios for replay test coverage
+- **#14** — Partially done: zoom + recording done; photo capture + recording speed remain
 - **#20** — Upside-down tracking
 - **#21** — Image stabilization
 - **#27** — Clothing color accuracy
+- **#34, #32, #23** — Can be closed (work merged)
 
 ## Key Design Decisions
 
@@ -322,6 +339,15 @@ Camera image aspect ratio differs from phone screen. All bounding box rendering 
 ### Confidence threshold at 50% (decided 2026-04-12)
 Both MediaPipe's detector and `DetectionFilter` use 0.5 minimum confidence.
 
+### Dynamic 2/3-stream switching for 4K recording (decided 2026-04-17)
+Camera hardware (Xiaomi 13 Pro) limits 3 concurrent streams (preview + analysis + video) to 720p. Dropping ImageAnalysis gives 2 streams → 4K. During recording, analysis frames come from `PreviewView.getBitmap()` downscaled to ~640px width (~30ms/frame vs ~500ms at native 1440x3200). Key gotchas: getBitmap must run on main thread, returns rendered pixel size (1dp view = 4x4px), image is display-oriented (deviceRot=0). VideoCapture must be recreated on each rebind to avoid resolution mismatch. `prepareForRebind()` forces search mode for instant recovery.
+
+### Stealth mode: hidden preview with black overlay (decided 2026-04-17)
+PreviewView must render at full size for `getBitmap()` to return usable frames. A 1dp preview returns 4x4px bitmaps. Solution: keep preview full-size, overlay with opaque black Box. Preview still processes frames, `getBitmap()` returns full resolution, user sees black screen with controls.
+
+### Volume-down hands-free cycle (decided 2026-04-17)
+Three-stage cycle on volume-down: idle → lock on center object, tracking → start recording, recording → stop recording + clear. Enables fully hands-free operation: point camera, press volume-down three times.
+
 ## Logging
 
 ### Logcat tags
@@ -365,18 +391,18 @@ Auto-prunes to 10 sessions max.
 
 ## Test Suite
 
-170 unit tests, all run via Robolectric (no device needed):
+183 unit tests, all run via Robolectric (no device needed):
 
 | Class | Tests | What it covers |
 |---|---|---|
-| `ReacquisitionEngineTest` | 74 | Lock/clear, direct match, cascade gate tests (label gate reject/pass/override, wrong label even with perfect color, embedding ranking, no-embedding fallback, COCO label gate), position decay, size threshold decay, timeout, hop counter (increment, max, reset, smart same-object detection), frame counters, appearance embedding (store/clear, similarity scoring, same-label discrimination, fallback without embeddings, weight after decay), appearance override of geometric filters (size, position, weak embedding), two-truck discrimination, visual tracker handoff, label flicker (strong/weak embedding with mislabeled objects), color histogram scoring, person attribute scoring |
-| `ScenarioReplayTest` | 5 | Replay harness validation (empty frames, reacquisition detection, timeout detection), real captured scenarios (cup reacquisition, wrong-category rejection) |
+| `ReacquisitionEngineTest` | 74 | Lock/clear, direct match, cascade gate tests (label gate reject/pass/override, wrong label even with perfect color, embedding ranking, no-embedding fallback, COCO label gate), position decay, size threshold decay, timeout, frame counters, appearance embedding (store/clear, similarity scoring, same-label discrimination, fallback without embeddings, weight after decay), appearance override of geometric filters (size, position, weak embedding), two-truck discrimination, visual tracker handoff, label flicker (strong/weak embedding with mislabeled objects), color histogram scoring, person attribute scoring, face/re-ID tier tests |
+| `ScenarioReplayTest` | 15 | Replay harness validation, real captured scenarios (cup, mouse reacquisition, wrong-category rejection), regression baselines with quantitative thresholds (boy label flicker 67% tracking, person recovery 89% tracking, person↔boy flicker, chair no false-reacquire) |
 | `DetectionFilterTest` | 15 | Confidence cutoff, label requirement, box area limits, aspect ratio limits, negative IDs, edge cases |
 | `OrientationHysteresisTest` | 13 | Hysteresis dead zones, cardinal stability, rapid oscillation, deliberate transitions |
 | `FrameToFrameTrackerTest` | 10 | IoU computation, ID assignment, persistence across frames, new object detection, disappearance, reset |
 | `RotationRemapTest` | 11 | Coordinate remapping for all orientations (0, 90, 180, 270), center invariance, round-trip correctness |
 | `PersonAttributesTest` | 30 | Attribute similarity scoring, color matching, raw probability comparison |
-| `ZoomControllerTest` | 10 | Zoom in/out/steady, min/max limits, gradual steps, reset, edge proximity |
+| `ZoomControllerTest` | 20 | Zoom in/out/steady, min/max limits, gradual steps, reset, edge proximity, manual zoom (set/clamp/pause/reset) |
 
 ### Python model quality tests
 
@@ -464,17 +490,20 @@ All in constructor defaults — no settings UI yet:
 - [x] Two-tier tracking: visual tracker + detector re-acquisition
 - [x] Two-stage detection: EfficientDet-Lite2 + YOLOv8n-oiv7 label enrichment
 - [x] Visual embedding for identity-aware re-acquisition
+- [x] Person identity: face embedding + body re-ID for person-vs-person discrimination
 - [x] Person attribute classification (gender, clothing, accessories, age)
 - [x] Color histogram scoring for same-category discrimination
 - [x] Haptic feedback (continuous pulse, edge intensity, stop on lost)
-- [x] Auto-zoom from bounding box
-- [x] Video recording (start/stop)
+- [x] Auto-zoom from bounding box + pinch-to-zoom with manual override
+- [x] Volume-down hands-free cycle: lock center → record → stop+clear
+- [x] 4K video recording via dynamic 2/3-stream switching
+- [x] Stealth mode (black screen, full tracking + recording)
 - [x] All-orientation support (portrait, landscape, upside down) with hysteresis
 - [x] Debug frame capture for on-device diagnostics
 - [x] Scenario recording + deterministic replay testing
 - [x] Off-device model quality testing (Python + MediaPipe)
 - [x] Cascade scoring (DeepSORT-style label gate + embedding-primary ranking)
-- [x] 170 unit tests
+- [x] 174 unit tests
 
 ### Not built yet (from concept doc)
 - [ ] **Scenario replay validation (#30 phase 3)** — capture more real-world scenarios and validate cascade behavior against them. Phase 1 (recorder) and Phase 2 (cascade) are done.

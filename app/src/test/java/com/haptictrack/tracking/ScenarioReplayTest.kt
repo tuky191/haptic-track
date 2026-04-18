@@ -38,8 +38,22 @@ class ScenarioReplayTest {
 
     data class ReplayResult(
         val engine: ReacquisitionEngine,
-        val events: List<ReplayEvent>
-    )
+        val events: List<ReplayEvent>,
+        val framesTracked: Int = 0,
+        val totalFrames: Int = 0
+    ) {
+        /** Percentage of frames where the object was tracked (0-100). */
+        val trackingRate: Int get() = if (totalFrames > 0) framesTracked * 100 / totalFrames else 0
+        /** Number of successful reacquisitions. */
+        val reacquisitions: Int get() = events.count { it.type == "REACQUIRE" }
+        /** Number of times tracking was lost. */
+        val losses: Int get() = events.count { it.type == "LOST" }
+        /** Whether the scenario timed out. */
+        val timedOut: Boolean get() = events.any { it.type == "TIMEOUT" }
+        /** Labels that were reacquired but don't match the given set. */
+        fun wrongCategoryReacqs(validLabels: Set<String>): List<ReplayEvent> =
+            events.filter { it.type == "REACQUIRE" && it.label !in validLabels }
+    }
 
     // --- Scenario loading ---
 
@@ -180,6 +194,129 @@ class ScenarioReplayTest {
         assertNeverReacquiresLabel(result, "scissors")
     }
 
+    // --- Regression baseline scenarios ---
+
+    companion object {
+        /** Labels that are valid for a person-locked scenario (COCO + OIV7 variants). */
+        val PERSON_LABELS = setOf("person", "boy", "girl", "man", "woman", "human face")
+    }
+
+    // boy_label_flicker: locked on "boy" (coco: person), subject constantly re-detected
+    // as "person" due to EfficientDet label flicker. 120 frames, 9 loss/8 reacq cycles.
+    // Baseline: 67% tracking rate, 8 reacqs, 0 wrong-category, no timeout.
+
+    @Test
+    fun `boy label flicker - reacquires as person via COCO label gate`() {
+        val scenario = loadScenario("boy_label_flicker.json")
+        val result = replay(scenario)
+
+        val reacqEvents = result.events.filter { it.type == "REACQUIRE" }
+        assertTrue("Should reacquire at least 6 times (baseline: 8), got ${reacqEvents.size}",
+            reacqEvents.size >= 6)
+        reacqEvents.forEach { event ->
+            assertTrue("Reacquire label '${event.label}' should be a person variant",
+                event.label in PERSON_LABELS)
+        }
+    }
+
+    @Test
+    fun `boy label flicker - no wrong-category reacquisitions`() {
+        val scenario = loadScenario("boy_label_flicker.json")
+        val result = replay(scenario)
+
+        val wrong = result.wrongCategoryReacqs(PERSON_LABELS)
+        assertTrue("Should never reacquire non-person (got: ${wrong.map { "${it.label}@F${it.frame}" }})",
+            wrong.isEmpty())
+        assertNeverReacquiresLabel(result, "chair")
+        assertNeverReacquiresLabel(result, "couch")
+        assertNeverReacquiresLabel(result, "bed")
+    }
+
+    @Test
+    fun `boy label flicker - tracking rate at least 60 percent`() {
+        val scenario = loadScenario("boy_label_flicker.json")
+        val result = replay(scenario)
+
+        assertTrue("Tracking rate should be >= 60% (baseline: 67%), got ${result.trackingRate}%",
+            result.trackingRate >= 60)
+        assertFalse("Should not timeout", result.timedOut)
+    }
+
+    // person_tracking_recovery: locked on "person", initial loss then stable recovery.
+    // 138 frames, 4 losses, 4 reacqs, long stable tracking at end (frames 23-137).
+    // Baseline: 89% tracking rate, 4 reacqs, 0 wrong-category.
+
+    @Test
+    fun `person recovery - reacquires and stabilizes`() {
+        val scenario = loadScenario("person_tracking_recovery.json")
+        val result = replay(scenario)
+
+        assertTrue("Should reacquire at least 3 times (baseline: 4), got ${result.reacquisitions}",
+            result.reacquisitions >= 3)
+        assertFalse("Should not timeout", result.timedOut)
+    }
+
+    @Test
+    fun `person recovery - tracking rate at least 80 percent`() {
+        val scenario = loadScenario("person_tracking_recovery.json")
+        val result = replay(scenario)
+
+        assertTrue("Tracking rate should be >= 80% (baseline: 89%), got ${result.trackingRate}%",
+            result.trackingRate >= 80)
+    }
+
+    @Test
+    fun `person recovery - no wrong-category reacquisitions`() {
+        val scenario = loadScenario("person_tracking_recovery.json")
+        val result = replay(scenario)
+
+        val wrong = result.wrongCategoryReacqs(PERSON_LABELS)
+        assertTrue("Should never reacquire non-person (got: ${wrong.map { "${it.label}@F${it.frame}" }})",
+            wrong.isEmpty())
+        assertNeverReacquiresLabel(result, "chair")
+        assertNeverReacquiresLabel(result, "car")
+        assertNeverReacquiresLabel(result, "bed")
+    }
+
+    // person_boy_flicker: locked on "person", short session with person↔boy flicker.
+    // 30 frames, 3 losses, 2 reacqs (one as "person", one as "boy").
+    // Baseline: 63% tracking rate.
+
+    @Test
+    fun `person boy flicker - reacquires both person and boy variants`() {
+        val scenario = loadScenario("person_boy_flicker.json")
+        val result = replay(scenario)
+
+        assertTrue("Should reacquire at least once (baseline: 2), got ${result.reacquisitions}",
+            result.reacquisitions >= 1)
+        result.events.filter { it.type == "REACQUIRE" }.forEach { event ->
+            assertTrue("Reacquire label '${event.label}' should be a person variant",
+                event.label in PERSON_LABELS)
+        }
+    }
+
+    @Test
+    fun `person boy flicker - tracking rate at least 50 percent`() {
+        val scenario = loadScenario("person_boy_flicker.json")
+        val result = replay(scenario)
+
+        assertTrue("Tracking rate should be >= 50% (baseline: 63%), got ${result.trackingRate}%",
+            result.trackingRate >= 50)
+    }
+
+    // chair_lost_no_recovery: locked on "chair", lost immediately, never recovered.
+    // 10 frames. Tests that the engine doesn't false-reacquire on wrong objects.
+    // Baseline: 0% tracking rate, 0 reacqs, 1 loss.
+
+    @Test
+    fun `chair lost - does not false-reacquire on wrong objects`() {
+        val scenario = loadScenario("chair_lost_no_recovery.json")
+        val result = replay(scenario)
+
+        assertEquals("Should have no reacquisitions", 0, result.reacquisitions)
+        assertTrue("Should have at least 1 loss", result.losses >= 1)
+    }
+
     // --- Helpers for building synthetic scenarios ---
 
     data class SyntheticDetection(
@@ -271,6 +408,7 @@ class ScenarioReplayTest {
 
         val events = mutableListOf<ReplayEvent>()
         val framesJson = scenario.getJSONArray("frames")
+        var framesTracked = 0
 
         for (i in 0 until framesJson.length()) {
             val frame = framesJson.getJSONObject(i)
@@ -285,6 +423,7 @@ class ScenarioReplayTest {
             val result = engine.processFrame(detections)
 
             val nowLost = engine.framesLost
+            if (nowLost == 0) framesTracked++
             when {
                 wasSearching && result != null && nowLost == 0 ->
                     events.add(ReplayEvent(i, "REACQUIRE", result.id, result.label))
@@ -295,6 +434,6 @@ class ScenarioReplayTest {
             }
         }
 
-        return ReplayResult(engine, events)
+        return ReplayResult(engine, events, framesTracked, framesJson.length())
     }
 }
