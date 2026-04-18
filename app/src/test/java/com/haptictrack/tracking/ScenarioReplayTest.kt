@@ -304,6 +304,16 @@ class ScenarioReplayTest {
             result.trackingRate >= 50)
     }
 
+    @Test
+    fun `person boy flicker - no wrong-category reacquisitions`() {
+        val scenario = loadScenario("person_boy_flicker.json")
+        val result = replay(scenario)
+
+        val wrong = result.wrongCategoryReacqs(PERSON_LABELS)
+        assertTrue("Should never reacquire non-person (got: ${wrong.map { "${it.label}@F${it.frame}" }})",
+            wrong.isEmpty())
+    }
+
     // chair_lost_no_recovery: locked on "chair", lost immediately, never recovered.
     // 10 frames. Tests that the engine doesn't false-reacquire on wrong objects.
     // Baseline: 0% tracking rate, 0 reacqs, 1 loss.
