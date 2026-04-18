@@ -9,6 +9,7 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
+import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetector
 import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetectorResult
 
@@ -44,6 +45,11 @@ class ObjectTracker(
     private var vtConfirmedFrames = 0
     private val VT_MAX_UNCONFIRMED = 10  // ~0.3s at 30fps
 
+    /** Skip detector every other frame when VT is confident and recently confirmed. */
+    private var vtFrameCounter = 0
+    private val VT_SKIP_INTERVAL = 2  // run detector every Nth frame when skipping
+    private val VT_SKIP_MIN_CONFIRMED = 5  // need this many confirmations before skipping
+
     /** Callback: (displayObjects, lockedObject, imageWidth, imageHeight, contour) */
     var onDetectionResult: ((List<TrackedObject>, TrackedObject?, Int, Int, List<PointF>) -> Unit)? = null
 
@@ -57,7 +63,8 @@ class ObjectTracker(
 
     init {
         val baseOptions = BaseOptions.builder()
-            .setModelAssetPath("efficientdet-lite2.tflite")
+            .setModelAssetPath("efficientdet-lite2-fp16.tflite")
+            .setDelegate(Delegate.GPU)
             .build()
 
         val options = ObjectDetector.ObjectDetectorOptions.builder()
@@ -139,6 +146,7 @@ class ObjectTracker(
         visualTracker.stop()
         vtUnconfirmedFrames = 0
         vtConfirmedFrames = 0
+        vtFrameCounter = 0
         cachedContour = emptyList()
         contourFrameCount = 0
     }
@@ -176,18 +184,33 @@ class ObjectTracker(
             if (visualTracker.isActive && reacquisition.isLocked && reacquisition.framesLost == 0) {
                 val vtResult = visualTracker.update(bitmap)
                 if (vtResult != null) {
-                    // Run detector anyway to validate and for display
-                    val detections = runDetector(bitmap, frameWidth, frameHeight, deviceRotation)
-                    val tracked = frameTracker.assignIds(detections)
-
                     // VT returns coords in rotated-image space; unmap to screen space
-                    // to match detector boxes (which are already unmapped).
                     val deviceRot = deviceRotation
                     val rawBox = vtResult.boundingBox
                     val vtBox = unmapRotation(rawBox.left, rawBox.top, rawBox.right, rawBox.bottom, deviceRot)
-                    val confirmed = tracked.any { det ->
-                        det.label == reacquisition.lockedLabel &&
-                        FrameToFrameTracker.computeIou(det.boundingBox, vtBox) > 0.15f
+
+                    // Skip detector when VT is confident and recently confirmed.
+                    // Saves ~35ms per skipped frame. Still run every Nth frame for drift detection.
+                    vtFrameCounter++
+                    val canSkip = vtConfirmedFrames >= VT_SKIP_MIN_CONFIRMED &&
+                        vtUnconfirmedFrames == 0 &&
+                        vtResult.confidence > 0.6f
+                    val skipDetector = canSkip && (vtFrameCounter % VT_SKIP_INTERVAL != 0)
+
+                    val tracked = if (skipDetector) {
+                        emptyList()
+                    } else {
+                        val detections = runDetector(bitmap, frameWidth, frameHeight, deviceRotation)
+                        frameTracker.assignIds(detections)
+                    }
+
+                    val confirmed = if (skipDetector) {
+                        true  // trust VT on skipped frames
+                    } else {
+                        tracked.any { det ->
+                            det.label == reacquisition.lockedLabel &&
+                            FrameToFrameTracker.computeIou(det.boundingBox, vtBox) > 0.15f
+                        }
                     }
 
                     if (confirmed) {
@@ -222,6 +245,7 @@ class ObjectTracker(
                         android.util.Log.w("VisualTracker", "DRIFT detected — $vtUnconfirmedFrames unconfirmed frames, stopping")
                         visualTracker.stop()
                         vtUnconfirmedFrames = 0
+                        vtFrameCounter = 0
                         // Fall through to detector path below
                     } else {
                         val lockedObj = TrackedObject(

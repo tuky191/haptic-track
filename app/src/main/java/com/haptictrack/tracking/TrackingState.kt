@@ -158,5 +158,7 @@ data class TrackingUiState(
     /** True when zoom indicator should be visible (during/after pinch). */
     val showZoomIndicator: Boolean = false,
     /** Stealth mode: preview hidden, screen stays black. */
-    val stealthMode: Boolean = false
+    val stealthMode: Boolean = false,
+    /** True once all ML models are loaded and ready. */
+    val isReady: Boolean = false
 )

@@ -55,7 +55,7 @@ class PersonReIdEmbedder(context: Context) {
 
     init {
         val model = loadTfliteModel(context, MODEL_ASSET)
-        interpreter = Interpreter(model, Interpreter.Options().apply { setNumThreads(2) })
+        interpreter = createGpuInterpreter(model, cpuThreads = 2)
         Log.i(TAG, "Loaded OSNet x1.0 Market-1501 (${EMBEDDING_DIM}-dim, ${INPUT_HEIGHT}x${INPUT_WIDTH})")
     }
 

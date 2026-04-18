@@ -76,6 +76,8 @@ dependencies {
 
     // TensorFlow Lite (person attribute classifier)
     implementation(libs.tensorflow.lite)
+    implementation(libs.tensorflow.lite.gpu)
+    implementation(libs.tensorflow.lite.gpu.api)
 
     // Permissions
     implementation(libs.accompanist.permissions)

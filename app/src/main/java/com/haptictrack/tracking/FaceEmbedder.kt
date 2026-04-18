@@ -46,7 +46,7 @@ class FaceEmbedder(context: Context, sharedFaceDetector: FaceDetector? = null) {
 
     init {
         val model = loadTfliteModel(context, MODEL_ASSET)
-        interpreter = Interpreter(model, Interpreter.Options().apply { setNumThreads(2) })
+        interpreter = createGpuInterpreter(model, cpuThreads = 2)
 
         if (sharedFaceDetector != null) {
             faceDetector = sharedFaceDetector

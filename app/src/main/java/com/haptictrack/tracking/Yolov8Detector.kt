@@ -63,7 +63,7 @@ class Yolov8Detector(context: Context) {
 
     init {
         val model = loadTfliteModel(context, MODEL_ASSET)
-        interpreter = Interpreter(model, Interpreter.Options().apply { setNumThreads(4) })
+        interpreter = createGpuInterpreter(model, cpuThreads = 4)
 
         labels = context.assets.open(LABELS_ASSET).bufferedReader().use { it.readLines() }
         Log.i(TAG, "Loaded YOLOv8n-oiv7: ${labels.size} classes, input ${INPUT_SIZE}x${INPUT_SIZE}")

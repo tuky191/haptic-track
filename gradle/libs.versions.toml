@@ -43,6 +43,8 @@ opencv = { group = "org.opencv", name = "opencv", version.ref = "opencv" }
 
 # TensorFlow Lite
 tensorflow-lite = { group = "org.tensorflow", name = "tensorflow-lite", version.ref = "tensorflowLite" }
+tensorflow-lite-gpu = { group = "org.tensorflow", name = "tensorflow-lite-gpu", version.ref = "tensorflowLite" }
+tensorflow-lite-gpu-api = { group = "org.tensorflow", name = "tensorflow-lite-gpu-api", version.ref = "tensorflowLite" }
 
 # Testing
 junit = { group = "junit", name = "junit", version.ref = "junit" }

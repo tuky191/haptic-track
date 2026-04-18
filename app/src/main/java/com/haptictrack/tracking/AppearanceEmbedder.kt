@@ -8,6 +8,7 @@ import android.util.Log
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.components.containers.Embedding
 import com.google.mediapipe.tasks.core.BaseOptions
+import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.vision.imageembedder.ImageEmbedder
 
 /**
@@ -32,6 +33,7 @@ class AppearanceEmbedder(context: Context) {
     init {
         val baseOptions = BaseOptions.builder()
             .setModelAssetPath(MODEL_PATH)
+            .setDelegate(Delegate.GPU)
             .build()
 
         val options = ImageEmbedder.ImageEmbedderOptions.builder()

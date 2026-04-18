@@ -348,6 +348,12 @@ PreviewView must render at full size for `getBitmap()` to return usable frames. 
 ### Volume-down hands-free cycle (decided 2026-04-17)
 Three-stage cycle on volume-down: idle → lock on center object, tracking → start recording, recording → stop recording + clear. Enables fully hands-free operation: point camera, press volume-down three times.
 
+### GPU delegate for FP32 models, CPU for INT8 (decided 2026-04-18)
+EfficientDet-Lite2 is the only INT8 quantized model — GPU delegate requires FP32/FP16 input tensors, so it stays on CPU (XNNPACK). All other 8 TFLite/MediaPipe models are FP32 and use GPU delegate (Adreno 740). TFLite GPU delegate uses `createGpuInterpreter()` with `Class.forName` check + `Throwable` catch for graceful CPU fallback. MediaPipe models use `Delegate.GPU` via `BaseOptions.setDelegate()`.
+
+### Adaptive frame skipping during visual tracking (decided 2026-04-18)
+When VitTracker is confident (>0.6) and has 5+ confirmed frames with 0 unconfirmed, skip the EfficientDet detector every other frame. VT alone runs at ~5ms vs ~35ms for detector. Still runs detector every 2nd frame for drift detection. Saves ~50% detector compute while locked. Resets on drift, lock clear, or VT stop.
+
 ## Logging
 
 ### Logcat tags
@@ -360,6 +366,7 @@ Three-stage cycle on volume-down: idle → lock on center object, tracking → s
 | `Yolov8Det` | Enriched label results, no-enrichment cases |
 | `ScenarioRec` | Recording started/stopped, frame count |
 | `AppearEmbed` | Embedding failures |
+| `TFLiteGPU` | GPU delegate activation or CPU fallback per model |
 | `DebugCapture` | Saved debug frame filenames |
 
 Filter: `adb logcat -s "Reacq" -s "VisualTracker" -s "FTFTracker" -s "Yolov8Det"`
@@ -438,18 +445,20 @@ Top-level functions used across multiple classes — avoids duplication:
 
 ## Models
 
-| Model | File | Size | Purpose |
-|---|---|---|---|
-| EfficientDet-Lite2 | `efficientdet-lite2.tflite` | 7.2MB | Primary detector (80 COCO classes, every frame) |
-| YOLOv8n-oiv7 | `yolov8n_oiv7.tflite` | 6.8MB | Label enricher (601 OIV7 classes, on-demand) |
-| MobileNetV3 Large | `mobilenet_v3_large_embedder.tflite` | 10MB | Visual embedding (1280-dim) |
-| VitTracker | `vitTracker.onnx` | 0.7MB | Visual frame-to-frame tracker |
-| magic_touch | `magic_touch.tflite` | 5.9MB | Segmentation for masked crops |
-| Crossroad-0230 | `person_attributes_crossroad_0230.tflite` | 2.8MB | Person body attributes (8 binary) |
-| BlazeFace | `blaze_face_short_range.tflite` | 0.2MB | Face detection within person crops |
-| age-gender-retail-0013 | `age_gender_retail_0013.tflite` | 4.1MB | Face-based gender + age |
-| OIV7 labels | `oiv7_labels.txt` | 10KB | 601 class names for YOLOv8 |
-| **Total** | | **~38MB** | |
+| Model | File | Size | Precision | Delegate | Purpose |
+|---|---|---|---|---|---|
+| EfficientDet-Lite2 | `efficientdet-lite2.tflite` | 7.2MB | INT8 | CPU (XNNPACK) | Primary detector (80 COCO classes, every frame) |
+| YOLOv8n-oiv7 | `yolov8n_oiv7.tflite` | 6.8MB | FP32 | GPU (fallback CPU) | Label enricher (601 OIV7 classes, on-demand) |
+| MobileNetV3 Large | `mobilenet_v3_large_embedder.tflite` | 10MB | FP32 | GPU (MediaPipe) | Visual embedding (1280-dim) |
+| VitTracker | `vitTracker.onnx` | 0.7MB | FP32 | CPU (OpenCV DNN) | Visual frame-to-frame tracker |
+| magic_touch | `magic_touch.tflite` | 5.9MB | FP32 | GPU (MediaPipe) | Segmentation for masked crops |
+| Crossroad-0230 | `person_attributes_crossroad_0230.tflite` | 2.8MB | FP32 | GPU (fallback CPU) | Person body attributes (8 binary) |
+| BlazeFace | `blaze_face_short_range.tflite` | 0.2MB | FP32 | GPU (MediaPipe) | Face detection within person crops |
+| age-gender-retail-0013 | `age_gender_retail_0013.tflite` | 4.1MB | FP32 | GPU (fallback CPU) | Face-based gender + age |
+| OSNet x1.0 | `osnet_x1_0_market.tflite` | 4.2MB | FP32 | GPU (fallback CPU) | Person re-ID embedding (512-dim) |
+| MobileFaceNet | `mobilefacenet.tflite` | 5.0MB | FP32 | GPU (fallback CPU) | Face embedding (192-dim) |
+| OIV7 labels | `oiv7_labels.txt` | 10KB | — | — | 601 class names for YOLOv8 |
+| **Total** | | **~47MB** | | |
 
 ## Dependencies
 
@@ -458,7 +467,8 @@ Top-level functions used across multiple classes — avoids duplication:
 | CameraX | 1.4.1 | — | Camera control + recording |
 | MediaPipe Tasks Vision | 0.10.21 | ~15MB | Object detection + image embedding |
 | OpenCV | 4.13.0 | ~10MB (arm64) | VitTracker visual tracking |
-| TensorFlow Lite | (via MediaPipe) | — | YOLOv8 + PersonAttributeClassifier inference |
+| TensorFlow Lite | 2.16.1 | — | YOLOv8 + PersonAttributeClassifier inference |
+| TensorFlow Lite GPU | 2.16.1 + 0.4.4 | — | GPU delegate for FP32 TFLite models |
 | Jetpack Compose BOM | 2024.12.01 | — | UI framework |
 | Accompanist Permissions | 0.36.0 | — | Runtime permission handling |
 
@@ -482,6 +492,8 @@ All in constructor defaults — no settings UI yet:
 | `targetFrameOccupancy` | ZoomController | 0.15 | Target subject size as fraction of frame |
 | `zoomSpeed` | ZoomController | 0.05 | Zoom change per frame |
 | `scoreThreshold` | ObjectTracker (MediaPipe) | 0.5 | MediaPipe detector confidence cutoff |
+| `VT_SKIP_INTERVAL` | ObjectTracker | 2 | Run detector every Nth frame when VT is skipping |
+| `VT_SKIP_MIN_CONFIRMED` | ObjectTracker | 5 | Min VT confirmations before frame skipping kicks in |
 
 ## What's Built vs. What's Not
 
@@ -499,6 +511,8 @@ All in constructor defaults — no settings UI yet:
 - [x] 4K video recording via dynamic 2/3-stream switching
 - [x] Stealth mode (black screen, full tracking + recording)
 - [x] All-orientation support (portrait, landscape, upside down) with hysteresis
+- [x] GPU delegate for FP32 models (8/9 models offloaded to Adreno 740)
+- [x] Adaptive frame skipping (skip detector when VT confident)
 - [x] Debug frame capture for on-device diagnostics
 - [x] Scenario recording + deterministic replay testing
 - [x] Off-device model quality testing (Python + MediaPipe)

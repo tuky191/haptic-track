@@ -7,6 +7,7 @@ import android.graphics.RectF
 import android.util.Log
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
+import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.vision.facedetector.FaceDetector
 import org.tensorflow.lite.Interpreter
 import java.nio.ByteBuffer
@@ -48,13 +49,13 @@ class PersonAttributeClassifier(context: Context) {
 
     init {
         val bodyModel = loadTfliteModel(context, BODY_MODEL_ASSET)
-        bodyInterpreter = Interpreter(bodyModel, Interpreter.Options().apply { setNumThreads(2) })
+        bodyInterpreter = createGpuInterpreter(bodyModel, cpuThreads = 2)
 
         val ageGenderModel = loadTfliteModel(context, AGE_GENDER_MODEL_ASSET)
-        ageGenderInterpreter = Interpreter(ageGenderModel, Interpreter.Options().apply { setNumThreads(2) })
+        ageGenderInterpreter = createGpuInterpreter(ageGenderModel, cpuThreads = 2)
 
         val faceOptions = FaceDetector.FaceDetectorOptions.builder()
-            .setBaseOptions(BaseOptions.builder().setModelAssetPath(FACE_MODEL_ASSET).build())
+            .setBaseOptions(BaseOptions.builder().setModelAssetPath(FACE_MODEL_ASSET).setDelegate(Delegate.GPU).build())
             .setMinDetectionConfidence(FACE_MIN_CONFIDENCE)
             .build()
         faceDetector = FaceDetector.createFromOptions(context, faceOptions)
