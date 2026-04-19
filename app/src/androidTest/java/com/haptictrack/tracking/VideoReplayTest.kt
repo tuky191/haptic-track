@@ -97,8 +97,6 @@ class VideoReplayTest {
     fun person_playground_reacquires_correctly() {
         val result = replayVideo("person_playground_tracking")
 
-        assertTrue("Should reacquire at least 2 times, got ${result.reacquisitions}",
-            result.reacquisitions >= 2)
         assertFalse("Should not timeout", result.timedOut)
 
         val wrong = result.wrongCategoryReacqs(PERSON_LABELS)
@@ -114,8 +112,10 @@ class VideoReplayTest {
     fun person_playground_tracking_rate() {
         val result = replayVideo("person_playground_tracking")
 
-        assertTrue("Tracking rate should be >= 50%, got ${result.trackingRate}%",
-            result.trackingRate >= 50)
+        // Baseline with velocity improvements: 100% tracked, 1 loss.
+        // Previously: 98% tracked, 5 losses.
+        assertTrue("Tracking rate should be >= 90%, got ${result.trackingRate}%",
+            result.trackingRate >= 90)
     }
 
     @Test
