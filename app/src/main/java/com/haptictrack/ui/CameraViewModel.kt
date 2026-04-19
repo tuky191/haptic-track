@@ -265,6 +265,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun clearTracking() {
+        if (!isTrackerReady) return
         objectTracker.clearLock()
         zoomController.reset()
         hapticManager.updateTrackingStatus(TrackingStatus.IDLE)
@@ -275,6 +276,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     @android.annotation.SuppressLint("MissingPermission")
     fun toggleRecording() {
+        if (!isTrackerReady) return
         if (recordingManager.isRecording) {
             recordingManager.stopRecording()
             if (!_uiState.value.stealthMode) stopBitmapAnalysis()
@@ -329,6 +331,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
                         objectTracker.processBitmap(scaled)
                     }
+                    kotlinx.coroutines.yield()
                 } else {
                     delay(BITMAP_ANALYSIS_INTERVAL_MS)
                 }

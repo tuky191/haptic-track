@@ -138,20 +138,26 @@ fun loadTfliteModel(context: Context, assetName: String): MappedByteBuffer {
     }
 }
 
+data class GpuInterpreter(val interpreter: Interpreter, val gpuDelegate: GpuDelegate?) {
+    fun close() {
+        interpreter.close()
+        gpuDelegate?.close()
+    }
+}
+
 /**
  * Create a TFLite Interpreter with GPU delegate, falling back to CPU if GPU is unavailable.
  */
-fun createGpuInterpreter(model: MappedByteBuffer, cpuThreads: Int = 2): Interpreter {
+fun createGpuInterpreter(model: MappedByteBuffer, modelName: String = "unknown", cpuThreads: Int = 2): GpuInterpreter {
     return try {
-        val gpuOptions = GpuDelegate.Options()
-        val gpuDelegate = GpuDelegate(gpuOptions)
+        val gpuDelegate = GpuDelegate(GpuDelegate.Options())
         val options = Interpreter.Options().addDelegate(gpuDelegate)
-        Interpreter(model, options).also {
-            Log.i("TFLiteGPU", "GPU delegate active")
+        GpuInterpreter(Interpreter(model, options), gpuDelegate).also {
+            Log.i("TFLiteGPU", "GPU delegate active for $modelName")
         }
     } catch (e: Throwable) {
-        Log.w("TFLiteGPU", "GPU delegate unavailable, using CPU ($cpuThreads threads): ${e.message}")
-        Interpreter(model, Interpreter.Options().apply { setNumThreads(cpuThreads) })
+        Log.w("TFLiteGPU", "GPU delegate unavailable for $modelName, using CPU ($cpuThreads threads): ${e.message}")
+        GpuInterpreter(Interpreter(model, Interpreter.Options().apply { setNumThreads(cpuThreads) }), null)
     }
 }
 

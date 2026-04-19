@@ -99,10 +99,9 @@ class ObjectSegmenter(context: Context) {
 
             val mpImage = BitmapImageBuilder(segInput ?: inputCrop).build()
 
-            // Keypoint at center of the segmenter input
-            val segBitmap = segInput ?: inputCrop
+            // Keypoint at center of the crop (normalized [0,1] coordinates)
             val roi = InteractiveSegmenter.RegionOfInterest.create(
-                NormalizedKeypoint.create(segBitmap.width / 2f, segBitmap.height / 2f)
+                NormalizedKeypoint.create(0.5f, 0.5f)
             )
 
             val result = segmenter.segment(mpImage, roi)
@@ -239,7 +238,7 @@ class ObjectSegmenter(context: Context) {
 
             // Keypoint at center of the crop (pixel coordinates — Android API)
             val roi = InteractiveSegmenter.RegionOfInterest.create(
-                NormalizedKeypoint.create(inputCrop.width / 2f, inputCrop.height / 2f)
+                NormalizedKeypoint.create(0.5f, 0.5f)
             )
 
             val result = segmenter.segment(mpImage, roi)

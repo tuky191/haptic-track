@@ -52,7 +52,8 @@ class Yolov8Detector(context: Context) {
         )
     }
 
-    private val interpreter: Interpreter
+    private val gpu: GpuInterpreter
+    private val interpreter: Interpreter get() = gpu.interpreter
     private val labels: List<String>
 
     // Pre-allocated buffers
@@ -63,7 +64,7 @@ class Yolov8Detector(context: Context) {
 
     init {
         val model = loadTfliteModel(context, MODEL_ASSET)
-        interpreter = createGpuInterpreter(model, cpuThreads = 4)
+        gpu = createGpuInterpreter(model, modelName = "YOLOv8n", cpuThreads = 4)
 
         labels = context.assets.open(LABELS_ASSET).bufferedReader().use { it.readLines() }
         Log.i(TAG, "Loaded YOLOv8n-oiv7: ${labels.size} classes, input ${INPUT_SIZE}x${INPUT_SIZE}")
@@ -124,7 +125,7 @@ class Yolov8Detector(context: Context) {
     }
 
     fun close() {
-        interpreter.close()
+        gpu.close()
     }
 
     data class Detection(

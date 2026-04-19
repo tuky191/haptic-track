@@ -150,6 +150,7 @@ class ObjectTracker(
         if (!reacquisition.isLocked) return
         visualTracker.stop()
         vtUnconfirmedFrames = 0
+        vtFrameCounter = 0
         reacquisition.prepareForRebind()
     }
 

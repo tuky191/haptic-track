@@ -42,17 +42,19 @@ class PersonAttributeClassifier(context: Context) {
         private const val FACE_MIN_CONFIDENCE = 0.5f
     }
 
-    private val bodyInterpreter: Interpreter
-    private val ageGenderInterpreter: Interpreter
+    private val bodyGpu: GpuInterpreter
+    private val bodyInterpreter: Interpreter get() = bodyGpu.interpreter
+    private val ageGenderGpu: GpuInterpreter
+    private val ageGenderInterpreter: Interpreter get() = ageGenderGpu.interpreter
     /** Exposed for sharing with [FaceEmbedder] to avoid duplicate model loading. */
     val faceDetector: FaceDetector
 
     init {
         val bodyModel = loadTfliteModel(context, BODY_MODEL_ASSET)
-        bodyInterpreter = createGpuInterpreter(bodyModel, cpuThreads = 2)
+        bodyGpu = createGpuInterpreter(bodyModel, modelName = "Crossroad-0230", cpuThreads = 2)
 
         val ageGenderModel = loadTfliteModel(context, AGE_GENDER_MODEL_ASSET)
-        ageGenderInterpreter = createGpuInterpreter(ageGenderModel, cpuThreads = 2)
+        ageGenderGpu = createGpuInterpreter(ageGenderModel, modelName = "age-gender", cpuThreads = 2)
 
         faceDetector = try {
             FaceDetector.createFromOptions(context, FaceDetector.FaceDetectorOptions.builder()
@@ -140,8 +142,8 @@ class PersonAttributeClassifier(context: Context) {
     }
 
     fun shutdown() {
-        bodyInterpreter.close()
-        ageGenderInterpreter.close()
+        bodyGpu.close()
+        ageGenderGpu.close()
         faceDetector.close()
     }
 
