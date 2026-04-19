@@ -44,12 +44,17 @@ class ObjectTracker(
     // Count frames where visual tracker has no detector confirmation
     private var vtUnconfirmedFrames = 0
     private var vtConfirmedFrames = 0
-    private val VT_MAX_UNCONFIRMED = 10  // ~0.3s at 30fps
+    private val VT_MAX_UNCONFIRMED = 10  // ~0.3s at 30fps (baseline for slow subjects)
 
     /** Skip detector every other frame when VT is confident and recently confirmed. */
     private var vtFrameCounter = 0
     private val VT_SKIP_INTERVAL = 2  // run detector every Nth frame when skipping
     private val VT_SKIP_MIN_CONFIRMED = 5  // need this many confirmations before skipping
+
+    /** Tracks object velocity for adaptive drift detection and position prediction. */
+    private val velocityEstimator = VelocityEstimator()
+    private val VT_ADAPTIVE_UNCONFIRMED_HIGH = 5      // ~165ms for fast subjects
+    private val VT_ADAPTIVE_UNCONFIRMED_VERY_HIGH = 3  // ~100ms for very fast subjects
 
     /** Callback: (displayObjects, lockedObject, imageWidth, imageHeight, contour) */
     var onDetectionResult: ((List<TrackedObject>, TrackedObject?, Int, Int, List<PointF>) -> Unit)? = null
@@ -151,6 +156,7 @@ class ObjectTracker(
         visualTracker.stop()
         vtUnconfirmedFrames = 0
         vtFrameCounter = 0
+        velocityEstimator.reset()
         reacquisition.prepareForRebind()
     }
 
@@ -164,6 +170,7 @@ class ObjectTracker(
         vtUnconfirmedFrames = 0
         vtConfirmedFrames = 0
         vtFrameCounter = 0
+        velocityEstimator.reset()
         cachedContour = emptyList()
         contourFrameCount = 0
     }
@@ -205,6 +212,9 @@ class ObjectTracker(
                     val deviceRot = deviceRotation
                     val rawBox = vtResult.boundingBox
                     val vtBox = unmapRotation(rawBox.left, rawBox.top, rawBox.right, rawBox.bottom, deviceRot)
+
+                    // Feed position to velocity estimator for adaptive drift detection
+                    velocityEstimator.update(vtBox.centerX(), vtBox.centerY())
 
                     // Skip detector when VT is confident and recently confirmed.
                     // Saves ~35ms per skipped frame. Still run every Nth frame for drift detection.
@@ -257,9 +267,15 @@ class ObjectTracker(
                         vtUnconfirmedFrames++
                     }
 
-                    // If too many frames without detector confirmation, tracker is drifting
-                    if (vtUnconfirmedFrames > VT_MAX_UNCONFIRMED) {
-                        android.util.Log.w("VisualTracker", "DRIFT detected — $vtUnconfirmedFrames unconfirmed frames, stopping")
+                    // If too many frames without detector confirmation, tracker is drifting.
+                    // Adaptive: fast-moving subjects get shorter tolerance (drift is more costly).
+                    val adaptiveMaxUnconfirmed = when {
+                        velocityEstimator.isVeryHighVelocity() -> VT_ADAPTIVE_UNCONFIRMED_VERY_HIGH
+                        velocityEstimator.isHighVelocity() -> VT_ADAPTIVE_UNCONFIRMED_HIGH
+                        else -> VT_MAX_UNCONFIRMED
+                    }
+                    if (vtUnconfirmedFrames > adaptiveMaxUnconfirmed) {
+                        android.util.Log.w("VisualTracker", "DRIFT detected — $vtUnconfirmedFrames unconfirmed frames (max=$adaptiveMaxUnconfirmed, speed=${velocityEstimator.speed}), stopping")
                         visualTracker.stop()
                         vtUnconfirmedFrames = 0
                         vtFrameCounter = 0
