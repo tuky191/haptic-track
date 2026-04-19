@@ -19,3 +19,6 @@ tools/.pytest_cache/
 tools/test_fixtures/*/frames/
 *.mp4
 *.logcat
+
+# Pulled device data (large, session-specific)
+pulled_frames/
