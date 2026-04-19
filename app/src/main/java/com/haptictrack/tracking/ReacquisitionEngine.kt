@@ -34,6 +34,10 @@ class ReacquisitionEngine(
          *  Lower than label override because position rejection is a different risk
          *  than cross-category leakage — 0.55 is enough to say "same object, just moved." */
         const val GEOMETRIC_OVERRIDE_THRESHOLD = 0.55f
+        /** Minimum embedding similarity to consider a candidate at all.
+         *  If the primary embedder says the candidate is a different object (sim < this),
+         *  no amount of re-ID, attributes, or color can rescue it. */
+        const val MIN_EMBEDDING_SIMILARITY = 0.15f
         /** Maximum embeddings to keep in gallery. */
         const val MAX_GALLERY_SIZE = 12
     }
@@ -299,6 +303,14 @@ class ReacquisitionEngine(
         val appearanceScore = if (hasAppearance) {
             bestGallerySimilarity(candidate.embedding!!).coerceIn(0f, 1f)
         } else 0f
+        // --- GATE: Embedding floor ---
+        // If the primary embedder says this is a different object, reject outright.
+        // Re-ID, attributes, and color are supplementary signals that can't override
+        // a negative identity match from the primary 1280-dim embedding.
+        if (hasAppearance && appearanceScore < MIN_EMBEDDING_SIMILARITY) {
+            return null
+        }
+
         // Tiered override: geometric gates use a lower threshold (0.55) because
         // position rejection is about camera movement, not identity confusion.
         // Label gate uses a higher threshold (0.7) to protect against cross-category leakage.
