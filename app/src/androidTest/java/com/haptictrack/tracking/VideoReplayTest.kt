@@ -229,34 +229,14 @@ class VideoReplayTest {
         var framesTracked = 0
         var framesProcessed = 0
         var locked = false
-        var wasSearching = false
-        var prevFramesLost = 0
 
+        // Track state transitions by sampling BEFORE and AFTER each processBitmap call.
+        // The callback approach misses transitions that happen within a single processFrame
+        // (e.g. LOST→REACQUIRE in the same call when the object disappears and reappears).
         ot.onDetectionResult = { _, lockedObject, _, _, _ ->
-            val nowLost = ot.reacquisition.framesLost
-            val isSearching = ot.reacquisition.isSearching
-
-            if (locked) {
-                when {
-                    wasSearching && lockedObject != null && nowLost == 0 ->
-                        events.add(ReplayEvent(framesProcessed, "REACQUIRE",
-                            lockedObject.id, lockedObject.label))
-                    nowLost == 1 && prevFramesLost == 0 ->
-                        events.add(ReplayEvent(framesProcessed, "LOST"))
-                    ot.reacquisition.hasTimedOut && prevFramesLost <= ot.reacquisition.maxFramesLost ->
-                        events.add(ReplayEvent(framesProcessed, "TIMEOUT"))
-                }
-                if (nowLost == 0) framesTracked++
-                wasSearching = isSearching
-                prevFramesLost = nowLost
-            }
+            if (locked && ot.reacquisition.framesLost == 0) framesTracked++
         }
 
-        // Decode and process frames with natural frame dropping.
-        // The decoder callback returns how many frames to skip after each processed
-        // frame. Skipped frames are drained from the codec without YUV→Bitmap
-        // conversion, so they're fast. This matches live behavior where the pipeline
-        // processes one frame and drops any that arrived during processing.
         var totalVideoFrames = 0
 
         val decoder = VideoFrameDecoder(videoFile)
@@ -270,14 +250,30 @@ class VideoReplayTest {
                 locked = true
                 framesTracked++
                 Log.i(TAG, "Locked on $lockLabel at frame $frameIndex box=$lockBox")
-                return@decodeAll 0 // process next frame immediately
+                return@decodeAll 0
             } else if (locked) {
+                // Snapshot state BEFORE processing
+                val wasSearching = ot.reacquisition.isSearching
+                val prevLost = ot.reacquisition.framesLost
+
                 val startMs = System.currentTimeMillis()
                 ot.processBitmap(bitmap)
                 val processingMs = System.currentTimeMillis() - startMs
 
+                // Check state AFTER processing to detect transitions
+                val nowLost = ot.reacquisition.framesLost
+                val lockedObj = if (nowLost == 0 && prevLost > 0) ot.reacquisition.lockedId else null
+                when {
+                    wasSearching && lockedObj != null && nowLost == 0 ->
+                        events.add(ReplayEvent(framesProcessed, "REACQUIRE",
+                            lockedObj, ot.reacquisition.lastKnownLabel))
+                    nowLost == 1 && prevLost == 0 ->
+                        events.add(ReplayEvent(framesProcessed, "LOST"))
+                    ot.reacquisition.hasTimedOut && prevLost <= ot.reacquisition.maxFramesLost ->
+                        events.add(ReplayEvent(framesProcessed, "TIMEOUT"))
+                }
+
                 framesProcessed++
-                // Skip frames that would have arrived during processing
                 val framesToSkip = ((processingMs / frameDurationMs).toInt() - 1).coerceAtLeast(0)
                 return@decodeAll framesToSkip
             }
@@ -285,7 +281,7 @@ class VideoReplayTest {
         }
         decoder.release()
 
-        val framesDropped = totalVideoFrames - framesProcessed - 1 // -1 for lock frame
+        val framesDropped = totalVideoFrames - framesProcessed - 1
         val result = ReplayResult(events, framesTracked, framesProcessed)
         Log.i(TAG, "Replay complete: $framesProcessed processed / $totalVideoFrames total " +
             "($framesDropped dropped, ${framesDropped * 100 / totalVideoFrames.coerceAtLeast(1)}% drop rate), " +
