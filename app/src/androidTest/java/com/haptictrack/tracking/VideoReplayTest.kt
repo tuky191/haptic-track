@@ -118,6 +118,33 @@ class VideoReplayTest {
             result.trackingRate >= 50)
     }
 
+    @Test
+    fun boy_indoor_wife_swap_reacquires_correctly() {
+        val result = replayVideo("boy_indoor_wife_swap")
+
+        assertTrue("Should reacquire at least once, got ${result.reacquisitions}",
+            result.reacquisitions >= 1)
+        assertFalse("Should not timeout", result.timedOut)
+
+        val wrong = result.wrongCategoryReacqs(PERSON_LABELS)
+        assertTrue("Should never reacquire non-person (got: ${wrong.map { "${it.label}@F${it.frame}" }})",
+            wrong.isEmpty())
+
+        Log.i(TAG, "boy_indoor_wife_swap: trackingRate=${result.trackingRate}% " +
+            "reacqs=${result.reacquisitions} losses=${result.losses} " +
+            "totalFrames=${result.totalFrames}")
+    }
+
+    @Test
+    fun boy_indoor_wife_swap_tracking_rate() {
+        val result = replayVideo("boy_indoor_wife_swap")
+
+        // This scenario has a known bug: tracking jumps from son to wife.
+        // Set a low floor initially — we'll tighten as we fix the person swap issue.
+        assertTrue("Tracking rate should be >= 30%, got ${result.trackingRate}%",
+            result.trackingRate >= 30)
+    }
+
     // --- Replay infrastructure ---
 
     data class ReplayEvent(
