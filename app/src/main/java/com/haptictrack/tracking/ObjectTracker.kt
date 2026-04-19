@@ -242,8 +242,9 @@ class ObjectTracker(
 
                     if (confirmed) {
                         vtUnconfirmedFrames = 0
-                        // Sync lastKnownBox in screen coords when detector confirms
+                        // Sync lastKnownBox and velocity in screen coords when detector confirms
                         reacquisition.updateFromVisualTracker(vtBox)
+                        reacquisition.updateVelocity(velocityEstimator.velocityX, velocityEstimator.velocityY)
 
                         // Accumulate embedding from current angle (every 30 confirmed frames ≈ 1s)
                         // Use raw rotated-image coords for embedding (embedder works on rotated bitmap)

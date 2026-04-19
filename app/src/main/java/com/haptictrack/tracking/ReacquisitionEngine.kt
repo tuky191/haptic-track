@@ -73,6 +73,11 @@ class ReacquisitionEngine(
         private set
     var lastKnownSize: Float = 0f
         private set
+    /** Last known velocity (normalized units/frame) from VelocityEstimator. */
+    var lastKnownVelocityX: Float = 0f
+        private set
+    var lastKnownVelocityY: Float = 0f
+        private set
     var framesLost: Int = 0
         private set
 
@@ -99,6 +104,8 @@ class ReacquisitionEngine(
         lastKnownBox = RectF(boundingBox)
         lastKnownLabel = label
         lastKnownSize = boundingBox.width() * boundingBox.height()
+        lastKnownVelocityX = 0f
+        lastKnownVelocityY = 0f
         framesLost = 0
         val attrStr = personAttrs?.summary() ?: "n/a"
         dualLog(Log.INFO, "LOCK id=$trackingId label=\"$label\" box=${fmtBox(boundingBox)} size=${fmtF(lastKnownSize)} gallery=${embeddingGallery.size} colorHist=${colorHist != null} attrs=\"$attrStr\"")
@@ -137,6 +144,8 @@ class ReacquisitionEngine(
         lockedFaceEmbedding = null
         lastKnownBox = null
         lastKnownLabel = null
+        lastKnownVelocityX = 0f
+        lastKnownVelocityY = 0f
         lastKnownSize = 0f
         framesLost = 0
     }
@@ -209,6 +218,12 @@ class ReacquisitionEngine(
         lastKnownBox = RectF(boundingBox)
         lastKnownSize = boundingBox.width() * boundingBox.height()
         framesLost = 0
+    }
+
+    /** Update last-known velocity from VelocityEstimator (normalized units/frame). */
+    fun updateVelocity(vx: Float, vy: Float) {
+        lastKnownVelocityX = vx
+        lastKnownVelocityY = vy
     }
 
     /**
@@ -318,8 +333,18 @@ class ReacquisitionEngine(
         val labelOverride = hasAppearance && appearanceScore > APPEARANCE_OVERRIDE_THRESHOLD
 
         // --- GATE A: Position hard filter (with time decay) ---
-        val dx = candBox.centerX() - refBox.centerX()
-        val dy = candBox.centerY() - refBox.centerY()
+        // Use velocity-predicted position when available. If the subject was moving
+        // right at 3%/frame and we lost it 5 frames ago, look 15% to the right
+        // of the last known position instead of at the last known position itself.
+        val velocitySpeed = kotlin.math.sqrt(lastKnownVelocityX * lastKnownVelocityX + lastKnownVelocityY * lastKnownVelocityY)
+        val predictedCenterX = if (velocitySpeed > 0.01f) {
+            (refBox.centerX() + lastKnownVelocityX * framesLost).coerceIn(0f, 1f)
+        } else refBox.centerX()
+        val predictedCenterY = if (velocitySpeed > 0.01f) {
+            (refBox.centerY() + lastKnownVelocityY * framesLost).coerceIn(0f, 1f)
+        } else refBox.centerY()
+        val dx = candBox.centerX() - predictedCenterX
+        val dy = candBox.centerY() - predictedCenterY
         val distance = kotlin.math.sqrt(dx * dx + dy * dy)
 
         if (distance > posThreshold && !geometricOverride) return null
