@@ -12,20 +12,16 @@ import java.io.File
 /**
  * Decodes an MP4 video file into a sequence of Bitmaps using MediaExtractor + MediaCodec.
  *
- * Usage:
- * ```
- * val decoder = VideoFrameDecoder(File("/path/to/video.mp4"))
- * decoder.decodeAll { frameIndex, bitmap ->
- *     // process bitmap (it will be recycled after callback returns)
- * }
- * decoder.release()
- * ```
+ * Supports frame skipping: the callback returns how many frames to skip before
+ * the next decode. Skipped frames are drained from the codec without the expensive
+ * YUV→Bitmap conversion, matching live camera behavior where the pipeline processes
+ * one frame and drops any that arrived during processing.
  */
 class VideoFrameDecoder(private val videoFile: File) {
 
     companion object {
         private const val TAG = "VideoFrameDec"
-        private const val TIMEOUT_US = 10_000L // 10ms dequeue timeout
+        private const val TIMEOUT_US = 10_000L
     }
 
     private val extractor = MediaExtractor()
@@ -46,13 +42,14 @@ class VideoFrameDecoder(private val videoFile: File) {
     }
 
     /**
-     * Decode all frames from the video, calling [onFrame] for each.
-     * The bitmap passed to onFrame is recycled after the callback returns.
+     * Decode frames from the video, calling [onFrame] for each processed frame.
      *
-     * @param targetWidth If > 0, decoded frames are downscaled to approximately this width.
-     *                    Use 0 to keep original resolution.
+     * @param targetWidth Decoded frames are downscaled to approximately this width.
+     * @param onFrame Called with (frameIndex, bitmap). Returns the number of frames
+     *                to skip after this one (0 = process next frame, 3 = skip 3 frames).
+     *                The bitmap is NOT recycled by the decoder — caller is responsible.
      */
-    fun decodeAll(targetWidth: Int = 640, onFrame: (frameIndex: Int, bitmap: Bitmap) -> Unit) {
+    fun decodeAll(targetWidth: Int = 640, onFrame: (frameIndex: Int, bitmap: Bitmap) -> Int) {
         extractor.selectTrack(videoTrackIndex)
         val format = extractor.getTrackFormat(videoTrackIndex)
         val mime = format.getString(MediaFormat.KEY_MIME)!!
@@ -61,7 +58,6 @@ class VideoFrameDecoder(private val videoFile: File) {
         Log.i(TAG, "Video: ${videoFile.name} ${width}x${height} mime=$mime")
 
         val codec = MediaCodec.createDecoderByType(mime)
-        // Request ARGB output for easy Bitmap conversion
         format.setInteger(MediaFormat.KEY_COLOR_FORMAT,
             android.media.MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
         codec.configure(format, null, null, 0)
@@ -71,6 +67,9 @@ class VideoFrameDecoder(private val videoFile: File) {
         val bufferInfo = MediaCodec.BufferInfo()
         var inputDone = false
         var frameIndex = 0
+        var framesToSkip = 0
+        var framesDecoded = 0
+        var framesSkipped = 0
 
         while (true) {
             // Feed input
@@ -99,12 +98,21 @@ class VideoFrameDecoder(private val videoFile: File) {
                     break
                 }
 
+                if (framesToSkip > 0) {
+                    // Skip this frame — release without converting to bitmap
+                    codec.releaseOutputBuffer(outputIndex, false)
+                    framesToSkip--
+                    framesSkipped++
+                    frameIndex++
+                    continue
+                }
+
+                // Process this frame
                 val image = codec.getOutputImage(outputIndex)
                 if (image != null) {
                     var bitmap = imageToBitmap(image)
                     image.close()
 
-                    // Downscale if requested
                     if (targetWidth > 0 && bitmap.width > targetWidth) {
                         val scale = targetWidth.toFloat() / bitmap.width
                         val scaled = Bitmap.createScaledBitmap(bitmap,
@@ -114,9 +122,8 @@ class VideoFrameDecoder(private val videoFile: File) {
                         bitmap = scaled
                     }
 
-                    onFrame(frameIndex, bitmap)
-                    // Note: caller is responsible for recycling the bitmap
-                    // (ObjectTracker.processBitmapInternal recycles in its finally block)
+                    framesToSkip = onFrame(frameIndex, bitmap)
+                    framesDecoded++
                     frameIndex++
                 }
 
@@ -126,7 +133,7 @@ class VideoFrameDecoder(private val videoFile: File) {
             }
         }
 
-        Log.i(TAG, "Decoded $frameIndex frames from ${videoFile.name}")
+        Log.i(TAG, "Done: $framesDecoded decoded, $framesSkipped skipped, $frameIndex total from ${videoFile.name}")
     }
 
     fun release() {
@@ -136,9 +143,6 @@ class VideoFrameDecoder(private val videoFile: File) {
         extractor.release()
     }
 
-    /**
-     * Convert a YUV Image from MediaCodec to an ARGB Bitmap.
-     */
     private fun imageToBitmap(image: Image): Bitmap {
         require(image.format == ImageFormat.YUV_420_888) {
             "Unexpected image format: ${image.format}"
@@ -169,7 +173,6 @@ class VideoFrameDecoder(private val videoFile: File) {
                 val u = uBuffer.get(uvIndex).toInt() and 0xFF
                 val v = vBuffer.get(uvIndex).toInt() and 0xFF
 
-                // YUV to RGB
                 val yVal = y - 16
                 val uVal = u - 128
                 val vVal = v - 128

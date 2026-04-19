@@ -87,10 +87,35 @@ class VideoReplayTest {
     fun man_desk_camera_swing_tracking_rate() {
         val result = replayVideo("man_desk_camera_swing")
 
-        // Baseline: 86% from full pipeline (vs 58% from scenario replay which lacks VitTracker).
-        // 942 frames, 5 losses, 5 reacqs, all person labels.
-        assertTrue("Tracking rate should be >= 75% (baseline: 86%), got ${result.trackingRate}%",
-            result.trackingRate >= 75)
+        // Baseline with natural frame dropping: 66% tracked, 3 reacqs, 3 losses.
+        // 130 frames processed / 943 total (86% drop rate — matches live behavior).
+        assertTrue("Tracking rate should be >= 55% (baseline: 66%), got ${result.trackingRate}%",
+            result.trackingRate >= 55)
+    }
+
+    @Test
+    fun person_playground_reacquires_correctly() {
+        val result = replayVideo("person_playground_tracking")
+
+        assertTrue("Should reacquire at least 2 times, got ${result.reacquisitions}",
+            result.reacquisitions >= 2)
+        assertFalse("Should not timeout", result.timedOut)
+
+        val wrong = result.wrongCategoryReacqs(PERSON_LABELS)
+        assertTrue("Should never reacquire non-person (got: ${wrong.map { "${it.label}@F${it.frame}" }})",
+            wrong.isEmpty())
+
+        Log.i(TAG, "person_playground: trackingRate=${result.trackingRate}% " +
+            "reacqs=${result.reacquisitions} losses=${result.losses} " +
+            "totalFrames=${result.totalFrames}")
+    }
+
+    @Test
+    fun person_playground_tracking_rate() {
+        val result = replayVideo("person_playground_tracking")
+
+        assertTrue("Tracking rate should be >= 50%, got ${result.trackingRate}%",
+            result.trackingRate >= 50)
     }
 
     // --- Replay infrastructure ---
@@ -131,7 +156,14 @@ class VideoReplayTest {
      * - lockBox: normalized bounding box [0,1] to lock on
      * - lockLabel: COCO label to lock with
      * - analysisWidth: downscale width for frames (default 640, matches production)
-     * - skipFrames: process every Nth frame to speed up test (default 1 = every frame)
+     * - fps: video framerate, used for natural frame dropping (default 30)
+     *
+     * Frame dropping simulates live camera behavior: the pipeline processes one
+     * frame at a time via processBitmap(). While processing, the camera keeps
+     * producing frames. When the pipeline is ready for the next frame, it grabs
+     * the LATEST — skipping any that arrived during processing. This test
+     * measures actual processBitmap() wall time and advances the frame index
+     * accordingly, so frame dropping matches what happens on-device.
      */
     private fun replayVideo(name: String): ReplayResult {
         val videoFile = File(testVideoDir, "$name.mp4")
@@ -150,7 +182,8 @@ class VideoReplayTest {
         )
         val lockLabel = spec.getString("lockLabel")
         val analysisWidth = spec.optInt("analysisWidth", 640)
-        val skipFrames = spec.optInt("skipFrames", 1)
+        val fps = spec.optInt("fps", 30)
+        val frameDurationMs = 1000L / fps
 
         // Initialize ObjectTracker with real models
         val context = ApplicationProvider.getApplicationContext<android.app.Application>()
@@ -167,25 +200,24 @@ class VideoReplayTest {
         // Collect events from the callback
         val events = mutableListOf<ReplayEvent>()
         var framesTracked = 0
-        var frameCount = 0
+        var framesProcessed = 0
         var locked = false
         var wasSearching = false
         var prevFramesLost = 0
 
-        ot.onDetectionResult = { allObjects, lockedObject, _, _, _ ->
+        ot.onDetectionResult = { _, lockedObject, _, _, _ ->
             val nowLost = ot.reacquisition.framesLost
             val isSearching = ot.reacquisition.isSearching
 
             if (locked) {
-                // Track events
                 when {
                     wasSearching && lockedObject != null && nowLost == 0 ->
-                        events.add(ReplayEvent(frameCount, "REACQUIRE",
+                        events.add(ReplayEvent(framesProcessed, "REACQUIRE",
                             lockedObject.id, lockedObject.label))
                     nowLost == 1 && prevFramesLost == 0 ->
-                        events.add(ReplayEvent(frameCount, "LOST"))
+                        events.add(ReplayEvent(framesProcessed, "LOST"))
                     ot.reacquisition.hasTimedOut && prevFramesLost <= ot.reacquisition.maxFramesLost ->
-                        events.add(ReplayEvent(frameCount, "TIMEOUT"))
+                        events.add(ReplayEvent(framesProcessed, "TIMEOUT"))
                 }
                 if (nowLost == 0) framesTracked++
                 wasSearching = isSearching
@@ -193,32 +225,43 @@ class VideoReplayTest {
             }
         }
 
-        // Decode and process frames
+        // Decode and process frames with natural frame dropping.
+        // The decoder callback returns how many frames to skip after each processed
+        // frame. Skipped frames are drained from the codec without YUV→Bitmap
+        // conversion, so they're fast. This matches live behavior where the pipeline
+        // processes one frame and drops any that arrived during processing.
+        var totalVideoFrames = 0
+
         val decoder = VideoFrameDecoder(videoFile)
         decoder.decodeAll(targetWidth = analysisWidth) { frameIndex, bitmap ->
-            if (frameIndex % skipFrames != 0) return@decodeAll
+            totalVideoFrames = frameIndex + 1
 
             if (frameIndex == lockFrame && !locked) {
-                // Feed one frame first so ObjectTracker has lastFrameBitmap.
-                // processBitmapInternal recycles the bitmap in its finally block,
-                // so we need a separate copy for the lock frame.
                 val forProcess = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
                 ot.processBitmap(forProcess)
-                // Now lock — lockOnObject reads lastFrameBitmap (set by processBitmap)
                 ot.lockOnObject(trackingId = 1, boundingBox = lockBox, label = lockLabel)
                 locked = true
-                framesTracked++ // lock frame counts as tracked
+                framesTracked++
                 Log.i(TAG, "Locked on $lockLabel at frame $frameIndex box=$lockBox")
+                return@decodeAll 0 // process next frame immediately
             } else if (locked) {
-                // processBitmapInternal recycles bitmap in its finally block
+                val startMs = System.currentTimeMillis()
                 ot.processBitmap(bitmap)
-                frameCount++
+                val processingMs = System.currentTimeMillis() - startMs
+
+                framesProcessed++
+                // Skip frames that would have arrived during processing
+                val framesToSkip = ((processingMs / frameDurationMs).toInt() - 1).coerceAtLeast(0)
+                return@decodeAll framesToSkip
             }
+            return@decodeAll 0
         }
         decoder.release()
 
-        val result = ReplayResult(events, framesTracked, frameCount)
-        Log.i(TAG, "Replay complete: ${result.totalFrames} frames, " +
+        val framesDropped = totalVideoFrames - framesProcessed - 1 // -1 for lock frame
+        val result = ReplayResult(events, framesTracked, framesProcessed)
+        Log.i(TAG, "Replay complete: $framesProcessed processed / $totalVideoFrames total " +
+            "($framesDropped dropped, ${framesDropped * 100 / totalVideoFrames.coerceAtLeast(1)}% drop rate), " +
             "${result.trackingRate}% tracked, ${result.reacquisitions} reacqs, " +
             "${result.losses} losses, timedOut=${result.timedOut}")
         Log.i(TAG, "Events: ${result.events}")

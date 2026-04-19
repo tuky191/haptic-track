@@ -365,6 +365,33 @@ class ScenarioReplayTest {
         assertNeverReacquiresLabel(result, "clock")
     }
 
+    // person_playground_tracking: locked on son at playground, small box far away.
+    // Fast movement, outdoor scene with cars/benches/other people.
+    // 274 frames. On-device: 5 losses, 5 reacqs with gallery accumulation.
+    // Scenario replay is limited: lock-time embeddings don't cover angle changes
+    // during tracking, so embedding similarity is low. The video replay test on
+    // device is the authoritative test for this scenario.
+
+    @Test
+    fun `playground - no wrong-category reacquisitions`() {
+        val scenario = loadScenario("person_playground_tracking.json")
+        val result = replay(scenario)
+
+        val wrong = result.wrongCategoryReacqs(PERSON_LABELS)
+        assertTrue("Should never reacquire non-person (got: ${wrong.map { "${it.label}@F${it.frame}" }})",
+            wrong.isEmpty())
+        assertNeverReacquiresLabel(result, "car")
+        assertNeverReacquiresLabel(result, "bench")
+    }
+
+    @Test
+    fun `playground - should not timeout`() {
+        val scenario = loadScenario("person_playground_tracking.json")
+        val result = replay(scenario)
+
+        assertFalse("Should not timeout", result.timedOut)
+    }
+
     // --- Helpers for building synthetic scenarios ---
 
     data class SyntheticDetection(
