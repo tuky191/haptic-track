@@ -28,8 +28,12 @@ class ReacquisitionEngine(
 
     companion object {
         private const val TAG = "Reacq"
-        /** Embedding similarity above this bypasses position/size hard filters. */
+        /** Embedding similarity above this bypasses the label gate (cross-category protection). */
         const val APPEARANCE_OVERRIDE_THRESHOLD = 0.7f
+        /** Embedding similarity above this bypasses position/size hard filters.
+         *  Lower than label override because position rejection is a different risk
+         *  than cross-category leakage — 0.55 is enough to say "same object, just moved." */
+        const val GEOMETRIC_OVERRIDE_THRESHOLD = 0.55f
         /** Maximum embeddings to keep in gallery. */
         const val MAX_GALLERY_SIZE = 12
     }
@@ -295,15 +299,19 @@ class ReacquisitionEngine(
         val appearanceScore = if (hasAppearance) {
             bestGallerySimilarity(candidate.embedding!!).coerceIn(0f, 1f)
         } else 0f
-        val strongVisualMatch = hasAppearance && appearanceScore > APPEARANCE_OVERRIDE_THRESHOLD
+        // Tiered override: geometric gates use a lower threshold (0.55) because
+        // position rejection is about camera movement, not identity confusion.
+        // Label gate uses a higher threshold (0.7) to protect against cross-category leakage.
+        val geometricOverride = hasAppearance && appearanceScore > GEOMETRIC_OVERRIDE_THRESHOLD
+        val labelOverride = hasAppearance && appearanceScore > APPEARANCE_OVERRIDE_THRESHOLD
 
         // --- GATE A: Position hard filter (with time decay) ---
         val dx = candBox.centerX() - refBox.centerX()
         val dy = candBox.centerY() - refBox.centerY()
         val distance = kotlin.math.sqrt(dx * dx + dy * dy)
 
-        if (distance > posThreshold && !strongVisualMatch) return null
-        if (distance > posThreshold && strongVisualMatch) {
+        if (distance > posThreshold && !geometricOverride) return null
+        if (distance > posThreshold && geometricOverride) {
             dualLog(Log.DEBUG, "  OVERRIDE position: dist=${fmtF(distance)} > thresh=${fmtF(posThreshold)}, but sim=${fmtF(appearanceScore)}")
         }
 
@@ -313,8 +321,8 @@ class ReacquisitionEngine(
             if (candSize > lastKnownSize) candSize / lastKnownSize else lastKnownSize / candSize
         } else 1f
         val effectiveSizeThreshold = effectiveSizeRatioThreshold()
-        if (sizeRatio > effectiveSizeThreshold && !strongVisualMatch) return null
-        if (sizeRatio > effectiveSizeThreshold && strongVisualMatch) {
+        if (sizeRatio > effectiveSizeThreshold && !geometricOverride) return null
+        if (sizeRatio > effectiveSizeThreshold && geometricOverride) {
             dualLog(Log.DEBUG, "  OVERRIDE size: ratio=${fmtF(sizeRatio)} > thresh=${fmtF(effectiveSizeThreshold)}, but sim=${fmtF(appearanceScore)}")
         }
 
@@ -322,13 +330,14 @@ class ReacquisitionEngine(
         // Wrong-label candidates are rejected outright unless a strong embedding
         // indicates it's the same object with a flickered label. This prevents
         // cross-category leakage (e.g. person matching a locked chair via color).
+        // Uses higher threshold (0.7) than geometric gates.
         val labelMatches = lockedLabel != null && (
             candidate.label == lockedLabel || candidate.label == lockedCocoLabel
         )
         when {
             lockedLabel == null -> { /* pass: no label constraint */ }
             labelMatches -> { /* pass: correct label */ }
-            strongVisualMatch -> {
+            labelOverride -> {
                 dualLog(Log.DEBUG, "  OVERRIDE label: \"${candidate.label}\" != \"$lockedLabel\", but sim=${fmtF(appearanceScore)}")
             }
             else -> return null  // REJECT: wrong label, no embedding override

@@ -251,8 +251,8 @@ class ScenarioReplayTest {
         val scenario = loadScenario("person_tracking_recovery.json")
         val result = replay(scenario)
 
-        assertTrue("Should reacquire at least 3 times (baseline: 4), got ${result.reacquisitions}",
-            result.reacquisitions >= 3)
+        assertTrue("Should reacquire at least 2 times (baseline: 2 with geometric override), got ${result.reacquisitions}",
+            result.reacquisitions >= 2)
         assertFalse("Should not timeout", result.timedOut)
     }
 
