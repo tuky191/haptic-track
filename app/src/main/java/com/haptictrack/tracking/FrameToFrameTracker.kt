@@ -12,11 +12,75 @@ import android.util.Log
  * unmatched ones get a new ID.
  */
 class FrameToFrameTracker(
-    private val minIou: Float = 0.2f
+    private val minIou: Float = 0.2f,
+    /** Lower IoU threshold when velocity prediction shifts boxes before matching. */
+    private val minIouWithPrediction: Float = 0.1f
 ) {
 
     private var nextId: Int = 1
     private var previousFrame: List<TrackedObject> = emptyList()
+
+    /**
+     * Velocity-aware ID matching: shifts previous frame's boxes by the velocity
+     * vector before computing IoU. This handles fast-moving objects that would
+     * otherwise lose their ID because the box displacement exceeds the IoU threshold.
+     *
+     * Uses a lower IoU threshold ([minIouWithPrediction]) since the prediction
+     * accounts for most of the displacement.
+     */
+    fun assignIdsWithVelocity(
+        detections: List<TrackedObject>,
+        velocityX: Float,
+        velocityY: Float
+    ): List<TrackedObject> {
+        if (previousFrame.isEmpty()) {
+            val result = detections.map { it.copy(id = nextId++) }
+            previousFrame = result
+            return result
+        }
+
+        // Shift previous boxes by velocity to predict where they should be now
+        val shiftedPrev = previousFrame.map { prev ->
+            val shifted = RectF(
+                (prev.boundingBox.left + velocityX).coerceIn(0f, 1f),
+                (prev.boundingBox.top + velocityY).coerceIn(0f, 1f),
+                (prev.boundingBox.right + velocityX).coerceIn(0f, 1f),
+                (prev.boundingBox.bottom + velocityY).coerceIn(0f, 1f)
+            )
+            prev.copy(boundingBox = shifted)
+        }
+
+        val used = mutableSetOf<Int>()
+        val result = mutableListOf<TrackedObject>()
+
+        for (detection in detections) {
+            var bestIdx = -1
+            var bestIou = minIouWithPrediction
+
+            for ((idx, prev) in shiftedPrev.withIndex()) {
+                if (idx in used) continue
+                val iou = computeIou(detection.boundingBox, prev.boundingBox)
+                if (iou > bestIou) {
+                    bestIou = iou
+                    bestIdx = idx
+                }
+            }
+
+            if (bestIdx >= 0) {
+                val prevId = previousFrame[bestIdx].id
+                used.add(bestIdx)
+                result.add(detection.copy(id = prevId))
+                Log.v("FTFTracker", "MATCH(vel) label=\"${detection.label}\" iou=${String.format("%.2f", bestIou)} → id=$prevId")
+            } else {
+                val newId = nextId++
+                result.add(detection.copy(id = newId))
+                Log.d("FTFTracker", "NEW label=\"${detection.label}\" → id=$newId box=[${String.format("%.2f,%.2f,%.2f,%.2f", detection.boundingBox.left, detection.boundingBox.top, detection.boundingBox.right, detection.boundingBox.bottom)}]")
+            }
+        }
+
+        previousFrame = result
+        return result
+    }
 
     fun assignIds(detections: List<TrackedObject>): List<TrackedObject> {
         if (previousFrame.isEmpty()) {

@@ -321,7 +321,16 @@ class ObjectTracker(
 
             // --- Detector path: detection + re-acquisition ---
             val detections = runDetector(bitmap, frameWidth, frameHeight, deviceRotation)
-            val tracked = frameTracker.assignIds(detections)
+            // Use velocity-shifted matching when tracking a fast-moving subject.
+            // Shifts previous frame's boxes by velocity before IoU matching,
+            // preventing ID churn from large displacements between frames.
+            val tracked = if (velocityEstimator.speed > 0.01f && reacquisition.isLocked) {
+                frameTracker.assignIdsWithVelocity(
+                    detections, velocityEstimator.velocityX, velocityEstimator.velocityY
+                )
+            } else {
+                frameTracker.assignIds(detections)
+            }
 
             // Compute embeddings when searching OR when the direct ID match might
             // fail (framesLost==0 but tracking ID likely changed after visual tracker
