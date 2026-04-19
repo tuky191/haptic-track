@@ -186,4 +186,63 @@ class ZoomControllerTest {
         assertFalse("Reset should clear manual override", zoom.manualOverride)
         assertEquals(1f, zoom.getCurrentZoom(), 0.001f)
     }
+
+    // --- Gradual zoom-out on loss ---
+
+    @Test
+    fun `gradual zoom-out does not change zoom during delay`() {
+        zoom.setManualZoom(3f, minZoom = 1f, maxZoom = 5f)
+        val before = zoom.getCurrentZoom()
+
+        // First 4 frames should not zoom out (delay = 5)
+        repeat(4) {
+            zoom.zoomOutForSearchGradual(minZoom = 1f, maxZoom = 5f)
+        }
+        assertEquals("Zoom should not change during delay", before, zoom.getCurrentZoom(), 0.001f)
+    }
+
+    @Test
+    fun `gradual zoom-out starts after delay`() {
+        zoom.setManualZoom(3f, minZoom = 1f, maxZoom = 5f)
+        val before = zoom.getCurrentZoom()
+
+        // 5 frames = delay expires, 6th should start zoom-out
+        repeat(6) {
+            zoom.zoomOutForSearchGradual(minZoom = 1f, maxZoom = 5f)
+        }
+        assertTrue("Zoom should decrease after delay", zoom.getCurrentZoom() < before)
+    }
+
+    @Test
+    fun `gradual zoom-out preserves zoom during critical reacquisition window`() {
+        // Gradual path: zoom stays at 3.0 for the first 4 frames (delay)
+        val gradual = ZoomController(targetFrameOccupancy = 0.15f, zoomSpeed = 0.05f)
+        gradual.setManualZoom(3f, minZoom = 1f, maxZoom = 5f)
+
+        // Immediate path: zoom drops to ~2.1 on first call
+        val immediate = ZoomController(targetFrameOccupancy = 0.15f, zoomSpeed = 0.05f)
+        immediate.setManualZoom(3f, minZoom = 1f, maxZoom = 5f)
+        immediate.zoomOutForSearch(minZoom = 1f, maxZoom = 5f)
+
+        // During the critical first 4 frames, gradual holds at original zoom
+        repeat(4) {
+            gradual.zoomOutForSearchGradual(minZoom = 1f, maxZoom = 5f)
+            assertTrue("Gradual should preserve zoom during delay (frame ${it+1})",
+                gradual.getCurrentZoom() > immediate.getCurrentZoom())
+        }
+    }
+
+    @Test
+    fun `resetLossCounter resets delay`() {
+        zoom.setManualZoom(3f, minZoom = 1f, maxZoom = 5f)
+
+        // Accumulate 4 loss frames
+        repeat(4) { zoom.zoomOutForSearchGradual(minZoom = 1f, maxZoom = 5f) }
+        zoom.resetLossCounter()
+
+        // 4 more frames — still within delay because counter was reset
+        val before = zoom.getCurrentZoom()
+        repeat(4) { zoom.zoomOutForSearchGradual(minZoom = 1f, maxZoom = 5f) }
+        assertEquals("Zoom should not change after reset + 4 frames", before, zoom.getCurrentZoom(), 0.001f)
+    }
 }
