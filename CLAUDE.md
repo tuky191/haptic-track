@@ -17,7 +17,7 @@ All changes follow this flow — never commit directly to master:
 
 ```bash
 ./gradlew assembleDebug          # Build debug APK
-./gradlew testDebugUnitTest      # Run unit tests (~3s, 183 tests)
+./gradlew testDebugUnitTest      # Run unit tests (~3s, 184 tests)
 adb install -r app/build/outputs/apk/debug/app-debug.apk  # Deploy to device
 
 adb logcat -d -s "Reacq" -s "VisualTracker" -s "FTFTracker" -s "Yolov8Det"  # Pull tracking logs
@@ -277,19 +277,21 @@ Position (50%, decays) + size (25%) + base bonus (25%). All survivors already pa
 ## Current Work (may be stale — verify with git/GitHub)
 
 **Recently merged to master:**
+- PR #42 — GPU delegate for all models, FP16 detector, adaptive frame skip, stealth mode, dependency bumps
+- PR #40 — Regression baseline scenarios with quantitative thresholds
 - PR #37 — Manual camera controls: pinch zoom, 4K recording via 2/3-stream switching, stealth mode, volume-down hands-free cycle
 - PR #36 — Person identity: face embedding (MobileFaceNet) + body re-ID (OSNet x1.0)
 - PR #31 — Cascade scoring refactor (#30 phases 1+2), scenario recorder + replay harness
 - PR #29 — Two-stage detection (EfficientDet-Lite2 + YOLOv8n-oiv7 label enrichment)
 
 **Open issues:**
+- **#43** — Tracking responsiveness for fast-moving subjects (kids, pets)
+- **#38** — Photo capture + recording speed control
 - **#35** — Auto-lock on predefined criteria (label + attributes)
-- **#30** — Phase 3 remaining: capture more real-world scenarios for replay test coverage
-- **#14** — Partially done: zoom + recording done; photo capture + recording speed remain
+- **#30** — Phase 3: more scenario captures
 - **#20** — Upside-down tracking
 - **#21** — Image stabilization
 - **#27** — Clothing color accuracy
-- **#34, #32, #23** — Can be closed (work merged)
 
 ## Key Design Decisions
 
@@ -509,7 +511,7 @@ All in constructor defaults — no settings UI yet:
 - [x] Auto-zoom from bounding box + pinch-to-zoom with manual override
 - [x] Volume-down hands-free cycle: lock center → record → stop+clear
 - [x] 4K video recording via dynamic 2/3-stream switching
-- [x] Stealth mode (black screen, full tracking + recording)
+- [x] Stealth mode (true stealth: blank screen, tap to exit, volume-down only)
 - [x] All-orientation support (portrait, landscape, upside down) with hysteresis
 - [x] GPU delegate for all 9 models (FP16 detector + FP32 others on Adreno 740)
 - [x] Adaptive frame skipping (skip detector when VT confident)
@@ -517,7 +519,9 @@ All in constructor defaults — no settings UI yet:
 - [x] Scenario recording + deterministic replay testing
 - [x] Off-device model quality testing (Python + MediaPipe)
 - [x] Cascade scoring (DeepSORT-style label gate + embedding-primary ranking)
-- [x] 174 unit tests
+- [x] Loading spinner with per-model status during GPU init
+- [x] Regression baseline scenarios (15 replay tests with quantitative thresholds)
+- [x] 184 unit tests
 
 ### Not built yet (from concept doc)
 - [ ] **Scenario replay validation (#30 phase 3)** — capture more real-world scenarios and validate cascade behavior against them. Phase 1 (recorder) and Phase 2 (cascade) are done.
@@ -526,8 +530,12 @@ All in constructor defaults — no settings UI yet:
 - [ ] **Settings UI** — all tunable parameters are constructor defaults with no runtime configuration
 - [ ] **Landscape UI** — the activity is portrait-locked. Detection works in all orientations but the UI doesn't rotate
 - [ ] **Battery/thermal management** — continuous ML + camera + haptics drains battery fast
+- [ ] **Tracking responsiveness (#43)** — fast-moving subjects (kids, pets) cause frequent lost/reacquire cycles. VT drift detection too aggressive, re-acquisition too slow, auto-zoom can't keep up.
+- [ ] **Photo capture + recording speed (#38)** — photo interval mode and slow-motion/timelapse
 
 ### Known issues
+- InteractiveSegmenter GPU delegate returns empty masks for crops >100K pixels on Adreno 740. Workaround: downscale to ~300x300 before segmenting (MAX_SEGMENT_PIXELS = 90000).
+- TFLite GPU delegate requires both `tensorflow-lite-gpu` and `tensorflow-lite-gpu-api` dependencies (GpuDelegateFactory$Options is in the api artifact).
 - Wrong-label candidates with strong embedding (>0.7) still pass the label gate — this handles genuine label flicker but could theoretically allow cross-category matches if the embedder is confused. In practice, sim>0.7 across categories is rare.
 - Visual tracker (VitTracker) dies quickly on small/transparent objects (bottles, glasses) — confidence drops below 0.25 within 2-3s, forcing unnecessary re-acquisition cycles.
 - Multiple visually similar objects of the same label (several bottles in a bathroom) are hard to distinguish — embedding similarity alone isn't enough.
