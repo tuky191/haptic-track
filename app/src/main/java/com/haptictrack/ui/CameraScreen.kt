@@ -15,8 +15,11 @@ import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -24,6 +27,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -280,105 +284,136 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                 Box(modifier = Modifier.fillMaxSize().background(Color.Black))
             }
 
-            // Bounding box / contour overlay
-            TrackingOverlay(
-                state = uiState,
-                bracketOpacity = bracketOpacity,
-                lockScale = lockPulse.value,
-                reacquireColorBlend = reacquireColorBlend,
-                lostOpacity = lostOpacity
-            )
+            // Loading overlay while ML models initialize on GPU
+            if (!uiState.isReady) {
+                Box(
+                    modifier = Modifier.fillMaxSize().background(Color.Black),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        CircularProgressIndicator(color = Color.White)
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Text(uiState.loadingStatus, color = Color.White, fontSize = 14.sp)
+                    }
+                }
+            }
 
-            // Label overlay (locked object only — kept for testing, remove later)
-            LockedLabelOverlay(uiState)
+            // In stealth mode, show nothing — completely black screen.
+            // Volume-down is the only control (lock → record → stop+clear).
+            // Tap anywhere to exit stealth.
+            if (!uiState.stealthMode) {
+                // Bounding box / contour overlay
+                TrackingOverlay(
+                    state = uiState,
+                    bracketOpacity = bracketOpacity,
+                    lockScale = lockPulse.value,
+                    reacquireColorBlend = reacquireColorBlend,
+                    lostOpacity = lostOpacity
+                )
 
-            // Status indicator
-            StatusBadge(
-                state = uiState,
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .padding(top = 64.dp)
-            )
+                // Label overlay (locked object only — kept for testing, remove later)
+                LockedLabelOverlay(uiState)
 
-            // Zoom level indicator — always visible when tracking, fades after pinch otherwise
-            val showZoomAlways = uiState.status == TrackingStatus.LOCKED || uiState.status == TrackingStatus.LOST
-            val zoomAlpha = if (showZoomAlways) 1f else zoomIndicatorOpacity.value
-            if (zoomAlpha > 0.01f) {
-                Text(
-                    text = "×${"%.1f".format(uiState.currentZoomRatio)}",
-                    color = Color.White.copy(alpha = zoomAlpha),
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.Medium,
+                // Status indicator
+                StatusBadge(
+                    state = uiState,
                     modifier = Modifier
                         .align(Alignment.TopCenter)
-                        .padding(top = 100.dp)
-                        .background(
-                            Color.Black.copy(alpha = 0.5f * zoomAlpha),
-                            RoundedCornerShape(16.dp)
-                        )
-                        .padding(horizontal = 12.dp, vertical = 4.dp)
+                        .padding(top = 64.dp)
                 )
-            }
 
-            // Capture mode selector (swipeable)
-            CaptureModePill(
-                captureMode = uiState.captureMode,
-                onToggle = { viewModel.toggleCaptureMode() },
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(bottom = 132.dp)
-            )
-
-            // Record button
-            RecordButton(
-                isRecording = uiState.isRecording,
-                captureMode = uiState.captureMode,
-                onClick = { viewModel.toggleRecording() },
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(bottom = 48.dp)
-            )
-
-            // Clear tracking button
-            if (uiState.status != TrackingStatus.IDLE) {
-                Button(
-                    onClick = { viewModel.clearTracking() },
-                    modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .padding(top = 64.dp, end = 16.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = Color.Black.copy(alpha = 0.5f))
-                ) {
-                    Text("Clear", color = Color.White)
+                // Zoom level indicator — always visible when tracking, fades after pinch otherwise
+                val showZoomAlways = uiState.status == TrackingStatus.LOCKED || uiState.status == TrackingStatus.LOST
+                val zoomAlpha = if (showZoomAlways) 1f else zoomIndicatorOpacity.value
+                if (zoomAlpha > 0.01f) {
+                    Text(
+                        text = "×${"%.1f".format(uiState.currentZoomRatio)}",
+                        color = Color.White.copy(alpha = zoomAlpha),
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .padding(top = 100.dp)
+                            .background(
+                                Color.Black.copy(alpha = 0.5f * zoomAlpha),
+                                RoundedCornerShape(16.dp)
+                            )
+                            .padding(horizontal = 12.dp, vertical = 4.dp)
+                    )
                 }
-            }
 
-            // Switch camera button
-            if (uiState.status == TrackingStatus.IDLE && !uiState.stealthMode) {
+                // Capture mode selector (swipeable)
+                CaptureModePill(
+                    captureMode = uiState.captureMode,
+                    onToggle = { viewModel.toggleCaptureMode() },
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 132.dp)
+                )
+
+                // Record button
+                RecordButton(
+                    isRecording = uiState.isRecording,
+                    captureMode = uiState.captureMode,
+                    onClick = { viewModel.toggleRecording() },
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 48.dp)
+                )
+
+                // Clear tracking button
+                if (uiState.status != TrackingStatus.IDLE) {
+                    Button(
+                        onClick = { viewModel.clearTracking() },
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(top = 64.dp, end = 16.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color.Black.copy(alpha = 0.5f))
+                    ) {
+                        Text("Clear", color = Color.White)
+                    }
+                }
+
+                // Switch camera button
+                if (uiState.status == TrackingStatus.IDLE) {
+                    Button(
+                        onClick = { viewModel.switchCamera() },
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
+                            .padding(top = 64.dp, start = 16.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color.Black.copy(alpha = 0.5f))
+                    ) {
+                        Text("\u21BB", color = Color.White, fontSize = 18.sp)
+                    }
+                }
+
+                // Stealth mode toggle
                 Button(
-                    onClick = { viewModel.switchCamera() },
+                    onClick = { viewModel.toggleStealthMode() },
                     modifier = Modifier
                         .align(Alignment.TopStart)
-                        .padding(top = 64.dp, start = 16.dp),
+                        .padding(top = if (uiState.status != TrackingStatus.IDLE) 64.dp else 112.dp, start = 16.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = Color.Black.copy(alpha = 0.5f))
                 ) {
-                    Text("\u21BB", color = Color.White, fontSize = 18.sp)
+                    Text("STEALTH", color = Color.White, fontSize = 12.sp)
                 }
-            }
-
-            // Stealth mode toggle
-            Button(
-                onClick = { viewModel.toggleStealthMode() },
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .padding(top = if (uiState.stealthMode || uiState.status != TrackingStatus.IDLE) 64.dp else 112.dp, start = 16.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (uiState.stealthMode) HapticRed.copy(alpha = 0.7f) else Color.Black.copy(alpha = 0.5f)
-                )
-            ) {
-                Text(
-                    if (uiState.stealthMode) "EXIT" else "STEALTH",
-                    color = Color.White,
-                    fontSize = 12.sp
+            } else {
+                // Stealth mode: tap anywhere to exit
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .pointerInput(Unit) {
+                            awaitPointerEventScope {
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    if (event.changes.any { it.pressed }) {
+                                        event.changes.forEach { it.consume() }
+                                        viewModel.toggleStealthMode()
+                                        break
+                                    }
+                                }
+                            }
+                        }
                 )
             }
         }

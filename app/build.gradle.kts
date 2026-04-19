@@ -6,7 +6,7 @@ plugins {
 
 android {
     namespace = "com.haptictrack"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.haptictrack"
@@ -76,6 +76,8 @@ dependencies {
 
     // TensorFlow Lite (person attribute classifier)
     implementation(libs.tensorflow.lite)
+    implementation(libs.tensorflow.lite.gpu)
+    implementation(libs.tensorflow.lite.gpu.api)
 
     // Permissions
     implementation(libs.accompanist.permissions)

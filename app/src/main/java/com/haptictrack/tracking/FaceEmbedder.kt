@@ -34,7 +34,8 @@ class FaceEmbedder(context: Context, sharedFaceDetector: FaceDetector? = null) {
         private const val FACE_MIN_CONFIDENCE = 0.5f
     }
 
-    private val interpreter: Interpreter
+    private val gpu: GpuInterpreter
+    private val interpreter: Interpreter get() = gpu.interpreter
     private val faceDetector: FaceDetector
     private val ownsFaceDetector: Boolean
 
@@ -46,7 +47,7 @@ class FaceEmbedder(context: Context, sharedFaceDetector: FaceDetector? = null) {
 
     init {
         val model = loadTfliteModel(context, MODEL_ASSET)
-        interpreter = Interpreter(model, Interpreter.Options().apply { setNumThreads(2) })
+        gpu = createGpuInterpreter(model, modelName = "MobileFaceNet", cpuThreads = 2)
 
         if (sharedFaceDetector != null) {
             faceDetector = sharedFaceDetector
@@ -122,7 +123,7 @@ class FaceEmbedder(context: Context, sharedFaceDetector: FaceDetector? = null) {
     }
 
     fun close() {
-        interpreter.close()
+        gpu.close()
         if (ownsFaceDetector) faceDetector.close()
     }
 

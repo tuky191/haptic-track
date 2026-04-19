@@ -32,7 +32,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     internal val cameraManager = CameraManager(application)
     private val recordingManager = RecordingManager(application)
-    private val objectTracker = ObjectTracker(application)
+    private lateinit var objectTracker: ObjectTracker
     private val hapticManager = HapticFeedbackManager(application)
     private val zoomController = ZoomController()
     private val orientationListener = DeviceOrientationListener(application)
@@ -60,63 +60,72 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     init {
         orientationListener.start()
-        objectTracker.deviceRotationProvider = { orientationListener.deviceRotation }
 
-        cameraManager.imageAnalysis.setAnalyzer(
-            java.util.concurrent.Executors.newSingleThreadExecutor(),
-            objectTracker.analyzer
-        )
+        // Load ML models on background thread — takes ~20s with GPU delegate init
+        viewModelScope.launch(Dispatchers.Default) {
+            _uiState.update { it.copy(loadingStatus = "Loading ML models...") }
+            val tracker = ObjectTracker(getApplication(), onLoadingStatus = { status ->
+                _uiState.update { it.copy(loadingStatus = status) }
+            })
+            tracker.deviceRotationProvider = { orientationListener.deviceRotation }
 
-        objectTracker.onDetectionResult = { allObjects, lockedObject, imgWidth, imgHeight, contour ->
-            val previousStatus = _uiState.value.status
+            tracker.onDetectionResult = { allObjects, lockedObject, imgWidth, imgHeight, contour ->
+                val previousStatus = _uiState.value.status
 
-            val status = when {
-                previousStatus == TrackingStatus.IDLE -> TrackingStatus.IDLE
-                lockedObject != null -> TrackingStatus.LOCKED
-                previousStatus == TrackingStatus.LOCKED || previousStatus == TrackingStatus.LOST -> TrackingStatus.LOST
-                else -> TrackingStatus.SEARCHING
+                val status = when {
+                    previousStatus == TrackingStatus.IDLE -> TrackingStatus.IDLE
+                    lockedObject != null -> TrackingStatus.LOCKED
+                    previousStatus == TrackingStatus.LOCKED || previousStatus == TrackingStatus.LOST -> TrackingStatus.LOST
+                    else -> TrackingStatus.SEARCHING
+                }
+
+                val edgeProximity = lockedObject?.let {
+                    zoomController.calculateEdgeProximity(it.boundingBox)
+                } ?: 0f
+
+                val targetZoom = if (lockedObject != null) {
+                    zoomController.calculateZoom(
+                        lockedObject.boundingBox,
+                        cameraManager.getMinZoom(),
+                        cameraManager.getMaxZoom()
+                    ).also { cameraManager.setZoomRatio(it) }
+                } else if (status == TrackingStatus.LOST && previousStatus == TrackingStatus.LOCKED) {
+                    zoomController.zoomOutForSearch(
+                        cameraManager.getMinZoom(),
+                        cameraManager.getMaxZoom()
+                    ).also { cameraManager.setZoomRatio(it) }
+                } else null
+
+                hapticManager.updateTrackingStatus(status, edgeProximity)
+
+                val displayObjects = if (status == TrackingStatus.IDLE) {
+                    smoothIdleDetections(allObjects)
+                } else {
+                    recentDetections.clear()
+                    allObjects
+                }
+
+                _uiState.update { current ->
+                    current.copy(
+                        status = status,
+                        trackedObject = lockedObject ?: if (status == TrackingStatus.LOST) current.trackedObject else null,
+                        detectedObjects = displayObjects,
+                        sourceImageWidth = imgWidth,
+                        sourceImageHeight = imgHeight,
+                        currentZoomRatio = targetZoom ?: current.currentZoomRatio,
+                        lockedContour = if (status == TrackingStatus.LOCKED) contour else
+                            if (status == TrackingStatus.LOST) current.lockedContour else emptyList()
+                    )
+                }
             }
 
-            val edgeProximity = lockedObject?.let {
-                zoomController.calculateEdgeProximity(it.boundingBox)
-            } ?: 0f
-
-            val targetZoom = if (lockedObject != null) {
-                zoomController.calculateZoom(
-                    lockedObject.boundingBox,
-                    cameraManager.getMinZoom(),
-                    cameraManager.getMaxZoom()
-                ).also { cameraManager.setZoomRatio(it) }
-            } else if (status == TrackingStatus.LOST && previousStatus == TrackingStatus.LOCKED) {
-                // Just lost — zoom out partially to widen field of view for re-acquisition
-                zoomController.zoomOutForSearch(
-                    cameraManager.getMinZoom(),
-                    cameraManager.getMaxZoom()
-                ).also { cameraManager.setZoomRatio(it) }
-            } else null
-
-            hapticManager.updateTrackingStatus(status, edgeProximity)
-
-            // In idle state, smooth detections to prevent bracket flickering
-            val displayObjects = if (status == TrackingStatus.IDLE) {
-                smoothIdleDetections(allObjects)
-            } else {
-                recentDetections.clear()
-                allObjects
-            }
-
-            _uiState.update { current ->
-                current.copy(
-                    status = status,
-                    trackedObject = lockedObject ?: if (status == TrackingStatus.LOST) current.trackedObject else null,
-                    detectedObjects = displayObjects,
-                    sourceImageWidth = imgWidth,
-                    sourceImageHeight = imgHeight,
-                    currentZoomRatio = targetZoom ?: current.currentZoomRatio,
-                    lockedContour = if (status == TrackingStatus.LOCKED) contour else
-                        if (status == TrackingStatus.LOST) current.lockedContour else emptyList()
-                )
-            }
+            objectTracker = tracker
+            cameraManager.imageAnalysis.setAnalyzer(
+                java.util.concurrent.Executors.newSingleThreadExecutor(),
+                tracker.analyzer
+            )
+            _uiState.update { it.copy(isReady = true) }
+            Log.i(TAG, "ML models loaded, tracking ready")
         }
     }
 
@@ -125,7 +134,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         cameraManager.startCamera(lifecycleOwner, previewView)
     }
 
+    private val isTrackerReady get() = ::objectTracker.isInitialized
+
     fun onTapToLock(normalizedX: Float, normalizedY: Float) {
+        if (!isTrackerReady) return
         // Ignore taps while already tracking — only Clear can reset
         if (_uiState.value.status != TrackingStatus.IDLE) return
 
@@ -192,6 +204,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
      * 3. Recording → stop recording + clear tracking
      */
     fun onVolumeDown() {
+        if (!isTrackerReady) return
         val state = _uiState.value
 
         if (state.isRecording) {
@@ -252,16 +265,18 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun clearTracking() {
+        if (!isTrackerReady) return
         objectTracker.clearLock()
         zoomController.reset()
         hapticManager.updateTrackingStatus(TrackingStatus.IDLE)
         _uiState.update {
-            TrackingUiState(status = TrackingStatus.IDLE, isRecording = it.isRecording, captureMode = it.captureMode, stealthMode = it.stealthMode)
+            TrackingUiState(status = TrackingStatus.IDLE, isRecording = it.isRecording, captureMode = it.captureMode, stealthMode = it.stealthMode, isReady = it.isReady)
         }
     }
 
     @android.annotation.SuppressLint("MissingPermission")
     fun toggleRecording() {
+        if (!isTrackerReady) return
         if (recordingManager.isRecording) {
             recordingManager.stopRecording()
             if (!_uiState.value.stealthMode) stopBitmapAnalysis()
@@ -316,8 +331,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
                         objectTracker.processBitmap(scaled)
                     }
+                    kotlinx.coroutines.yield()
+                } else {
+                    delay(BITMAP_ANALYSIS_INTERVAL_MS)
                 }
-                delay(BITMAP_ANALYSIS_INTERVAL_MS)
             }
             Log.i(TAG, "Bitmap analysis loop stopped")
         }
@@ -332,7 +349,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         super.onCleared()
         stopBitmapAnalysis()
         orientationListener.stop()
-        objectTracker.shutdown()
+        if (isTrackerReady) objectTracker.shutdown()
         hapticManager.shutdown()
         cameraManager.shutdown()
         if (recordingManager.isRecording) recordingManager.stopRecording()

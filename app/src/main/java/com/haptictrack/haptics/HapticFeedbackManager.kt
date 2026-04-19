@@ -29,14 +29,15 @@ class HapticFeedbackManager(context: Context) {
 
     private fun vibrateLockedPulse(edgeProximity: Float) {
         // edgeProximity: 0.0 = centered, 1.0 = at edge of frame
-        val amplitude = (60 + (edgeProximity * 195)).toInt().coerceIn(1, 255)
-        val effect = VibrationEffect.createOneShot(100, amplitude)
+        // Subtle: gentle tick when centered, moderate nudge at edge
+        val amplitude = (20 + (edgeProximity * 80)).toInt().coerceIn(1, 100)
+        val effect = VibrationEffect.createOneShot(60, amplitude)
         vibrator.vibrate(effect)
     }
 
     private fun vibrateSearching() {
-        val timings = longArrayOf(0, 50, 100, 50, 100, 50)
-        val amplitudes = intArrayOf(0, 80, 0, 80, 0, 80)
+        val timings = longArrayOf(0, 30, 150, 30)
+        val amplitudes = intArrayOf(0, 40, 0, 40)
         val effect = VibrationEffect.createWaveform(timings, amplitudes, -1)
         vibrator.vibrate(effect)
     }

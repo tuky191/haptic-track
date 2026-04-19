@@ -45,7 +45,8 @@ class PersonReIdEmbedder(context: Context) {
         private const val STD_B = 0.225f
     }
 
-    private val interpreter: Interpreter
+    private val gpu: GpuInterpreter
+    private val interpreter: Interpreter get() = gpu.interpreter
 
     // Pre-allocated buffers
     private val inputBuffer: ByteBuffer = ByteBuffer.allocateDirect(4 * INPUT_HEIGHT * INPUT_WIDTH * 3).apply {
@@ -55,7 +56,7 @@ class PersonReIdEmbedder(context: Context) {
 
     init {
         val model = loadTfliteModel(context, MODEL_ASSET)
-        interpreter = Interpreter(model, Interpreter.Options().apply { setNumThreads(2) })
+        gpu = createGpuInterpreter(model, modelName = "OSNet-ReID", cpuThreads = 2)
         Log.i(TAG, "Loaded OSNet x1.0 Market-1501 (${EMBEDDING_DIM}-dim, ${INPUT_HEIGHT}x${INPUT_WIDTH})")
     }
 
@@ -99,7 +100,7 @@ class PersonReIdEmbedder(context: Context) {
     }
 
     fun close() {
-        interpreter.close()
+        gpu.close()
     }
 
     /** ImageNet normalization: (pixel/255 - mean) / std per channel */

@@ -7,6 +7,7 @@ import android.graphics.RectF
 import android.util.Log
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
+import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.vision.facedetector.FaceDetector
 import org.tensorflow.lite.Interpreter
 import java.nio.ByteBuffer
@@ -41,23 +42,30 @@ class PersonAttributeClassifier(context: Context) {
         private const val FACE_MIN_CONFIDENCE = 0.5f
     }
 
-    private val bodyInterpreter: Interpreter
-    private val ageGenderInterpreter: Interpreter
+    private val bodyGpu: GpuInterpreter
+    private val bodyInterpreter: Interpreter get() = bodyGpu.interpreter
+    private val ageGenderGpu: GpuInterpreter
+    private val ageGenderInterpreter: Interpreter get() = ageGenderGpu.interpreter
     /** Exposed for sharing with [FaceEmbedder] to avoid duplicate model loading. */
     val faceDetector: FaceDetector
 
     init {
         val bodyModel = loadTfliteModel(context, BODY_MODEL_ASSET)
-        bodyInterpreter = Interpreter(bodyModel, Interpreter.Options().apply { setNumThreads(2) })
+        bodyGpu = createGpuInterpreter(bodyModel, modelName = "Crossroad-0230", cpuThreads = 2)
 
         val ageGenderModel = loadTfliteModel(context, AGE_GENDER_MODEL_ASSET)
-        ageGenderInterpreter = Interpreter(ageGenderModel, Interpreter.Options().apply { setNumThreads(2) })
+        ageGenderGpu = createGpuInterpreter(ageGenderModel, modelName = "age-gender", cpuThreads = 2)
 
-        val faceOptions = FaceDetector.FaceDetectorOptions.builder()
-            .setBaseOptions(BaseOptions.builder().setModelAssetPath(FACE_MODEL_ASSET).build())
-            .setMinDetectionConfidence(FACE_MIN_CONFIDENCE)
-            .build()
-        faceDetector = FaceDetector.createFromOptions(context, faceOptions)
+        faceDetector = try {
+            FaceDetector.createFromOptions(context, FaceDetector.FaceDetectorOptions.builder()
+                .setBaseOptions(BaseOptions.builder().setModelAssetPath(FACE_MODEL_ASSET).setDelegate(Delegate.GPU).build())
+                .setMinDetectionConfidence(FACE_MIN_CONFIDENCE).build())
+        } catch (e: Exception) {
+            Log.w(TAG, "BlazeFace GPU failed, falling back to CPU: ${e.message}")
+            FaceDetector.createFromOptions(context, FaceDetector.FaceDetectorOptions.builder()
+                .setBaseOptions(BaseOptions.builder().setModelAssetPath(FACE_MODEL_ASSET).build())
+                .setMinDetectionConfidence(FACE_MIN_CONFIDENCE).build())
+        }
 
         Log.i(TAG, "Loaded: Crossroad-0230 (body), BlazeFace (face detect), age-gender-retail-0013 (face classify)")
     }
@@ -134,8 +142,8 @@ class PersonAttributeClassifier(context: Context) {
     }
 
     fun shutdown() {
-        bodyInterpreter.close()
-        ageGenderInterpreter.close()
+        bodyGpu.close()
+        ageGenderGpu.close()
         faceDetector.close()
     }
 

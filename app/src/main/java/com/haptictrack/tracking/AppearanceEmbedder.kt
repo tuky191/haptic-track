@@ -8,6 +8,7 @@ import android.util.Log
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.components.containers.Embedding
 import com.google.mediapipe.tasks.core.BaseOptions
+import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.vision.imageembedder.ImageEmbedder
 
 /**
@@ -30,17 +31,19 @@ class AppearanceEmbedder(context: Context) {
     private val segmenter: ObjectSegmenter = ObjectSegmenter(context)
 
     init {
-        val baseOptions = BaseOptions.builder()
-            .setModelAssetPath(MODEL_PATH)
-            .build()
-
-        val options = ImageEmbedder.ImageEmbedderOptions.builder()
-            .setBaseOptions(baseOptions)
-            .setL2Normalize(true)
-            .setQuantize(false)
-            .build()
-
-        embedder = ImageEmbedder.createFromOptions(context, options)
+        embedder = try {
+            val gpuOptions = BaseOptions.builder()
+                .setModelAssetPath(MODEL_PATH)
+                .setDelegate(Delegate.GPU)
+                .build()
+            ImageEmbedder.createFromOptions(context, ImageEmbedder.ImageEmbedderOptions.builder()
+                .setBaseOptions(gpuOptions).setL2Normalize(true).setQuantize(false).build())
+        } catch (e: Exception) {
+            Log.w(TAG, "GPU delegate failed, falling back to CPU: ${e.message}")
+            val cpuOptions = BaseOptions.builder().setModelAssetPath(MODEL_PATH).build()
+            ImageEmbedder.createFromOptions(context, ImageEmbedder.ImageEmbedderOptions.builder()
+                .setBaseOptions(cpuOptions).setL2Normalize(true).setQuantize(false).build())
+        }
     }
 
     /**

@@ -5,6 +5,8 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.RectF
 import android.util.Log
+import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.gpu.GpuDelegate
 import java.io.FileInputStream
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
@@ -133,6 +135,29 @@ fun loadTfliteModel(context: Context, assetName: String): MappedByteBuffer {
         FileInputStream(it.fileDescriptor).use { input ->
             input.channel.map(FileChannel.MapMode.READ_ONLY, it.startOffset, it.declaredLength)
         }
+    }
+}
+
+data class GpuInterpreter(val interpreter: Interpreter, val gpuDelegate: GpuDelegate?) {
+    fun close() {
+        interpreter.close()
+        gpuDelegate?.close()
+    }
+}
+
+/**
+ * Create a TFLite Interpreter with GPU delegate, falling back to CPU if GPU is unavailable.
+ */
+fun createGpuInterpreter(model: MappedByteBuffer, modelName: String = "unknown", cpuThreads: Int = 2): GpuInterpreter {
+    return try {
+        val gpuDelegate = GpuDelegate(GpuDelegate.Options())
+        val options = Interpreter.Options().addDelegate(gpuDelegate)
+        GpuInterpreter(Interpreter(model, options), gpuDelegate).also {
+            Log.i("TFLiteGPU", "GPU delegate active for $modelName")
+        }
+    } catch (e: Throwable) {
+        Log.w("TFLiteGPU", "GPU delegate unavailable for $modelName, using CPU ($cpuThreads threads): ${e.message}")
+        GpuInterpreter(Interpreter(model, Interpreter.Options().apply { setNumThreads(cpuThreads) }), null)
     }
 }
 
