@@ -40,6 +40,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private val _uiState = MutableStateFlow(TrackingUiState())
     val uiState: StateFlow<TrackingUiState> = _uiState.asStateFlow()
 
+    /** Analysis frame for viewfinder during recording (when Preview goes to SurfaceTexture). */
+    private val _viewfinderBitmap = MutableStateFlow<android.graphics.Bitmap?>(null)
+    val viewfinderBitmap: StateFlow<android.graphics.Bitmap?> = _viewfinderBitmap.asStateFlow()
+
     /** Coroutine job for getBitmap() analysis loop during recording. */
     private var bitmapAnalysisJob: Job? = null
     private var previewViewRef: PreviewView? = null
@@ -128,9 +132,17 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 tracker.analyzer
             )
             // During recording, frames come from SurfaceTextureFrameReader instead of ImageAnalysis.
-            // Feed them to ObjectTracker.processBitmap() (same path as the old getBitmap loop).
+            // Feed them to ObjectTracker.processBitmap() and expose for viewfinder display.
             cameraManager.onRecordingFrame = { bitmap ->
-                if (isTrackerReady) tracker.processBitmap(bitmap)
+                if (isTrackerReady) {
+                    // Copy for viewfinder before processBitmap recycles the original
+                    val viewfinderCopy = bitmap.copy(bitmap.config ?: android.graphics.Bitmap.Config.ARGB_8888, false)
+                    val old = _viewfinderBitmap.value
+                    _viewfinderBitmap.value = viewfinderCopy
+                    old?.recycle()
+
+                    tracker.processBitmap(bitmap)
+                }
             }
             _uiState.update { it.copy(isReady = true) }
             Log.i(TAG, "ML models loaded, tracking ready")
@@ -298,7 +310,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                         _uiState.update { it.copy(isRecording = true) }
                     is VideoRecordEvent.Finalize -> {
                         _uiState.update { it.copy(isRecording = false) }
-                        // Read stealth state at callback time, not at call time
+                        _viewfinderBitmap.value?.recycle()
+                        _viewfinderBitmap.value = null
                         if (!_uiState.value.stealthMode) {
                             objectTracker.prepareForRebind()
                             cameraManager.exitRecordingMode()

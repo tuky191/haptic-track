@@ -332,11 +332,14 @@ class ObjectTracker(
                 frameTracker.assignIds(detections)
             }
 
-            // Compute embeddings when searching OR when the direct ID match might
-            // fail (framesLost==0 but tracking ID likely changed after visual tracker
-            // handoff). Without embeddings, two same-label objects are indistinguishable.
+            // Compute embeddings only when searching. Skip on direct ID match frames —
+            // saves ~70ms of embedding/segmentation/classification per frame.
+            // After VT handoff, the first detector frame may have a new ID (VT drift
+            // caused framesLost=1), which triggers isSearching and computes embeddings.
+            val hasDirectMatch = reacquisition.lockedId != null &&
+                tracked.any { it.id == reacquisition.lockedId }
             val needEmbeddings = reacquisition.hasEmbeddings &&
-                (reacquisition.isSearching || (reacquisition.isLocked && reacquisition.framesLost == 0))
+                reacquisition.isSearching && !hasDirectMatch
 
             // Enrich labels with YOLOv8 during search (every 10 frames, not every frame)
             val searchFrame = reacquisition.framesLost

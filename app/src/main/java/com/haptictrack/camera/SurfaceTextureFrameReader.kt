@@ -108,12 +108,18 @@ class SurfaceTextureFrameReader(
                 // GL render loop: reads frames at camera rate, stores latest
                 while (running.get()) {
                     if (frameAvailable.compareAndSet(true, false)) {
-                        surfaceTexture?.updateTexImage()
+                        val st = surfaceTexture ?: continue
+                        st.updateTexImage()
+                        st.getTransformMatrix(texMatrix)
 
                         // Render external texture to FBO at output resolution
                         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fbo[0])
                         GLES20.glViewport(0, 0, outputWidth, outputHeight)
                         GLES20.glUseProgram(program)
+
+                        // Pass transform matrix (handles rotation, flip from camera HAL)
+                        val texMatLoc = GLES20.glGetUniformLocation(program, "uTexMatrix")
+                        GLES20.glUniformMatrix4fv(texMatLoc, 1, false, texMatrix, 0)
 
                         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
                         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
@@ -129,11 +135,9 @@ class SurfaceTextureFrameReader(
                         val bitmap = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.ARGB_8888)
                         bitmap.copyPixelsFromBuffer(readBuffer)
 
-                        val flipped = flipVertically(bitmap)
-                        bitmap.recycle()
-
                         // Store latest frame — recycle any unprocessed previous frame
-                        val old = latestFrame.getAndSet(flipped)
+                        // No manual flip needed — transform matrix handles orientation
+                        val old = latestFrame.getAndSet(bitmap)
                         old?.recycle()
                         glFrameCount++
                     } else {
@@ -260,13 +264,17 @@ class SurfaceTextureFrameReader(
 
     // --- Shader program for external OES texture ---
 
+    /** SurfaceTexture transform matrix — updated each frame, applied in shader. */
+    private val texMatrix = FloatArray(16)
+
     private val vertexShaderSource = """
         attribute vec4 aPosition;
         attribute vec2 aTexCoord;
+        uniform mat4 uTexMatrix;
         varying vec2 vTexCoord;
         void main() {
             gl_Position = aPosition;
-            vTexCoord = aTexCoord;
+            vTexCoord = (uTexMatrix * vec4(aTexCoord, 0.0, 1.0)).xy;
         }
     """.trimIndent()
 
@@ -331,10 +339,5 @@ class SurfaceTextureFrameReader(
         GLES20.glEnableVertexAttribArray(texLoc)
 
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
-    }
-
-    private fun flipVertically(src: Bitmap): Bitmap {
-        val matrix = android.graphics.Matrix().apply { postScale(1f, -1f) }
-        return Bitmap.createBitmap(src, 0, 0, src.width, src.height, matrix, false)
     }
 }

@@ -46,12 +46,16 @@ import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.asAndroidPath
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.pointerInteropFilter
 import kotlin.math.abs
@@ -279,7 +283,22 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                     }
             )
 
-            // Stealth mode: black overlay hides preview but keeps it rendering for getBitmap
+            // Viewfinder from analysis frames during recording.
+            // Preview surface goes to SurfaceTexture for fast frame reading,
+            // so PreviewView is frozen. We render the analysis bitmap instead.
+            if (uiState.isRecording && !uiState.stealthMode) {
+                val viewfinderBmp by viewModel.viewfinderBitmap.collectAsStateWithLifecycle()
+                viewfinderBmp?.let { bmp ->
+                    Image(
+                        bitmap = bmp.asImageBitmap(),
+                        contentDescription = null,
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Crop
+                    )
+                }
+            }
+
+            // Stealth mode: black overlay (analysis runs via SurfaceTexture, no viewfinder)
             if (uiState.stealthMode) {
                 Box(modifier = Modifier.fillMaxSize().background(Color.Black))
             }
