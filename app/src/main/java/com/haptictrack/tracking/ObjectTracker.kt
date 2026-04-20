@@ -44,12 +44,32 @@ class ObjectTracker(
     // Count frames where visual tracker has no detector confirmation
     private var vtUnconfirmedFrames = 0
     private var vtConfirmedFrames = 0
-    private val VT_MAX_UNCONFIRMED = 10  // ~0.3s at 30fps
+    private val VT_MAX_UNCONFIRMED = 10  // ~0.3s at 30fps (baseline for slow subjects)
 
     /** Skip detector every other frame when VT is confident and recently confirmed. */
     private var vtFrameCounter = 0
     private val VT_SKIP_INTERVAL = 2  // run detector every Nth frame when skipping
     private val VT_SKIP_MIN_CONFIRMED = 5  // need this many confirmations before skipping
+
+    /** Tracks object velocity for adaptive drift detection and position prediction. */
+    private val velocityEstimator = VelocityEstimator()
+    private val VT_ADAPTIVE_UNCONFIRMED_HIGH = 5      // ~165ms for fast subjects
+    private val VT_ADAPTIVE_UNCONFIRMED_VERY_HIGH = 3  // ~100ms for very fast subjects
+
+    /** Async embedding pipeline: compute embeddings on background thread, use results next frame. */
+    private val embeddingExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "EmbeddingAsync") }
+    private var pendingEmbeddings: java.util.concurrent.Future<Map<Int, EmbeddingResult>>? = null
+
+    /** Cached embedding results from previous frame, keyed by detection ID. */
+    data class EmbeddingResult(
+        val embedding: FloatArray? = null,
+        val colorHistogram: FloatArray? = null,
+        val personAttributes: PersonAttributes? = null,
+        val reIdEmbedding: FloatArray? = null,
+        val faceEmbedding: FloatArray? = null,
+        /** Bounding box at computation time, for IoU-based matching to next frame. */
+        val cachedBox: RectF? = null
+    )
 
     /** Callback: (displayObjects, lockedObject, imageWidth, imageHeight, contour) */
     var onDetectionResult: ((List<TrackedObject>, TrackedObject?, Int, Int, List<PointF>) -> Unit)? = null
@@ -151,6 +171,9 @@ class ObjectTracker(
         visualTracker.stop()
         vtUnconfirmedFrames = 0
         vtFrameCounter = 0
+        velocityEstimator.reset()
+        pendingEmbeddings?.cancel(true)
+        pendingEmbeddings = null
         reacquisition.prepareForRebind()
     }
 
@@ -164,6 +187,9 @@ class ObjectTracker(
         vtUnconfirmedFrames = 0
         vtConfirmedFrames = 0
         vtFrameCounter = 0
+        velocityEstimator.reset()
+        pendingEmbeddings?.cancel(true)
+        pendingEmbeddings = null
         cachedContour = emptyList()
         contourFrameCount = 0
     }
@@ -206,6 +232,9 @@ class ObjectTracker(
                     val rawBox = vtResult.boundingBox
                     val vtBox = unmapRotation(rawBox.left, rawBox.top, rawBox.right, rawBox.bottom, deviceRot)
 
+                    // Feed position to velocity estimator for adaptive drift detection
+                    velocityEstimator.update(vtBox.centerX(), vtBox.centerY())
+
                     // Skip detector when VT is confident and recently confirmed.
                     // Saves ~35ms per skipped frame. Still run every Nth frame for drift detection.
                     vtFrameCounter++
@@ -232,8 +261,9 @@ class ObjectTracker(
 
                     if (confirmed) {
                         vtUnconfirmedFrames = 0
-                        // Sync lastKnownBox in screen coords when detector confirms
+                        // Sync lastKnownBox and velocity in screen coords when detector confirms
                         reacquisition.updateFromVisualTracker(vtBox)
+                        reacquisition.updateVelocity(velocityEstimator.velocityX, velocityEstimator.velocityY)
 
                         // Accumulate embedding from current angle (every 30 confirmed frames ≈ 1s)
                         // Use raw rotated-image coords for embedding (embedder works on rotated bitmap)
@@ -257,9 +287,15 @@ class ObjectTracker(
                         vtUnconfirmedFrames++
                     }
 
-                    // If too many frames without detector confirmation, tracker is drifting
-                    if (vtUnconfirmedFrames > VT_MAX_UNCONFIRMED) {
-                        android.util.Log.w("VisualTracker", "DRIFT detected — $vtUnconfirmedFrames unconfirmed frames, stopping")
+                    // If too many frames without detector confirmation, tracker is drifting.
+                    // Adaptive: fast-moving subjects get shorter tolerance (drift is more costly).
+                    val adaptiveMaxUnconfirmed = when {
+                        velocityEstimator.isVeryHighVelocity() -> VT_ADAPTIVE_UNCONFIRMED_VERY_HIGH
+                        velocityEstimator.isHighVelocity() -> VT_ADAPTIVE_UNCONFIRMED_HIGH
+                        else -> VT_MAX_UNCONFIRMED
+                    }
+                    if (vtUnconfirmedFrames > adaptiveMaxUnconfirmed) {
+                        android.util.Log.w("VisualTracker", "DRIFT detected — $vtUnconfirmedFrames unconfirmed frames (max=$adaptiveMaxUnconfirmed, speed=${velocityEstimator.speed}), stopping")
                         visualTracker.stop()
                         vtUnconfirmedFrames = 0
                         vtFrameCounter = 0
@@ -304,13 +340,22 @@ class ObjectTracker(
 
             // --- Detector path: detection + re-acquisition ---
             val detections = runDetector(bitmap, frameWidth, frameHeight, deviceRotation)
-            val tracked = frameTracker.assignIds(detections)
+            // Use velocity-shifted matching when tracking a fast-moving subject.
+            // Shifts previous frame's boxes by velocity before IoU matching,
+            // preventing ID churn from large displacements between frames.
+            val tracked = if (velocityEstimator.speed > 0.01f && reacquisition.isLocked) {
+                frameTracker.assignIdsWithVelocity(
+                    detections, velocityEstimator.velocityX, velocityEstimator.velocityY
+                )
+            } else {
+                frameTracker.assignIds(detections)
+            }
 
-            // Compute embeddings when searching OR when the direct ID match might
-            // fail (framesLost==0 but tracking ID likely changed after visual tracker
-            // handoff). Without embeddings, two same-label objects are indistinguishable.
+            // --- Embedding pipeline (async): use previous frame's results, kick off current ---
+            val hasDirectMatch = reacquisition.lockedId != null &&
+                tracked.any { it.id == reacquisition.lockedId }
             val needEmbeddings = reacquisition.hasEmbeddings &&
-                (reacquisition.isSearching || (reacquisition.isLocked && reacquisition.framesLost == 0))
+                reacquisition.isSearching && !hasDirectMatch
 
             // Enrich labels with YOLOv8 during search (every 10 frames, not every frame)
             val searchFrame = reacquisition.framesLost
@@ -325,35 +370,63 @@ class ObjectTracker(
             } else tracked
 
             val withEmbeddings = if (needEmbeddings) {
-                // First pass: compute embeddings + histograms for all candidates
-                val withVisual = withLabels.map { obj ->
-                    val result = appearanceEmbedder.embedAndCrop(bitmap, obj.boundingBox, fallback = true)
-                    val hist = if (result.maskedCrop != null) {
-                        val fullBox = RectF(0f, 0f, 1f, 1f)
-                        computeColorHistogram(result.maskedCrop, fullBox).also { result.maskedCrop.recycle() }
-                    } else computeColorHistogram(bitmap, obj.boundingBox)
-                    obj.copy(embedding = result.embedding, colorHistogram = hist)
-                }
-                // Second pass: classify person attributes only for top-2 person
-                // candidates by embedding similarity (3 model inferences is expensive)
-                val personCandidates = withVisual
-                    .filter { it.label == "person" && it.embedding != null }
-                    .sortedByDescending { reacquisition.bestGallerySimilarity(it.embedding!!) }
-                    .take(2)
-                    .map { it.id }
-                    .toSet()
-                withVisual.map { obj ->
-                    if (obj.id in personCandidates) {
-                        val attrs = personClassifier.classify(bitmap, obj.boundingBox, obj.label)
-                        // Compute re-ID + face embeddings for person candidates
-                        val reIdEmb = personReId.embed(bitmap, obj.boundingBox)
-                        val faceEmb = if (reacquisition.lockedFaceEmbedding != null) {
-                            faceEmbedder.embedFace(bitmap, obj.boundingBox)
-                        } else null
-                        obj.copy(personAttributes = attrs, reIdEmbedding = reIdEmb, faceEmbedding = faceEmb)
+                // Collect results from previous frame's async embedding computation.
+                // Wait up to 50ms — the processing thread is decoupled from the GL thread,
+                // so blocking briefly is fine. Better to wait for embeddings than reacquire
+                // without identity verification.
+                val cachedResults = try {
+                    pendingEmbeddings?.get(50, java.util.concurrent.TimeUnit.MILLISECONDS) ?: emptyMap()
+                } catch (e: java.util.concurrent.TimeoutException) { emptyMap() }
+                catch (e: Exception) { emptyMap() }
+
+                // Merge cached embeddings into current detections by greedy IoU match.
+                // Each cached entry can only match one detection (prevents duplicates
+                // when overlapping boxes all match the same cached result).
+                val cachedEntries = cachedResults.entries.toList()
+                val usedCacheKeys = mutableSetOf<Int>()
+                val merged = withLabels.map { obj ->
+                    val bestMatch = cachedEntries
+                        .filter { (id, result) -> result.cachedBox != null && id !in usedCacheKeys }
+                        .maxByOrNull { (_, result) ->
+                            computeIou(obj.boundingBox, result.cachedBox!!)
+                        }
+                    val iou = bestMatch?.let { (_, result) ->
+                        computeIou(obj.boundingBox, result.cachedBox!!)
+                    } ?: 0f
+                    if (bestMatch != null && iou > 0.3f) {
+                        usedCacheKeys.add(bestMatch.key)
+                        val cached = bestMatch.value
+                        obj.copy(
+                            embedding = cached.embedding,
+                            colorHistogram = cached.colorHistogram,
+                            personAttributes = cached.personAttributes,
+                            reIdEmbedding = cached.reIdEmbedding,
+                            faceEmbedding = cached.faceEmbedding
+                        )
                     } else obj
                 }
-            } else withLabels
+
+                // Kick off async embedding computation for current frame's detections.
+                // Only submit if previous task is done — don't overwrite in-flight work
+                // or its results are lost before we can collect them.
+                val prevDone = pendingEmbeddings?.isDone ?: true
+                if (prevDone) {
+                    val bitmapCopy = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
+                    val detectionsSnapshot = withLabels.toList()
+                    pendingEmbeddings = embeddingExecutor.submit(java.util.concurrent.Callable {
+                        try {
+                            computeEmbeddingsSync(bitmapCopy, detectionsSnapshot)
+                        } finally {
+                            bitmapCopy.recycle()
+                        }
+                    })
+                }
+
+                merged
+            } else {
+                pendingEmbeddings = null // clear when not searching
+                withLabels
+            }
 
             // Snapshot state before processing
             val wasSearching = reacquisition.isSearching
@@ -524,9 +597,48 @@ class ObjectTracker(
         }
     }
 
+    /**
+     * Compute embeddings synchronously for a list of detections. Runs on [embeddingExecutor].
+     * Returns a map of detection ID → embedding results.
+     */
+    private fun computeEmbeddingsSync(bitmap: Bitmap, detections: List<TrackedObject>): Map<Int, EmbeddingResult> {
+        val results = mutableMapOf<Int, EmbeddingResult>()
+        // First pass: embeddings + color histograms for all
+        for (obj in detections) {
+            val embResult = appearanceEmbedder.embedAndCrop(bitmap, obj.boundingBox, fallback = true)
+            val hist = if (embResult.maskedCrop != null) {
+                val fullBox = RectF(0f, 0f, 1f, 1f)
+                computeColorHistogram(embResult.maskedCrop, fullBox).also { embResult.maskedCrop.recycle() }
+            } else computeColorHistogram(bitmap, obj.boundingBox)
+            results[obj.id] = EmbeddingResult(embedding = embResult.embedding, colorHistogram = hist, cachedBox = RectF(obj.boundingBox))
+        }
+        // Second pass: classify top-2 person candidates
+        val personCandidates = detections
+            .filter { it.label == "person" && results[it.id]?.embedding != null }
+            .sortedByDescending {
+                val emb = results[it.id]?.embedding
+                if (emb != null) reacquisition.bestGallerySimilarity(emb) else 0f
+            }
+            .take(2)
+            .map { it.id }
+            .toSet()
+        for (id in personCandidates) {
+            val obj = detections.find { it.id == id } ?: continue
+            val attrs = personClassifier.classify(bitmap, obj.boundingBox, obj.label)
+            val reIdEmb = personReId.embed(bitmap, obj.boundingBox)
+            val faceEmb = if (reacquisition.lockedFaceEmbedding != null) {
+                faceEmbedder.embedFace(bitmap, obj.boundingBox)
+            } else null
+            val existing = results[id] ?: EmbeddingResult(cachedBox = RectF(obj.boundingBox))
+            results[id] = existing.copy(personAttributes = attrs, reIdEmbedding = reIdEmb, faceEmbedding = faceEmb)
+        }
+        return results
+    }
+
     fun shutdown() {
         scenarioRecorder.stop()
         debugCapture.endSession()
+        embeddingExecutor.shutdownNow()
         detector.close()
         labelEnricher.close()
         faceEmbedder.close()

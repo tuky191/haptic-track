@@ -40,6 +40,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private val _uiState = MutableStateFlow(TrackingUiState())
     val uiState: StateFlow<TrackingUiState> = _uiState.asStateFlow()
 
+    /** Analysis frame for viewfinder during recording (when Preview goes to SurfaceTexture). */
+    private val _viewfinderBitmap = MutableStateFlow<android.graphics.Bitmap?>(null)
+    val viewfinderBitmap: StateFlow<android.graphics.Bitmap?> = _viewfinderBitmap.asStateFlow()
+
     /** Coroutine job for getBitmap() analysis loop during recording. */
     private var bitmapAnalysisJob: Job? = null
     private var previewViewRef: PreviewView? = null
@@ -84,13 +88,16 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 } ?: 0f
 
                 val targetZoom = if (lockedObject != null) {
+                    zoomController.resetLossCounter()
                     zoomController.calculateZoom(
                         lockedObject.boundingBox,
                         cameraManager.getMinZoom(),
                         cameraManager.getMaxZoom()
                     ).also { cameraManager.setZoomRatio(it) }
-                } else if (status == TrackingStatus.LOST && previousStatus == TrackingStatus.LOCKED) {
-                    zoomController.zoomOutForSearch(
+                } else if (status == TrackingStatus.LOST) {
+                    // Gradual zoom-out: delays 5 frames then pulls back 15% per frame.
+                    // Gives reacquisition a chance at the original zoom before widening FOV.
+                    zoomController.zoomOutForSearchGradual(
                         cameraManager.getMinZoom(),
                         cameraManager.getMaxZoom()
                     ).also { cameraManager.setZoomRatio(it) }
@@ -124,6 +131,20 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 java.util.concurrent.Executors.newSingleThreadExecutor(),
                 tracker.analyzer
             )
+            // During recording, frames come from SurfaceTextureFrameReader instead of ImageAnalysis.
+            // Viewfinder updates at GL rate (~29fps) — always smooth, independent of processing.
+            // Processing thread picks up latest frame when ready (~10-12fps), naturally drops frames.
+            cameraManager.onViewfinderFrame = { bitmap ->
+                // Don't recycle previous bitmaps — Compose's RenderThread may still be
+                // drawing them asynchronously even after StateFlow emits a new value.
+                // At 480×640 ARGB (~1.2MB each), GC handles this fine on 8GB+ devices.
+                _viewfinderBitmap.value = bitmap
+            }
+            cameraManager.onRecordingFrame = { bitmap ->
+                if (isTrackerReady) {
+                    tracker.processBitmap(bitmap)
+                }
+            }
             _uiState.update { it.copy(isReady = true) }
             Log.i(TAG, "ML models loaded, tracking ready")
         }
@@ -252,9 +273,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         objectTracker.prepareForRebind()
         if (entering) {
             cameraManager.enterRecordingMode()
-            startBitmapAnalysis()
+            // Frame reader in CameraManager handles analysis via onRecordingFrame
         } else {
-            stopBitmapAnalysis()
             cameraManager.exitRecordingMode()
         }
     }
@@ -279,12 +299,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         if (!isTrackerReady) return
         if (recordingManager.isRecording) {
             recordingManager.stopRecording()
-            if (!_uiState.value.stealthMode) stopBitmapAnalysis()
         } else {
             if (!_uiState.value.stealthMode) {
                 objectTracker.prepareForRebind()
                 cameraManager.enterRecordingMode()
-                startBitmapAnalysis()
+                // Frame reader in CameraManager handles analysis via onRecordingFrame
             }
             recordingManager.startRecording(cameraManager.videoCapture) { event ->
                 when (event) {
@@ -292,7 +311,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                         _uiState.update { it.copy(isRecording = true) }
                     is VideoRecordEvent.Finalize -> {
                         _uiState.update { it.copy(isRecording = false) }
-                        // Read stealth state at callback time, not at call time
+                        _viewfinderBitmap.value = null
                         if (!_uiState.value.stealthMode) {
                             objectTracker.prepareForRebind()
                             cameraManager.exitRecordingMode()

@@ -1,0 +1,8 @@
+{
+  "description": "Son indoors (blue shirt, shorts), tracking jumps to wife (white/beige) — must not swap to wrong person",
+  "lockFrame": 0,
+  "lockBox": [0.367, 0.297, 0.777, 0.723],
+  "lockLabel": "person",
+  "analysisWidth": 640,
+  "fps": 30
+}

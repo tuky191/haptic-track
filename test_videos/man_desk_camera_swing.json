@@ -1,0 +1,8 @@
+{
+  "description": "Self-filming at desk, fast camera swings cause multiple lost/reacquire cycles",
+  "lockFrame": 0,
+  "lockBox": [0.075, 0.29, 0.998, 1.0],
+  "lockLabel": "person",
+  "analysisWidth": 640,
+  "fps": 30
+}

@@ -1,0 +1,8 @@
+{
+  "description": "Son at playground, small lock box far away, fast movement, multiple people in scene",
+  "lockFrame": 0,
+  "lockBox": [0.479, 0.344, 0.556, 0.422],
+  "lockLabel": "person",
+  "analysisWidth": 640,
+  "fps": 30
+}

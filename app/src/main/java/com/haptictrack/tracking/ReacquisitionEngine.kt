@@ -28,8 +28,21 @@ class ReacquisitionEngine(
 
     companion object {
         private const val TAG = "Reacq"
-        /** Embedding similarity above this bypasses position/size hard filters. */
+        /** Embedding similarity above this bypasses the label gate (cross-category protection). */
         const val APPEARANCE_OVERRIDE_THRESHOLD = 0.7f
+        /** Embedding similarity above this bypasses position/size hard filters.
+         *  Lower than label override because position rejection is a different risk
+         *  than cross-category leakage — 0.55 is enough to say "same object, just moved." */
+        const val GEOMETRIC_OVERRIDE_THRESHOLD = 0.55f
+        /** Minimum embedding similarity to consider a candidate at all.
+         *  If the primary embedder says the candidate is a different object (sim < this),
+         *  no amount of re-ID, attributes, or color can rescue it. */
+        const val MIN_EMBEDDING_SIMILARITY = 0.15f
+        /** Frames to require embedding before allowing fallback scoring.
+         *  Async embeddings typically arrive within 2-3 frames. Allow a short grace
+         *  period, then fall back to position/label scoring if embeddings never arrive
+         *  (e.g. object left frame entirely, no detections to embed). */
+        const val EMBEDDING_REQUIRED_FRAMES = 5
         /** Maximum embeddings to keep in gallery. */
         const val MAX_GALLERY_SIZE = 12
     }
@@ -65,6 +78,11 @@ class ReacquisitionEngine(
         private set
     var lastKnownSize: Float = 0f
         private set
+    /** Last known velocity (normalized units/frame) from VelocityEstimator. */
+    var lastKnownVelocityX: Float = 0f
+        private set
+    var lastKnownVelocityY: Float = 0f
+        private set
     var framesLost: Int = 0
         private set
 
@@ -91,6 +109,8 @@ class ReacquisitionEngine(
         lastKnownBox = RectF(boundingBox)
         lastKnownLabel = label
         lastKnownSize = boundingBox.width() * boundingBox.height()
+        lastKnownVelocityX = 0f
+        lastKnownVelocityY = 0f
         framesLost = 0
         val attrStr = personAttrs?.summary() ?: "n/a"
         dualLog(Log.INFO, "LOCK id=$trackingId label=\"$label\" box=${fmtBox(boundingBox)} size=${fmtF(lastKnownSize)} gallery=${embeddingGallery.size} colorHist=${colorHist != null} attrs=\"$attrStr\"")
@@ -129,6 +149,8 @@ class ReacquisitionEngine(
         lockedFaceEmbedding = null
         lastKnownBox = null
         lastKnownLabel = null
+        lastKnownVelocityX = 0f
+        lastKnownVelocityY = 0f
         lastKnownSize = 0f
         framesLost = 0
     }
@@ -201,6 +223,12 @@ class ReacquisitionEngine(
         lastKnownBox = RectF(boundingBox)
         lastKnownSize = boundingBox.width() * boundingBox.height()
         framesLost = 0
+    }
+
+    /** Update last-known velocity from VelocityEstimator (normalized units/frame). */
+    fun updateVelocity(vx: Float, vy: Float) {
+        lastKnownVelocityX = vx
+        lastKnownVelocityY = vy
     }
 
     /**
@@ -295,15 +323,48 @@ class ReacquisitionEngine(
         val appearanceScore = if (hasAppearance) {
             bestGallerySimilarity(candidate.embedding!!).coerceIn(0f, 1f)
         } else 0f
-        val strongVisualMatch = hasAppearance && appearanceScore > APPEARANCE_OVERRIDE_THRESHOLD
+        // --- GATE: Require embedding when gallery exists ---
+        // If we have reference embeddings but the candidate has none (async not ready),
+        // reject it — accepting without identity verification causes wrong-object locks.
+        // Allow fallback after EMBEDDING_REQUIRED_FRAMES to avoid permanent deadlock.
+        if (hasEmbeddings && candidate.embedding == null && framesLost < EMBEDDING_REQUIRED_FRAMES) {
+            return null
+        }
+
+        // --- GATE: Embedding floor ---
+        // If the primary embedder says this is a different object, reject outright.
+        // Re-ID, attributes, and color are supplementary signals that can't override
+        // a negative identity match from the primary 1280-dim embedding.
+        if (hasAppearance && appearanceScore < MIN_EMBEDDING_SIMILARITY) {
+            return null
+        }
+
+        // Tiered override: geometric gates use a lower threshold (0.55) because
+        // position rejection is about camera movement, not identity confusion.
+        // Label gate uses a higher threshold (0.7) to protect against cross-category leakage.
+        val geometricOverride = hasAppearance && appearanceScore > GEOMETRIC_OVERRIDE_THRESHOLD
+        val labelOverride = hasAppearance && appearanceScore > APPEARANCE_OVERRIDE_THRESHOLD
 
         // --- GATE A: Position hard filter (with time decay) ---
-        val dx = candBox.centerX() - refBox.centerX()
-        val dy = candBox.centerY() - refBox.centerY()
+        // Use velocity-predicted position when available. If the subject was moving
+        // right at 3%/frame and we lost it 5 frames ago, look 15% to the right
+        // of the last known position instead of at the last known position itself.
+        val velocitySpeed = kotlin.math.sqrt(lastKnownVelocityX * lastKnownVelocityX + lastKnownVelocityY * lastKnownVelocityY)
+        // Cap prediction to 10 frames — beyond that, velocity is unreliable and prediction
+        // pins to screen edge. Revert to last-known position as uncertainty grows.
+        val predictionFrames = minOf(framesLost, 10)
+        val predictedCenterX = if (velocitySpeed > 0.01f) {
+            (refBox.centerX() + lastKnownVelocityX * predictionFrames).coerceIn(0f, 1f)
+        } else refBox.centerX()
+        val predictedCenterY = if (velocitySpeed > 0.01f) {
+            (refBox.centerY() + lastKnownVelocityY * predictionFrames).coerceIn(0f, 1f)
+        } else refBox.centerY()
+        val dx = candBox.centerX() - predictedCenterX
+        val dy = candBox.centerY() - predictedCenterY
         val distance = kotlin.math.sqrt(dx * dx + dy * dy)
 
-        if (distance > posThreshold && !strongVisualMatch) return null
-        if (distance > posThreshold && strongVisualMatch) {
+        if (distance > posThreshold && !geometricOverride) return null
+        if (distance > posThreshold && geometricOverride) {
             dualLog(Log.DEBUG, "  OVERRIDE position: dist=${fmtF(distance)} > thresh=${fmtF(posThreshold)}, but sim=${fmtF(appearanceScore)}")
         }
 
@@ -313,8 +374,8 @@ class ReacquisitionEngine(
             if (candSize > lastKnownSize) candSize / lastKnownSize else lastKnownSize / candSize
         } else 1f
         val effectiveSizeThreshold = effectiveSizeRatioThreshold()
-        if (sizeRatio > effectiveSizeThreshold && !strongVisualMatch) return null
-        if (sizeRatio > effectiveSizeThreshold && strongVisualMatch) {
+        if (sizeRatio > effectiveSizeThreshold && !geometricOverride) return null
+        if (sizeRatio > effectiveSizeThreshold && geometricOverride) {
             dualLog(Log.DEBUG, "  OVERRIDE size: ratio=${fmtF(sizeRatio)} > thresh=${fmtF(effectiveSizeThreshold)}, but sim=${fmtF(appearanceScore)}")
         }
 
@@ -322,13 +383,14 @@ class ReacquisitionEngine(
         // Wrong-label candidates are rejected outright unless a strong embedding
         // indicates it's the same object with a flickered label. This prevents
         // cross-category leakage (e.g. person matching a locked chair via color).
+        // Uses higher threshold (0.7) than geometric gates.
         val labelMatches = lockedLabel != null && (
             candidate.label == lockedLabel || candidate.label == lockedCocoLabel
         )
         when {
             lockedLabel == null -> { /* pass: no label constraint */ }
             labelMatches -> { /* pass: correct label */ }
-            strongVisualMatch -> {
+            labelOverride -> {
                 dualLog(Log.DEBUG, "  OVERRIDE label: \"${candidate.label}\" != \"$lockedLabel\", but sim=${fmtF(appearanceScore)}")
             }
             else -> return null  // REJECT: wrong label, no embedding override
