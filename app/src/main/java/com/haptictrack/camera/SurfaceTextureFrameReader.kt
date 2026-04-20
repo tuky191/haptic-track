@@ -170,6 +170,9 @@ class SurfaceTextureFrameReader(
                 Log.i(TAG, "GL thread stopped")
             } catch (e: Exception) {
                 Log.e(TAG, "GL thread error: ${e.message}", e)
+                if (eglDisplay != EGL14.EGL_NO_DISPLAY) {
+                    releaseEGL()
+                }
                 surfaceLatch.countDown() // unblock in case of early failure
             }
         }, "STFrameReader-GL")

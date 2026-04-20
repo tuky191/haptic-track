@@ -135,8 +135,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             // Viewfinder updates at GL rate (~29fps) — always smooth, independent of processing.
             // Processing thread picks up latest frame when ready (~10-12fps), naturally drops frames.
             cameraManager.onViewfinderFrame = { bitmap ->
-                // Don't recycle — Compose may still be drawing previous frames. Let GC handle.
+                // Recycle the previous bitmap — once StateFlow emits a new value,
+                // Compose collectors will only see the new one. The old is safe to recycle.
+                val old = _viewfinderBitmap.value
                 _viewfinderBitmap.value = bitmap
+                old?.recycle()
             }
             cameraManager.onRecordingFrame = { bitmap ->
                 if (isTrackerReady) {

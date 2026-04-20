@@ -33,7 +33,7 @@ class ReacquisitionEngine(
         /** Embedding similarity above this bypasses position/size hard filters.
          *  Lower than label override because position rejection is a different risk
          *  than cross-category leakage — 0.55 is enough to say "same object, just moved." */
-        const val GEOMETRIC_OVERRIDE_THRESHOLD = 0.55f
+        const val GEOMETRIC_OVERRIDE_THRESHOLD = 0.6f
         /** Minimum embedding similarity to consider a candidate at all.
          *  If the primary embedder says the candidate is a different object (sim < this),
          *  no amount of re-ID, attributes, or color can rescue it. */
@@ -42,7 +42,7 @@ class ReacquisitionEngine(
          *  Async embeddings typically arrive within 2-3 frames. Allow a short grace
          *  period, then fall back to position/label scoring if embeddings never arrive
          *  (e.g. object left frame entirely, no detections to embed). */
-        const val EMBEDDING_REQUIRED_FRAMES = 10
+        const val EMBEDDING_REQUIRED_FRAMES = 5
         /** Maximum embeddings to keep in gallery. */
         const val MAX_GALLERY_SIZE = 12
     }
@@ -350,11 +350,14 @@ class ReacquisitionEngine(
         // right at 3%/frame and we lost it 5 frames ago, look 15% to the right
         // of the last known position instead of at the last known position itself.
         val velocitySpeed = kotlin.math.sqrt(lastKnownVelocityX * lastKnownVelocityX + lastKnownVelocityY * lastKnownVelocityY)
+        // Cap prediction to 10 frames — beyond that, velocity is unreliable and prediction
+        // pins to screen edge. Revert to last-known position as uncertainty grows.
+        val predictionFrames = minOf(framesLost, 10)
         val predictedCenterX = if (velocitySpeed > 0.01f) {
-            (refBox.centerX() + lastKnownVelocityX * framesLost).coerceIn(0f, 1f)
+            (refBox.centerX() + lastKnownVelocityX * predictionFrames).coerceIn(0f, 1f)
         } else refBox.centerX()
         val predictedCenterY = if (velocitySpeed > 0.01f) {
-            (refBox.centerY() + lastKnownVelocityY * framesLost).coerceIn(0f, 1f)
+            (refBox.centerY() + lastKnownVelocityY * predictionFrames).coerceIn(0f, 1f)
         } else refBox.centerY()
         val dx = candBox.centerX() - predictedCenterX
         val dy = candBox.centerY() - predictedCenterY

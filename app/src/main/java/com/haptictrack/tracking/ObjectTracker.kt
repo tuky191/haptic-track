@@ -57,7 +57,7 @@ class ObjectTracker(
     private val VT_ADAPTIVE_UNCONFIRMED_VERY_HIGH = 3  // ~100ms for very fast subjects
 
     /** Async embedding pipeline: compute embeddings on background thread, use results next frame. */
-    private val embeddingExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+    private val embeddingExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "EmbeddingAsync") }
     private var pendingEmbeddings: java.util.concurrent.Future<Map<Int, EmbeddingResult>>? = null
 
     /** Cached embedding results from previous frame, keyed by detection ID. */
@@ -379,11 +379,14 @@ class ObjectTracker(
                 } catch (e: java.util.concurrent.TimeoutException) { emptyMap() }
                 catch (e: Exception) { emptyMap() }
 
-                // Merge cached embeddings into current detections by best IoU match
+                // Merge cached embeddings into current detections by greedy IoU match.
+                // Each cached entry can only match one detection (prevents duplicates
+                // when overlapping boxes all match the same cached result).
                 val cachedEntries = cachedResults.entries.toList()
+                val usedCacheKeys = mutableSetOf<Int>()
                 val merged = withLabels.map { obj ->
                     val bestMatch = cachedEntries
-                        .filter { (_, result) -> result.cachedBox != null }
+                        .filter { (id, result) -> result.cachedBox != null && id !in usedCacheKeys }
                         .maxByOrNull { (_, result) ->
                             computeIou(obj.boundingBox, result.cachedBox!!)
                         }
@@ -391,6 +394,7 @@ class ObjectTracker(
                         computeIou(obj.boundingBox, result.cachedBox!!)
                     } ?: 0f
                     if (bestMatch != null && iou > 0.3f) {
+                        usedCacheKeys.add(bestMatch.key)
                         val cached = bestMatch.value
                         obj.copy(
                             embedding = cached.embedding,
