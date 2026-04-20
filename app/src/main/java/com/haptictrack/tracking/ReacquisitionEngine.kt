@@ -38,6 +38,11 @@ class ReacquisitionEngine(
          *  If the primary embedder says the candidate is a different object (sim < this),
          *  no amount of re-ID, attributes, or color can rescue it. */
         const val MIN_EMBEDDING_SIMILARITY = 0.15f
+        /** Frames to require embedding before allowing fallback scoring.
+         *  Async embeddings typically arrive within 2-3 frames. Allow a short grace
+         *  period, then fall back to position/label scoring if embeddings never arrive
+         *  (e.g. object left frame entirely, no detections to embed). */
+        const val EMBEDDING_REQUIRED_FRAMES = 10
         /** Maximum embeddings to keep in gallery. */
         const val MAX_GALLERY_SIZE = 12
     }
@@ -318,6 +323,14 @@ class ReacquisitionEngine(
         val appearanceScore = if (hasAppearance) {
             bestGallerySimilarity(candidate.embedding!!).coerceIn(0f, 1f)
         } else 0f
+        // --- GATE: Require embedding when gallery exists ---
+        // If we have reference embeddings but the candidate has none (async not ready),
+        // reject it — accepting without identity verification causes wrong-object locks.
+        // Allow fallback after EMBEDDING_REQUIRED_FRAMES to avoid permanent deadlock.
+        if (hasEmbeddings && candidate.embedding == null && framesLost < EMBEDDING_REQUIRED_FRAMES) {
+            return null
+        }
+
         // --- GATE: Embedding floor ---
         // If the primary embedder says this is a different object, reject outright.
         // Re-ID, attributes, and color are supplementary signals that can't override

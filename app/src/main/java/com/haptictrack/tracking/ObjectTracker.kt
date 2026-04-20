@@ -370,11 +370,14 @@ class ObjectTracker(
             } else tracked
 
             val withEmbeddings = if (needEmbeddings) {
-                // Collect any ready results from previous frame's async embedding computation.
-                // Match by best IoU overlap (not ID) since FTF IDs may change between frames.
+                // Collect results from previous frame's async embedding computation.
+                // Wait up to 50ms — the processing thread is decoupled from the GL thread,
+                // so blocking briefly is fine. Better to wait for embeddings than reacquire
+                // without identity verification.
                 val cachedResults = try {
-                    pendingEmbeddings?.takeIf { it.isDone }?.get() ?: emptyMap()
-                } catch (e: Exception) { emptyMap() }
+                    pendingEmbeddings?.get(50, java.util.concurrent.TimeUnit.MILLISECONDS) ?: emptyMap()
+                } catch (e: java.util.concurrent.TimeoutException) { emptyMap() }
+                catch (e: Exception) { emptyMap() }
 
                 // Merge cached embeddings into current detections by best IoU match
                 val cachedEntries = cachedResults.entries.toList()
@@ -400,16 +403,20 @@ class ObjectTracker(
                 }
 
                 // Kick off async embedding computation for current frame's detections.
-                // Results will be available next frame via pendingEmbeddings.
-                val bitmapCopy = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
-                val detectionsSnapshot = withLabels.toList()
-                pendingEmbeddings = embeddingExecutor.submit(java.util.concurrent.Callable {
-                    try {
-                        computeEmbeddingsSync(bitmapCopy, detectionsSnapshot)
-                    } finally {
-                        bitmapCopy.recycle()
-                    }
-                })
+                // Only submit if previous task is done — don't overwrite in-flight work
+                // or its results are lost before we can collect them.
+                val prevDone = pendingEmbeddings?.isDone ?: true
+                if (prevDone) {
+                    val bitmapCopy = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
+                    val detectionsSnapshot = withLabels.toList()
+                    pendingEmbeddings = embeddingExecutor.submit(java.util.concurrent.Callable {
+                        try {
+                            computeEmbeddingsSync(bitmapCopy, detectionsSnapshot)
+                        } finally {
+                            bitmapCopy.recycle()
+                        }
+                    })
+                }
 
                 merged
             } else {
