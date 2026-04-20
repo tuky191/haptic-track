@@ -15,6 +15,7 @@ import android.view.Surface
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Reads camera frames from a [SurfaceTexture] via OpenGL on a background thread.
@@ -24,7 +25,11 @@ import java.util.concurrent.atomic.AtomicBoolean
  * this class provides its own Surface to the Preview use case and reads frames
  * via SurfaceTexture → OpenGL texture → glReadPixels → Bitmap at 20-30fps.
  *
- * The output bitmap is downscaled to [outputWidth] × [outputHeight] for analysis.
+ * Architecture: two threads, decoupled via atomic "latest frame" holder.
+ * - GL thread: reads frames from SurfaceTexture at camera rate (~30fps),
+ *   stores latest bitmap in [latestFrame]. Old unprocessed frames are recycled.
+ * - Processing thread: picks up latest frame when ready, calls [onFrame].
+ *   Natural frame dropping when processing is slower than delivery.
  */
 class SurfaceTextureFrameReader(
     private val outputWidth: Int = 640,
@@ -37,10 +42,14 @@ class SurfaceTextureFrameReader(
     }
 
     private var glThread: Thread? = null
+    private var processingThread: Thread? = null
     private var surfaceTexture: SurfaceTexture? = null
     private var surface: Surface? = null
     private val running = AtomicBoolean(false)
     private val frameAvailable = AtomicBoolean(false)
+
+    /** Latest frame from GL thread. Processing thread swaps it out atomically. */
+    private val latestFrame = AtomicReference<Bitmap?>(null)
 
     // EGL state (initialized on GL thread)
     private var eglDisplay: EGLDisplay = EGL14.EGL_NO_DISPLAY
@@ -94,8 +103,9 @@ class SurfaceTextureFrameReader(
                 val program = createShaderProgram()
 
                 Log.i(TAG, "GL thread started, output=${outputWidth}x${outputHeight}")
+                var glFrameCount = 0
 
-                // Render loop
+                // GL render loop: reads frames at camera rate, stores latest
                 while (running.get()) {
                     if (frameAvailable.compareAndSet(true, false)) {
                         surfaceTexture?.updateTexImage()
@@ -109,10 +119,8 @@ class SurfaceTextureFrameReader(
                         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
                         GLES20.glUniform1i(GLES20.glGetUniformLocation(program, "sTexture"), 0)
 
-                        // Full-screen quad
                         drawQuad(program)
 
-                        // Read pixels
                         readBuffer.rewind()
                         GLES20.glReadPixels(0, 0, outputWidth, outputHeight,
                             GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, readBuffer)
@@ -121,16 +129,18 @@ class SurfaceTextureFrameReader(
                         val bitmap = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.ARGB_8888)
                         bitmap.copyPixelsFromBuffer(readBuffer)
 
-                        // GL reads bottom-to-top, flip vertically
                         val flipped = flipVertically(bitmap)
                         bitmap.recycle()
 
-                        onFrame(flipped)
+                        // Store latest frame — recycle any unprocessed previous frame
+                        val old = latestFrame.getAndSet(flipped)
+                        old?.recycle()
+                        glFrameCount++
                     } else {
-                        // No frame ready, sleep briefly to avoid busy-waiting
                         Thread.sleep(1)
                     }
                 }
+                Log.i(TAG, "GL thread produced $glFrameCount frames")
 
                 // Cleanup
                 GLES20.glDeleteFramebuffers(1, fbo, 0)
@@ -148,14 +158,40 @@ class SurfaceTextureFrameReader(
 
         surfaceLatch.await(3, java.util.concurrent.TimeUnit.SECONDS)
         surface = resultSurface
+
+        // Start processing thread — picks up latest frame when ready,
+        // naturally drops frames when processing is slower than GL delivery
+        processingThread = Thread({
+            var processedCount = 0
+            var droppedCount = 0
+            Log.i(TAG, "Processing thread started")
+            while (running.get()) {
+                val frame = latestFrame.getAndSet(null)
+                if (frame != null) {
+                    onFrame(frame)
+                    // onFrame's consumer (processBitmap) recycles the bitmap
+                    processedCount++
+                } else {
+                    Thread.sleep(2) // wait for next frame
+                }
+            }
+            // Recycle any remaining frame
+            latestFrame.getAndSet(null)?.recycle()
+            Log.i(TAG, "Processing thread stopped: $processedCount processed")
+        }, "STFrameReader-Process")
+        processingThread?.start()
+
         return resultSurface ?: throw IllegalStateException("Failed to create Surface")
     }
 
-    /** Stop the GL thread and release resources. */
+    /** Stop both threads and release resources. */
     fun stop() {
         running.set(false)
+        processingThread?.join(2000)
+        processingThread = null
         glThread?.join(2000)
         glThread = null
+        latestFrame.getAndSet(null)?.recycle()
         surface?.release()
         surface = null
         surfaceTexture?.release()
