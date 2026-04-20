@@ -56,6 +56,21 @@ class ObjectTracker(
     private val VT_ADAPTIVE_UNCONFIRMED_HIGH = 5      // ~165ms for fast subjects
     private val VT_ADAPTIVE_UNCONFIRMED_VERY_HIGH = 3  // ~100ms for very fast subjects
 
+    /** Async embedding pipeline: compute embeddings on background thread, use results next frame. */
+    private val embeddingExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+    private var pendingEmbeddings: java.util.concurrent.Future<Map<Int, EmbeddingResult>>? = null
+
+    /** Cached embedding results from previous frame, keyed by detection ID. */
+    data class EmbeddingResult(
+        val embedding: FloatArray? = null,
+        val colorHistogram: FloatArray? = null,
+        val personAttributes: PersonAttributes? = null,
+        val reIdEmbedding: FloatArray? = null,
+        val faceEmbedding: FloatArray? = null,
+        /** Bounding box at computation time, for IoU-based matching to next frame. */
+        val cachedBox: RectF? = null
+    )
+
     /** Callback: (displayObjects, lockedObject, imageWidth, imageHeight, contour) */
     var onDetectionResult: ((List<TrackedObject>, TrackedObject?, Int, Int, List<PointF>) -> Unit)? = null
 
@@ -157,6 +172,8 @@ class ObjectTracker(
         vtUnconfirmedFrames = 0
         vtFrameCounter = 0
         velocityEstimator.reset()
+        pendingEmbeddings?.cancel(true)
+        pendingEmbeddings = null
         reacquisition.prepareForRebind()
     }
 
@@ -171,6 +188,8 @@ class ObjectTracker(
         vtConfirmedFrames = 0
         vtFrameCounter = 0
         velocityEstimator.reset()
+        pendingEmbeddings?.cancel(true)
+        pendingEmbeddings = null
         cachedContour = emptyList()
         contourFrameCount = 0
     }
@@ -332,10 +351,7 @@ class ObjectTracker(
                 frameTracker.assignIds(detections)
             }
 
-            // Compute embeddings only when searching. Skip on direct ID match frames —
-            // saves ~70ms of embedding/segmentation/classification per frame.
-            // After VT handoff, the first detector frame may have a new ID (VT drift
-            // caused framesLost=1), which triggers isSearching and computes embeddings.
+            // --- Embedding pipeline (async): use previous frame's results, kick off current ---
             val hasDirectMatch = reacquisition.lockedId != null &&
                 tracked.any { it.id == reacquisition.lockedId }
             val needEmbeddings = reacquisition.hasEmbeddings &&
@@ -354,35 +370,52 @@ class ObjectTracker(
             } else tracked
 
             val withEmbeddings = if (needEmbeddings) {
-                // First pass: compute embeddings + histograms for all candidates
-                val withVisual = withLabels.map { obj ->
-                    val result = appearanceEmbedder.embedAndCrop(bitmap, obj.boundingBox, fallback = true)
-                    val hist = if (result.maskedCrop != null) {
-                        val fullBox = RectF(0f, 0f, 1f, 1f)
-                        computeColorHistogram(result.maskedCrop, fullBox).also { result.maskedCrop.recycle() }
-                    } else computeColorHistogram(bitmap, obj.boundingBox)
-                    obj.copy(embedding = result.embedding, colorHistogram = hist)
-                }
-                // Second pass: classify person attributes only for top-2 person
-                // candidates by embedding similarity (3 model inferences is expensive)
-                val personCandidates = withVisual
-                    .filter { it.label == "person" && it.embedding != null }
-                    .sortedByDescending { reacquisition.bestGallerySimilarity(it.embedding!!) }
-                    .take(2)
-                    .map { it.id }
-                    .toSet()
-                withVisual.map { obj ->
-                    if (obj.id in personCandidates) {
-                        val attrs = personClassifier.classify(bitmap, obj.boundingBox, obj.label)
-                        // Compute re-ID + face embeddings for person candidates
-                        val reIdEmb = personReId.embed(bitmap, obj.boundingBox)
-                        val faceEmb = if (reacquisition.lockedFaceEmbedding != null) {
-                            faceEmbedder.embedFace(bitmap, obj.boundingBox)
-                        } else null
-                        obj.copy(personAttributes = attrs, reIdEmbedding = reIdEmb, faceEmbedding = faceEmb)
+                // Collect any ready results from previous frame's async embedding computation.
+                // Match by best IoU overlap (not ID) since FTF IDs may change between frames.
+                val cachedResults = try {
+                    pendingEmbeddings?.takeIf { it.isDone }?.get() ?: emptyMap()
+                } catch (e: Exception) { emptyMap() }
+
+                // Merge cached embeddings into current detections by best IoU match
+                val cachedEntries = cachedResults.entries.toList()
+                val merged = withLabels.map { obj ->
+                    val bestMatch = cachedEntries
+                        .filter { (_, result) -> result.cachedBox != null }
+                        .maxByOrNull { (_, result) ->
+                            computeIou(obj.boundingBox, result.cachedBox!!)
+                        }
+                    val iou = bestMatch?.let { (_, result) ->
+                        computeIou(obj.boundingBox, result.cachedBox!!)
+                    } ?: 0f
+                    if (bestMatch != null && iou > 0.3f) {
+                        val cached = bestMatch.value
+                        obj.copy(
+                            embedding = cached.embedding,
+                            colorHistogram = cached.colorHistogram,
+                            personAttributes = cached.personAttributes,
+                            reIdEmbedding = cached.reIdEmbedding,
+                            faceEmbedding = cached.faceEmbedding
+                        )
                     } else obj
                 }
-            } else withLabels
+
+                // Kick off async embedding computation for current frame's detections.
+                // Results will be available next frame via pendingEmbeddings.
+                val bitmapCopy = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
+                val detectionsSnapshot = withLabels.toList()
+                pendingEmbeddings = embeddingExecutor.submit(java.util.concurrent.Callable {
+                    try {
+                        computeEmbeddingsSync(bitmapCopy, detectionsSnapshot)
+                    } finally {
+                        bitmapCopy.recycle()
+                    }
+                })
+
+                merged
+            } else {
+                pendingEmbeddings = null // clear when not searching
+                withLabels
+            }
 
             // Snapshot state before processing
             val wasSearching = reacquisition.isSearching
@@ -553,9 +586,48 @@ class ObjectTracker(
         }
     }
 
+    /**
+     * Compute embeddings synchronously for a list of detections. Runs on [embeddingExecutor].
+     * Returns a map of detection ID → embedding results.
+     */
+    private fun computeEmbeddingsSync(bitmap: Bitmap, detections: List<TrackedObject>): Map<Int, EmbeddingResult> {
+        val results = mutableMapOf<Int, EmbeddingResult>()
+        // First pass: embeddings + color histograms for all
+        for (obj in detections) {
+            val embResult = appearanceEmbedder.embedAndCrop(bitmap, obj.boundingBox, fallback = true)
+            val hist = if (embResult.maskedCrop != null) {
+                val fullBox = RectF(0f, 0f, 1f, 1f)
+                computeColorHistogram(embResult.maskedCrop, fullBox).also { embResult.maskedCrop.recycle() }
+            } else computeColorHistogram(bitmap, obj.boundingBox)
+            results[obj.id] = EmbeddingResult(embedding = embResult.embedding, colorHistogram = hist, cachedBox = RectF(obj.boundingBox))
+        }
+        // Second pass: classify top-2 person candidates
+        val personCandidates = detections
+            .filter { it.label == "person" && results[it.id]?.embedding != null }
+            .sortedByDescending {
+                val emb = results[it.id]?.embedding
+                if (emb != null) reacquisition.bestGallerySimilarity(emb) else 0f
+            }
+            .take(2)
+            .map { it.id }
+            .toSet()
+        for (id in personCandidates) {
+            val obj = detections.find { it.id == id } ?: continue
+            val attrs = personClassifier.classify(bitmap, obj.boundingBox, obj.label)
+            val reIdEmb = personReId.embed(bitmap, obj.boundingBox)
+            val faceEmb = if (reacquisition.lockedFaceEmbedding != null) {
+                faceEmbedder.embedFace(bitmap, obj.boundingBox)
+            } else null
+            val existing = results[id] ?: EmbeddingResult(cachedBox = RectF(obj.boundingBox))
+            results[id] = existing.copy(personAttributes = attrs, reIdEmbedding = reIdEmb, faceEmbedding = faceEmb)
+        }
+        return results
+    }
+
     fun shutdown() {
         scenarioRecorder.stop()
         debugCapture.endSession()
+        embeddingExecutor.shutdownNow()
         detector.close()
         labelEnricher.close()
         faceEmbedder.close()
