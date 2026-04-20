@@ -132,15 +132,14 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 tracker.analyzer
             )
             // During recording, frames come from SurfaceTextureFrameReader instead of ImageAnalysis.
-            // Feed them to ObjectTracker.processBitmap() and expose for viewfinder display.
+            // Viewfinder updates at GL rate (~29fps) — always smooth, independent of processing.
+            // Processing thread picks up latest frame when ready (~10-12fps), naturally drops frames.
+            cameraManager.onViewfinderFrame = { bitmap ->
+                // Don't recycle — Compose may still be drawing previous frames. Let GC handle.
+                _viewfinderBitmap.value = bitmap
+            }
             cameraManager.onRecordingFrame = { bitmap ->
                 if (isTrackerReady) {
-                    // Copy for viewfinder before processBitmap recycles the original.
-                    // Don't recycle old bitmaps — Compose may still be drawing them.
-                    // Let GC handle cleanup; bitmaps are small (640x480 ARGB = ~1.2MB).
-                    val viewfinderCopy = bitmap.copy(bitmap.config ?: android.graphics.Bitmap.Config.ARGB_8888, false)
-                    _viewfinderBitmap.value = viewfinderCopy
-
                     tracker.processBitmap(bitmap)
                 }
             }

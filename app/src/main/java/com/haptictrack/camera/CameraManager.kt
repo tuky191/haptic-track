@@ -58,8 +58,11 @@ class CameraManager(private val context: Context) {
     /** Reads frames from Preview surface via OpenGL during recording mode. */
     private var frameReader: SurfaceTextureFrameReader? = null
 
-    /** Callback for frames read from the Preview surface during recording. */
+    /** Callback for frames read from the Preview surface during recording (processing thread). */
     var onRecordingFrame: ((android.graphics.Bitmap) -> Unit)? = null
+
+    /** Callback for viewfinder display frames during recording (GL thread, ~29fps). */
+    var onViewfinderFrame: ((android.graphics.Bitmap) -> Unit)? = null
 
     val preview = Preview.Builder().build()
 
@@ -178,7 +181,8 @@ class CameraManager(private val context: Context) {
                     inputHeight = inputSize.height,
                     outputWidth = outW,
                     outputHeight = outH,
-                    onFrame = { bitmap -> onRecordingFrame?.invoke(bitmap) }
+                    onFrame = { bitmap -> onRecordingFrame?.invoke(bitmap) },
+                    onViewfinderFrame = { bitmap -> onViewfinderFrame?.invoke(bitmap) }
                 )
                 val readerSurface = reader.start()
                 frameReader = reader

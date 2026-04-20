@@ -38,7 +38,10 @@ class SurfaceTextureFrameReader(
     /** Output bitmap size (portrait for portrait phones). */
     private val outputWidth: Int = 480,
     private val outputHeight: Int = 640,
-    private val onFrame: (Bitmap) -> Unit
+    /** Called on processing thread when a frame is ready for ObjectTracker. */
+    private val onFrame: (Bitmap) -> Unit,
+    /** Called on GL thread at camera rate (~29fps) for viewfinder display. */
+    private val onViewfinderFrame: ((Bitmap) -> Unit)? = null
 ) {
 
     companion object {
@@ -139,7 +142,15 @@ class SurfaceTextureFrameReader(
                         val bitmap = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.ARGB_8888)
                         bitmap.copyPixelsFromBuffer(readBuffer)
 
-                        // Store latest frame — recycle any unprocessed previous frame
+                        // Send to viewfinder at full camera rate (~29fps).
+                        // Viewfinder gets its own copy — not recycled by processing thread.
+                        // Don't recycle old viewfinder bitmaps: Compose may still be drawing them.
+                        if (onViewfinderFrame != null) {
+                            val vfBitmap = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
+                            onViewfinderFrame.invoke(vfBitmap)
+                        }
+
+                        // Store latest frame for processing — recycle any unprocessed previous frame
                         // No manual flip needed — transform matrix handles orientation
                         val old = latestFrame.getAndSet(bitmap)
                         old?.recycle()
