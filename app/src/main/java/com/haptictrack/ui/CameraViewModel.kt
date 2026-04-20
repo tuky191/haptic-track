@@ -135,11 +135,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             // Feed them to ObjectTracker.processBitmap() and expose for viewfinder display.
             cameraManager.onRecordingFrame = { bitmap ->
                 if (isTrackerReady) {
-                    // Copy for viewfinder before processBitmap recycles the original
+                    // Copy for viewfinder before processBitmap recycles the original.
+                    // Don't recycle old bitmaps — Compose may still be drawing them.
+                    // Let GC handle cleanup; bitmaps are small (640x480 ARGB = ~1.2MB).
                     val viewfinderCopy = bitmap.copy(bitmap.config ?: android.graphics.Bitmap.Config.ARGB_8888, false)
-                    val old = _viewfinderBitmap.value
                     _viewfinderBitmap.value = viewfinderCopy
-                    old?.recycle()
 
                     tracker.processBitmap(bitmap)
                 }
@@ -310,7 +310,6 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                         _uiState.update { it.copy(isRecording = true) }
                     is VideoRecordEvent.Finalize -> {
                         _uiState.update { it.copy(isRecording = false) }
-                        _viewfinderBitmap.value?.recycle()
                         _viewfinderBitmap.value = null
                         if (!_uiState.value.stealthMode) {
                             objectTracker.prepareForRebind()

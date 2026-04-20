@@ -32,8 +32,12 @@ import java.util.concurrent.atomic.AtomicReference
  *   Natural frame dropping when processing is slower than delivery.
  */
 class SurfaceTextureFrameReader(
-    private val outputWidth: Int = 640,
-    private val outputHeight: Int = 480,
+    /** Camera's native buffer size (landscape, e.g. 1600x1200). */
+    private val inputWidth: Int = 1600,
+    private val inputHeight: Int = 1200,
+    /** Output bitmap size (portrait for portrait phones). */
+    private val outputWidth: Int = 480,
+    private val outputHeight: Int = 640,
     private val onFrame: (Bitmap) -> Unit
 ) {
 
@@ -77,7 +81,7 @@ class SurfaceTextureFrameReader(
                 initEGL()
                 textureId = createExternalTexture()
                 surfaceTexture = SurfaceTexture(textureId).apply {
-                    setDefaultBufferSize(outputWidth, outputHeight)
+                    setDefaultBufferSize(inputWidth, inputHeight)
                     setOnFrameAvailableListener { frameAvailable.set(true) }
                 }
                 resultSurface = Surface(surfaceTexture)
@@ -314,11 +318,13 @@ class SurfaceTextureFrameReader(
 
     // --- Quad rendering ---
 
+    // Quad vertices with flipped Y positions to correct for GL→Bitmap coordinate mismatch.
+    // GL has Y-up, Bitmap has Y-down. Flipping the quad avoids a separate flipVertically pass.
     private val quadVertices = floatArrayOf(
-        -1f, -1f, 0f, 0f,  // bottom-left
-         1f, -1f, 1f, 0f,  // bottom-right
-        -1f,  1f, 0f, 1f,  // top-left
-         1f,  1f, 1f, 1f   // top-right
+        -1f,  1f, 0f, 0f,  // top-left (GL) → top-left (Bitmap)
+         1f,  1f, 1f, 0f,  // top-right
+        -1f, -1f, 0f, 1f,  // bottom-left
+         1f, -1f, 1f, 1f   // bottom-right
     )
 
     private val quadBuffer = ByteBuffer.allocateDirect(quadVertices.size * 4)

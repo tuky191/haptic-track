@@ -160,15 +160,29 @@ class CameraManager(private val context: Context) {
             // 2 streams: preview + video → 4K video
             // Preview goes to SurfaceTextureFrameReader for fast off-thread frame capture
             // instead of PreviewView.getBitmap() (slow, main-thread, 7-10fps)
-            val reader = SurfaceTextureFrameReader(
-                outputWidth = 640,
-                outputHeight = 480,
-                onFrame = { bitmap -> onRecordingFrame?.invoke(bitmap) }
-            )
-            val readerSurface = reader.start()
-            frameReader = reader
-
             preview.surfaceProvider = Preview.SurfaceProvider { request ->
+                val inputSize = request.resolution // camera's native buffer size (landscape, e.g. 1600x1200)
+                // Output in portrait at analysis resolution.
+                // Camera outputs landscape; transform matrix rotates 90°.
+                // So output width = min dim scaled, height = max dim scaled.
+                val analysisShort = 480 // short edge of output
+                val aspect = inputSize.width.toFloat() / inputSize.height
+                val analysisLong = (analysisShort * aspect).toInt()
+                // Portrait: width=short, height=long
+                val outW = analysisShort
+                val outH = analysisLong
+                Log.i(TAG, "SurfaceTexture: input=${inputSize}, output=${outW}x${outH}")
+
+                val reader = SurfaceTextureFrameReader(
+                    inputWidth = inputSize.width,
+                    inputHeight = inputSize.height,
+                    outputWidth = outW,
+                    outputHeight = outH,
+                    onFrame = { bitmap -> onRecordingFrame?.invoke(bitmap) }
+                )
+                val readerSurface = reader.start()
+                frameReader = reader
+
                 request.provideSurface(readerSurface, java.util.concurrent.Executors.newSingleThreadExecutor()) { result ->
                     Log.d(TAG, "Preview surface result: ${result.resultCode}")
                 }
