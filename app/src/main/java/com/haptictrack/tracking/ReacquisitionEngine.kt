@@ -60,6 +60,15 @@ class ReacquisitionEngine(
 
     /** Convenience: true if we have any reference embeddings. */
     val hasEmbeddings: Boolean get() = _embeddingGallery.isNotEmpty()
+    /** Centroid (L2-normalized mean) of the gallery — stable identity representation. */
+    private var _embeddingCentroid: FloatArray? = null
+    private fun recomputeCentroid() { _embeddingCentroid = computeCentroid(_embeddingGallery) }
+
+    /** Cosine similarity between a candidate and the gallery centroid. */
+    fun centroidSimilarity(candidate: FloatArray): Float {
+        val centroid = _embeddingCentroid ?: return 0f
+        return cosineSimilarity(candidate, centroid)
+    }
     /** Reference color histogram from lock time. */
     var lockedColorHistogram: FloatArray? = null
         private set
@@ -102,6 +111,7 @@ class ReacquisitionEngine(
         lockedLabel = label
         lockedCocoLabel = cocoLabel
         _embeddingGallery = embeddings.map { it.copyOf() }.toMutableList()
+        recomputeCentroid()
         lockedColorHistogram = colorHist?.copyOf()
         lockedPersonAttributes = personAttrs
         lockedReIdEmbedding = reIdEmbedding?.copyOf()
@@ -135,6 +145,7 @@ class ReacquisitionEngine(
             }
         }
         _embeddingGallery.add(embedding.copyOf())
+        recomputeCentroid()
     }
 
     fun clear() {
@@ -143,6 +154,7 @@ class ReacquisitionEngine(
         lockedLabel = null
         lockedCocoLabel = null
         _embeddingGallery.clear()
+        _embeddingCentroid = null
         lockedColorHistogram = null
         lockedPersonAttributes = null
         lockedReIdEmbedding = null
@@ -264,10 +276,19 @@ class ReacquisitionEngine(
         // strong embedding (>0.7) overrides — handles label flicker.
         val validCandidates = candidates.filter { it.id >= 0 }
 
+        // Single-candidate fast path: if exactly one same-label candidate exists,
+        // bypass the EMBEDDING_REQUIRED_FRAMES wait. With no ambiguity about which
+        // object to pick, waiting for embeddings just delays the inevitable reacquisition.
+        val sameLabelCandidates = validCandidates.filter { candidate ->
+            val label = candidate.label ?: return@filter false
+            label == lockedLabel || label == lockedCocoLabel
+        }
+        val isSoleSameLabel = sameLabelCandidates.size == 1
+
         val logThis = framesLost % 10 == 1 || validCandidates.isNotEmpty()
 
         val scored = validCandidates.mapNotNull { candidate ->
-            val score = scoreCandidate(candidate, refBox, posConf, posThreshold)
+            val score = scoreCandidate(candidate, refBox, posConf, posThreshold, isSoleSameLabel)
             val sim = if (hasEmbeddings && candidate.embedding != null) {
                 bestGallerySimilarity(candidate.embedding!!)
             } else null
@@ -296,10 +317,30 @@ class ReacquisitionEngine(
             }
         }
 
-        return scored
-            .maxByOrNull { it.second }
-            ?.takeIf { it.second >= minScoreThreshold }
-            ?.first
+        if (scored.isEmpty()) return null
+
+        val sortedScored = scored.sortedByDescending { it.second }
+        val best = sortedScored[0]
+
+        // Relative scoring: if the best candidate has a clear embedding margin over
+        // the rest of the scene, it's almost certainly the target — even if its absolute
+        // score is borderline. This handles label-flicker cases where sim=0.6 is clearly
+        // the target but doesn't clear absolute thresholds.
+        if (sortedScored.size >= 2) {
+            val bestSim = if (hasEmbeddings && best.first.embedding != null) {
+                bestGallerySimilarity(best.first.embedding!!)
+            } else 0f
+            val secondSim = if (hasEmbeddings && sortedScored[1].first.embedding != null) {
+                bestGallerySimilarity(sortedScored[1].first.embedding!!)
+            } else 0f
+            val margin = bestSim - secondSim
+            if (margin > 0.2f && bestSim > 0.4f && best.second >= minScoreThreshold * 0.8f) {
+                if (logThis) dualLog(Log.DEBUG, "  RELATIVE_MARGIN: best sim=${fmtF(bestSim)} margin=${fmtF(margin)} — accepting")
+                return best.first
+            }
+        }
+
+        return best.takeIf { it.second >= minScoreThreshold }?.first
     }
 
     /**
@@ -314,7 +355,8 @@ class ReacquisitionEngine(
         candidate: TrackedObject,
         refBox: RectF,
         positionConfidence: Float = positionConfidence(),
-        posThreshold: Float = effectivePositionThreshold()
+        posThreshold: Float = effectivePositionThreshold(),
+        soleSameLabelCandidate: Boolean = false
     ): Float? {
         val candBox = candidate.boundingBox
 
@@ -327,7 +369,8 @@ class ReacquisitionEngine(
         // If we have reference embeddings but the candidate has none (async not ready),
         // reject it — accepting without identity verification causes wrong-object locks.
         // Allow fallback after EMBEDDING_REQUIRED_FRAMES to avoid permanent deadlock.
-        if (hasEmbeddings && candidate.embedding == null && framesLost < EMBEDDING_REQUIRED_FRAMES) {
+        // Exception: sole same-label candidate bypasses this — no ambiguity, no need to wait.
+        if (hasEmbeddings && candidate.embedding == null && framesLost < EMBEDDING_REQUIRED_FRAMES && !soleSameLabelCandidate) {
             return null
         }
 
@@ -464,6 +507,9 @@ class ReacquisitionEngine(
                    labelBonus
         } else if (hasAppearance) {
             // Generic embedding only (non-person, or person without re-ID)
+            // Use centroid similarity for ranking (more stable than best-of-gallery)
+            val centroidScore = centroidSimilarity(candidate.embedding!!).coerceIn(0f, 1f)
+            val embScore = (appearanceScore + centroidScore) / 2f  // blend best-match + centroid
             val baseEmbW = 0.50f
             val basePosW = 0.15f * positionConfidence
             val baseSizeW = 0.10f
@@ -472,7 +518,7 @@ class ReacquisitionEngine(
             val unused = (1f - baseEmbW - basePosW - baseSizeW - baseColorW - baseAttrW).coerceAtLeast(0f)
             val effEmbW = baseEmbW + unused
 
-            return (appearanceScore * effEmbW) +
+            return (embScore * effEmbW) +
                    (positionScore * basePosW) +
                    (sizeScore * baseSizeW) +
                    (colorScore * baseColorW) +

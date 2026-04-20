@@ -258,6 +258,11 @@ class ObjectTracker(
                             FrameToFrameTracker.computeIou(det.boundingBox, vtBox) > 0.15f
                         }
                     }
+                    // Distinguish non-confirmation from contradiction:
+                    // If detector found nothing at all, that's not evidence of drift —
+                    // it's poor detection conditions. Only count unconfirmed when
+                    // detector found detections but none match our tracked position.
+                    val detectorFoundSomething = skipDetector || tracked.isNotEmpty()
 
                     if (confirmed) {
                         vtUnconfirmedFrames = 0
@@ -265,16 +270,20 @@ class ObjectTracker(
                         reacquisition.updateFromVisualTracker(vtBox)
                         reacquisition.updateVelocity(velocityEstimator.velocityX, velocityEstimator.velocityY)
 
-                        // Accumulate embedding from current angle (every 30 confirmed frames ≈ 1s)
+                        // Accumulate embedding from current angle (every 15 confirmed frames ≈ 0.5s)
                         // Use raw rotated-image coords for embedding (embedder works on rotated bitmap)
                         vtConfirmedFrames++
-                        if (vtConfirmedFrames % 30 == 0) {
+                        if (vtConfirmedFrames % 15 == 0) {
                             // Use fallback: during confirmed tracking, even an unmasked
                             // embedding is better than no embedding for gallery diversity
                             val emb = appearanceEmbedder.embedWithFallback(bitmap, rawBox)
                             if (emb != null) {
-                                reacquisition.addEmbedding(emb)
-                                android.util.Log.d("AppearEmbed", "Gallery +1 → ${reacquisition.embeddingGallery.size} (accumulated)")
+                                // Diversity check: only add if meaningfully different from centroid
+                                val centroidSim = reacquisition.centroidSimilarity(emb)
+                                if (centroidSim < 0.92f || reacquisition.embeddingGallery.size < 8) {
+                                    reacquisition.addEmbedding(emb)
+                                    android.util.Log.d("AppearEmbed", "Gallery +1 → ${reacquisition.embeddingGallery.size} (centroidSim=${centroidSim})")
+                                }
                             }
                             // Progressive face embedding: try to capture face during tracking
                             // Use rawBox (rotated-image coords) since bitmap is the rotated image
@@ -284,7 +293,12 @@ class ObjectTracker(
                             }
                         }
                     } else {
-                        vtUnconfirmedFrames++
+                        // Only count as unconfirmed if detector actually found detections
+                        // (found objects but none match VT position = likely drift).
+                        // Empty detector output = poor conditions, not drift evidence.
+                        if (detectorFoundSomething) {
+                            vtUnconfirmedFrames++
+                        }
                     }
 
                     // If too many frames without detector confirmation, tracker is drifting.
