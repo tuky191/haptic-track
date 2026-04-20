@@ -33,7 +33,7 @@ class ReacquisitionEngine(
         /** Embedding similarity above this bypasses position/size hard filters.
          *  Lower than label override because position rejection is a different risk
          *  than cross-category leakage — 0.55 is enough to say "same object, just moved." */
-        const val GEOMETRIC_OVERRIDE_THRESHOLD = 0.6f
+        const val GEOMETRIC_OVERRIDE_THRESHOLD = 0.55f
         /** Minimum embedding similarity to consider a candidate at all.
          *  If the primary embedder says the candidate is a different object (sim < this),
          *  no amount of re-ID, attributes, or color can rescue it. */
