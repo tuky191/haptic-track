@@ -127,6 +127,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 java.util.concurrent.Executors.newSingleThreadExecutor(),
                 tracker.analyzer
             )
+            // During recording, frames come from SurfaceTextureFrameReader instead of ImageAnalysis.
+            // Feed them to ObjectTracker.processBitmap() (same path as the old getBitmap loop).
+            cameraManager.onRecordingFrame = { bitmap ->
+                if (isTrackerReady) tracker.processBitmap(bitmap)
+            }
             _uiState.update { it.copy(isReady = true) }
             Log.i(TAG, "ML models loaded, tracking ready")
         }
@@ -255,9 +260,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         objectTracker.prepareForRebind()
         if (entering) {
             cameraManager.enterRecordingMode()
-            startBitmapAnalysis()
+            // Frame reader in CameraManager handles analysis via onRecordingFrame
         } else {
-            stopBitmapAnalysis()
             cameraManager.exitRecordingMode()
         }
     }
@@ -282,12 +286,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         if (!isTrackerReady) return
         if (recordingManager.isRecording) {
             recordingManager.stopRecording()
-            if (!_uiState.value.stealthMode) stopBitmapAnalysis()
         } else {
             if (!_uiState.value.stealthMode) {
                 objectTracker.prepareForRebind()
                 cameraManager.enterRecordingMode()
-                startBitmapAnalysis()
+                // Frame reader in CameraManager handles analysis via onRecordingFrame
             }
             recordingManager.startRecording(cameraManager.videoCapture) { event ->
                 when (event) {

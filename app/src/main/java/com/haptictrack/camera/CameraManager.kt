@@ -55,6 +55,12 @@ class CameraManager(private val context: Context) {
     var analysisActive: Boolean = true
         private set
 
+    /** Reads frames from Preview surface via OpenGL during recording mode. */
+    private var frameReader: SurfaceTextureFrameReader? = null
+
+    /** Callback for frames read from the Preview surface during recording. */
+    var onRecordingFrame: ((android.graphics.Bitmap) -> Unit)? = null
+
     val preview = Preview.Builder().build()
 
     val imageAnalysis: ImageAnalysis = ImageAnalysis.Builder()
@@ -140,19 +146,37 @@ class CameraManager(private val context: Context) {
         val provider = cameraProvider ?: return
         provider.unbindAll()
 
+        // Stop any existing frame reader
+        frameReader?.stop()
+        frameReader = null
+
         // Recreate VideoCapture to avoid resolution mismatch when switching modes
         videoCapture = createVideoCapture()
-
-        preview.surfaceProvider = previewView.surfaceProvider
 
         val selector = if (isFrontCamera) CameraSelector.DEFAULT_FRONT_CAMERA
                        else CameraSelector.DEFAULT_BACK_CAMERA
 
         val camera = if (recordingMode) {
-            // 2 streams: preview + video → 4K video, analysis via getBitmap()
+            // 2 streams: preview + video → 4K video
+            // Preview goes to SurfaceTextureFrameReader for fast off-thread frame capture
+            // instead of PreviewView.getBitmap() (slow, main-thread, 7-10fps)
+            val reader = SurfaceTextureFrameReader(
+                outputWidth = 640,
+                outputHeight = 480,
+                onFrame = { bitmap -> onRecordingFrame?.invoke(bitmap) }
+            )
+            val readerSurface = reader.start()
+            frameReader = reader
+
+            preview.surfaceProvider = Preview.SurfaceProvider { request ->
+                request.provideSurface(readerSurface, java.util.concurrent.Executors.newSingleThreadExecutor()) { result ->
+                    Log.d(TAG, "Preview surface result: ${result.resultCode}")
+                }
+            }
             provider.bindToLifecycle(lifecycleOwner, selector, preview, videoCapture)
         } else {
             // 3 streams: preview + analysis + video → full-quality analysis
+            preview.surfaceProvider = previewView.surfaceProvider
             provider.bindToLifecycle(lifecycleOwner, selector, preview, imageAnalysis, videoCapture)
         }
         analysisActive = !recordingMode
@@ -162,7 +186,7 @@ class CameraManager(private val context: Context) {
 
         val previewRes = preview.resolutionInfo?.resolution
         val analysisRes = if (!recordingMode) imageAnalysis.resolutionInfo?.resolution else null
-        Log.i(TAG, "Bound use cases — preview: $previewRes, analysis: $analysisRes, mode: ${if (recordingMode) "recording (2-stream)" else "tracking (3-stream)"}")
+        Log.i(TAG, "Bound use cases — preview: $previewRes, analysis: $analysisRes, frameReader: ${frameReader != null}, mode: ${if (recordingMode) "recording (2-stream)" else "tracking (3-stream)"}")
     }
 
     fun setZoomRatio(ratio: Float) {
@@ -225,6 +249,8 @@ class CameraManager(private val context: Context) {
     }
 
     fun shutdown() {
+        frameReader?.stop()
+        frameReader = null
         cameraProvider?.unbindAll()
     }
 }
