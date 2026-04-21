@@ -441,8 +441,13 @@ class ReacquisitionEngine(
             if (candSize > lastKnownSize) candSize / lastKnownSize else lastKnownSize / candSize
         } else 1f
         val effectiveSizeThreshold = effectiveSizeRatioThreshold()
-        if (sizeRatio > effectiveSizeThreshold && !geometricOverride) return null
-        if (sizeRatio > effectiveSizeThreshold && geometricOverride) {
+        // Without embeddings, use a stricter size limit to avoid locking on partial bodies
+        // (e.g. a hand when we locked on a full person). Max 3x size ratio without identity.
+        val sizeThreshold = if (!hasAppearance && _embeddingGallery.size >= 8) {
+            minOf(effectiveSizeThreshold, 3.0f)
+        } else effectiveSizeThreshold
+        if (sizeRatio > sizeThreshold && !geometricOverride) return null
+        if (sizeRatio > sizeThreshold && geometricOverride) {
             dualLog(Log.DEBUG, "  OVERRIDE size: ratio=${fmtF(sizeRatio)} > thresh=${fmtF(effectiveSizeThreshold)}, but sim=${fmtF(appearanceScore)}")
         }
 
