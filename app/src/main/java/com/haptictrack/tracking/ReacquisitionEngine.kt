@@ -404,9 +404,11 @@ class ReacquisitionEngine(
 
         // --- GATE: Embedding floor ---
         // If the primary embedder says this is a different object, reject outright.
-        // Re-ID, attributes, and color are supplementary signals that can't override
-        // a negative identity match from the primary 1280-dim embedding.
-        if (hasAppearance && appearanceScore < MIN_EMBEDDING_SIMILARITY) {
+        // With mature gallery, raise the floor: we have strong identity reference,
+        // so demand higher similarity. Prevents cross-object confusion within same
+        // category (e.g. keyboard accepted when tracking mouse, both non-person).
+        val embeddingFloor = if (galleryMature) 0.45f else MIN_EMBEDDING_SIMILARITY
+        if (hasAppearance && appearanceScore < embeddingFloor) {
             return null
         }
 
