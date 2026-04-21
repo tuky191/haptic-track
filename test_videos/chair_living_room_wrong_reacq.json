@@ -1,0 +1,8 @@
+{
+  "description": "Chair at desk in living room, camera pans around. Multiple couches and chairs. Tests identity verification — should not lock on wrong chair at frame edge",
+  "lockFrame": 0,
+  "lockBox": [0.4609, 0.3236, 0.6766, 0.6061],
+  "lockLabel": "chair",
+  "analysisWidth": 640,
+  "fps": 30
+}

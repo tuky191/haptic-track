@@ -145,6 +145,36 @@ class VideoReplayTest {
             result.trackingRate >= 30)
     }
 
+    // chair_living_room_wrong_reacq: chair at desk, camera pans around living room.
+    // Multiple couches and other chairs. Tests that wrong chair at frame edge is NOT
+    // reacquired without identity verification (regression for single-candidate fast path).
+
+    @Test
+    fun chair_living_room_reacquires_correctly() {
+        val result = replayVideo("chair_living_room_wrong_reacq")
+
+        assertTrue("Should reacquire at least once, got ${result.reacquisitions}",
+            result.reacquisitions >= 1)
+        assertFalse("Should not timeout", result.timedOut)
+
+        val wrong = result.wrongCategoryReacqs(setOf("chair"))
+        assertTrue("Should never reacquire non-chair (got: ${wrong.map { "${it.label}@F${it.frame}" }})",
+            wrong.isEmpty())
+
+        Log.i(TAG, "chair_living_room: trackingRate=${result.trackingRate}% " +
+            "reacqs=${result.reacquisitions} losses=${result.losses} " +
+            "totalFrames=${result.totalFrames}")
+    }
+
+    @Test
+    fun chair_living_room_tracking_rate() {
+        val result = replayVideo("chair_living_room_wrong_reacq")
+
+        // Baseline: 86% tracked, 5 reacqs, 5 losses. All chair-only.
+        assertTrue("Tracking rate should be >= 70%, got ${result.trackingRate}%",
+            result.trackingRate >= 70)
+    }
+
     // --- Replay infrastructure ---
 
     data class ReplayEvent(
