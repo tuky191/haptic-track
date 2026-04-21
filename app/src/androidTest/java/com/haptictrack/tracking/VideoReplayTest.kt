@@ -175,6 +175,30 @@ class VideoReplayTest {
             result.trackingRate >= 70)
     }
 
+    // flowerpot_wrong_reacq: white bowl/flowerpot on table, camera zooms away and returns.
+    // Black potted plant nearby. Tests that the wrong plant is NOT reacquired.
+    // Regression test for: mature gallery accepting sim=0.000 candidates after timeout.
+
+    @Test
+    fun flowerpot_reacquires_correctly() {
+        val result = replayVideo("flowerpot_wrong_reacq")
+
+        assertFalse("Should not timeout", result.timedOut)
+
+        Log.i(TAG, "flowerpot_wrong_reacq: trackingRate=${result.trackingRate}% " +
+            "reacqs=${result.reacquisitions} losses=${result.losses} " +
+            "totalFrames=${result.totalFrames}")
+    }
+
+    @Test
+    fun flowerpot_tracking_rate() {
+        val result = replayVideo("flowerpot_wrong_reacq")
+
+        // Baseline: 80% tracked, 4 reacqs, 5 losses. No wrong-plant lock.
+        assertTrue("Tracking rate should be >= 65%, got ${result.trackingRate}%",
+            result.trackingRate >= 65)
+    }
+
     // --- Replay infrastructure ---
 
     data class ReplayEvent(

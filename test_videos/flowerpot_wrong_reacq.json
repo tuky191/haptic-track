@@ -1,0 +1,8 @@
+{
+  "description": "White bowl/flowerpot on table, camera zooms away and returns. Black potted plant nearby. Tests that wrong plant is NOT reacquired — identity must be verified by embeddings",
+  "lockFrame": 0,
+  "lockBox": [0.305, 0.394, 0.613, 0.645],
+  "lockLabel": "potted plant",
+  "analysisWidth": 640,
+  "fps": 30
+}
