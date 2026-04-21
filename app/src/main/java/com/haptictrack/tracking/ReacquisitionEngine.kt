@@ -45,6 +45,10 @@ class ReacquisitionEngine(
         const val EMBEDDING_REQUIRED_FRAMES = 5
         /** Maximum embeddings to keep in gallery. */
         const val MAX_GALLERY_SIZE = 12
+        /** Maximum negative examples to store. */
+        const val MAX_NEGATIVE_EXAMPLES = 5
+        /** Penalty applied when candidate is closer to a negative than to centroid. */
+        const val NEGATIVE_PENALTY = 0.1f
     }
 
     var lockedId: Int? = null
@@ -68,6 +72,22 @@ class ReacquisitionEngine(
     fun centroidSimilarity(candidate: FloatArray): Float {
         val centroid = _embeddingCentroid ?: return 0f
         return cosineSimilarity(candidate, centroid)
+    }
+
+    /** Embeddings of rejected candidates — sharpens identity boundary. */
+    private val _negativeExamples = mutableListOf<FloatArray>()
+
+    private fun addNegativeExample(embedding: FloatArray) {
+        if (_negativeExamples.size >= MAX_NEGATIVE_EXAMPLES) _negativeExamples.removeAt(0)
+        _negativeExamples.add(embedding.copyOf())
+    }
+
+    /** Penalty if candidate is closer to a negative example than to the centroid. */
+    private fun negativePenalty(candidateEmbedding: FloatArray): Float {
+        if (_negativeExamples.isEmpty() || _embeddingCentroid == null) return 0f
+        val centroidSim = cosineSimilarity(candidateEmbedding, _embeddingCentroid!!)
+        val worstNegSim = _negativeExamples.maxOf { cosineSimilarity(candidateEmbedding, it) }
+        return if (worstNegSim > centroidSim) NEGATIVE_PENALTY else 0f
     }
     /** Reference color histogram from lock time. */
     var lockedColorHistogram: FloatArray? = null
@@ -155,6 +175,7 @@ class ReacquisitionEngine(
         lockedCocoLabel = null
         _embeddingGallery.clear()
         _embeddingCentroid = null
+        _negativeExamples.clear()
         lockedColorHistogram = null
         lockedPersonAttributes = null
         lockedReIdEmbedding = null
@@ -436,7 +457,11 @@ class ReacquisitionEngine(
             labelOverride -> {
                 dualLog(Log.DEBUG, "  OVERRIDE label: \"${candidate.label}\" != \"$lockedLabel\", but sim=${fmtF(appearanceScore)}")
             }
-            else -> return null  // REJECT: wrong label, no embedding override
+            else -> {
+                // Store as negative example — helps sharpen identity boundary
+                if (hasAppearance) addNegativeExample(candidate.embedding!!)
+                return null  // REJECT: wrong label, no embedding override
+            }
         }
 
         // --- RANKING: score survivors for selection ---
@@ -518,12 +543,13 @@ class ReacquisitionEngine(
             val unused = (1f - baseEmbW - basePosW - baseSizeW - baseColorW - baseAttrW).coerceAtLeast(0f)
             val effEmbW = baseEmbW + unused
 
+            val negPenalty = negativePenalty(candidate.embedding!!)
             return (embScore * effEmbW) +
                    (positionScore * basePosW) +
                    (sizeScore * baseSizeW) +
                    (colorScore * baseColorW) +
                    (attrScore * baseAttrW) +
-                   labelBonus
+                   labelBonus - negPenalty
         } else {
             // No embedding fallback: position + size only
             val basePosW = 0.50f * positionConfidence
