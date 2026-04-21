@@ -27,6 +27,9 @@ class VisualTracker(private val context: Context) {
     companion object {
         private const val TAG = "VisualTracker"
         private const val MIN_CONFIDENCE = 0.4f  // VitTracker returns real scores — lower threshold works
+        private const val MIN_CONFIDENCE_SMALL = 0.25f  // Lower floor for small ROIs where VT confidence is inherently low
+        /** ROI area (in pixels) below which we use the lower confidence floor. */
+        private const val SMALL_ROI_AREA = 15000  // ~120x125 pixels
         private const val MODEL_ASSET = "object_tracking_vittrack_2023sep.onnx"
 
         @Volatile
@@ -36,6 +39,7 @@ class VisualTracker(private val context: Context) {
     private var tracker: TrackerVit? = null
     private var isTracking = false
     private var lastConfidence = 0f
+    private var roiArea = 0  // pixel area of tracked ROI, used for adaptive confidence threshold
 
     private val modelPath: String by lazy { copyAssetToFile(MODEL_ASSET) }
 
@@ -75,6 +79,7 @@ class VisualTracker(private val context: Context) {
             tracker!!.init(mat, clampedRoi)
             isTracking = true
             lastConfidence = 1.0f
+            roiArea = clampedRoi.width * clampedRoi.height
 
             mat.release()
             Log.d(TAG, "INIT box=${fmtBox(normalizedBox)} roi=${clampedRoi}")
@@ -97,10 +102,15 @@ class VisualTracker(private val context: Context) {
 
             mat.release()
 
-            if (!found || lastConfidence < MIN_CONFIDENCE) {
-                Log.d(TAG, "LOST confidence=${fmtF(lastConfidence)}")
+            // Small objects have inherently lower VT confidence — use a lower floor
+            val confidenceFloor = if (roiArea < SMALL_ROI_AREA) MIN_CONFIDENCE_SMALL else MIN_CONFIDENCE
+            if (!found || lastConfidence < confidenceFloor) {
+                Log.d(TAG, "LOST confidence=${fmtF(lastConfidence)} (floor=${fmtF(confidenceFloor)}, roi=$roiArea)")
                 return null
             }
+
+            // Update ROI area from current output for next frame's threshold
+            roiArea = outRect.width * outRect.height
 
             val normBox = RectF(
                 outRect.x.toFloat() / bitmap.width,

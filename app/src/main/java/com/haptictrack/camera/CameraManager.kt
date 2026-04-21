@@ -71,7 +71,7 @@ class CameraManager(private val context: Context) {
         .setResolutionSelector(
             ResolutionSelector.Builder()
                 .setResolutionStrategy(
-                    ResolutionStrategy(Size(640, 480), ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER)
+                    ResolutionStrategy(Size(854, 640), ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER)
                 )
                 .build()
         )
@@ -168,7 +168,7 @@ class CameraManager(private val context: Context) {
                 // Output in portrait at analysis resolution.
                 // Camera outputs landscape; transform matrix rotates 90°.
                 // So output width = min dim scaled, height = max dim scaled.
-                val analysisShort = 480 // short edge of output
+                val analysisShort = 640 // short edge of output
                 val aspect = inputSize.width.toFloat() / inputSize.height
                 val analysisLong = (analysisShort * aspect).toInt()
                 // Portrait: width=short, height=long

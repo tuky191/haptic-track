@@ -36,8 +36,8 @@ class SurfaceTextureFrameReader(
     private val inputWidth: Int = 1600,
     private val inputHeight: Int = 1200,
     /** Output bitmap size (portrait for portrait phones). */
-    private val outputWidth: Int = 480,
-    private val outputHeight: Int = 640,
+    private val outputWidth: Int = 640,
+    private val outputHeight: Int = 854,
     /** Called on processing thread when a frame is ready for ObjectTracker. */
     private val onFrame: (Bitmap) -> Unit,
     /** Called on GL thread at camera rate (~29fps) for viewfinder display. */

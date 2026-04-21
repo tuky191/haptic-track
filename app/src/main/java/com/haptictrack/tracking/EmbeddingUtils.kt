@@ -38,6 +38,26 @@ fun bestGallerySimilarity(candidate: FloatArray, gallery: List<FloatArray>): Flo
 }
 
 /**
+ * Compute the centroid (mean) of a gallery of L2-normalized embeddings, then L2-normalize.
+ * More stable identity representation than any single embedding.
+ */
+fun computeCentroid(gallery: List<FloatArray>): FloatArray? {
+    if (gallery.isEmpty()) return null
+    val dim = gallery[0].size
+    val sum = FloatArray(dim)
+    for (emb in gallery) {
+        for (i in 0 until dim) sum[i] += emb[i]
+    }
+    // L2-normalize the mean
+    var norm = 0f
+    for (i in 0 until dim) norm += sum[i] * sum[i]
+    norm = kotlin.math.sqrt(norm)
+    if (norm < 1e-8f) return null
+    for (i in 0 until dim) sum[i] /= norm
+    return sum
+}
+
+/**
  * Crop a bitmap at a normalized bounding box. Returns null if the crop is invalid.
  */
 fun cropNormalized(bitmap: Bitmap, normalizedBox: RectF): Bitmap? {

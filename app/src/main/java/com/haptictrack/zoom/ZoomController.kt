@@ -22,8 +22,8 @@ class ZoomController(
         private const val EDGE_MARGIN = 0.08f
         /** How long manual zoom holds after the last pinch gesture (ms). */
         private const val MANUAL_OVERRIDE_DURATION_MS = 2000L
-        /** Frames to wait before starting zoom-out on loss (~165ms at 30fps). */
-        private const val ZOOM_OUT_DELAY_FRAMES = 5
+        /** Frames to wait before starting zoom-out on loss (~270ms at 30fps). */
+        private const val ZOOM_OUT_DELAY_FRAMES = 8
     }
 
     /** Counts frames since tracking was lost, for gradual zoom-out delay. */
@@ -106,13 +106,13 @@ class ZoomController(
     /**
      * Gradual zoom-out for search, called each LOST frame.
      * Delays [ZOOM_OUT_DELAY_FRAMES] frames before starting, then applies
-     * a gentle 15% pullback per frame. This gives reacquisition a chance to
+     * a gentle 8% pullback per frame. This gives reacquisition a chance to
      * find the subject at the original zoom before widening the field of view.
      */
     fun zoomOutForSearchGradual(minZoom: Float, maxZoom: Float): Float {
         lossFrameCount++
         if (lossFrameCount >= ZOOM_OUT_DELAY_FRAMES) {
-            val pullback = 0.15f
+            val pullback = 0.08f
             currentZoom = (currentZoom - (currentZoom - minZoom) * pullback).coerceIn(minZoom, maxZoom)
         }
         return currentZoom

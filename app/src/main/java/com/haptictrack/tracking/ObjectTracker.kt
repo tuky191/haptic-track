@@ -253,11 +253,22 @@ class ObjectTracker(
                     val confirmed = if (skipDetector) {
                         true  // trust VT on skipped frames
                     } else {
+                        // Confirmation = detection overlaps VT's position.
+                        // Accept same-category at low IoU (0.15) or any category at high IoU (0.4).
+                        // High IoU means it's the same object regardless of label.
+                        // Low IoU with different category (e.g. person walking past a cup) doesn't confirm.
+                        val lockedIsPerson = reacquisition.lockedIsPerson
                         tracked.any { det ->
-                            det.label == reacquisition.lockedLabel &&
-                            FrameToFrameTracker.computeIou(det.boundingBox, vtBox) > 0.15f
+                            val iou = FrameToFrameTracker.computeIou(det.boundingBox, vtBox)
+                            val sameCategory = (det.label == "person") == lockedIsPerson
+                            (sameCategory && iou > 0.15f) || iou > 0.4f
                         }
                     }
+                    // Distinguish non-confirmation from contradiction:
+                    // If detector found nothing at all, that's not evidence of drift —
+                    // it's poor detection conditions. Only count unconfirmed when
+                    // detector found detections but none match our tracked position.
+                    val detectorFoundSomething = skipDetector || tracked.isNotEmpty()
 
                     if (confirmed) {
                         vtUnconfirmedFrames = 0
@@ -265,16 +276,20 @@ class ObjectTracker(
                         reacquisition.updateFromVisualTracker(vtBox)
                         reacquisition.updateVelocity(velocityEstimator.velocityX, velocityEstimator.velocityY)
 
-                        // Accumulate embedding from current angle (every 30 confirmed frames ≈ 1s)
+                        // Accumulate embedding from current angle (every 15 confirmed frames ≈ 0.5s)
                         // Use raw rotated-image coords for embedding (embedder works on rotated bitmap)
                         vtConfirmedFrames++
-                        if (vtConfirmedFrames % 30 == 0) {
+                        if (vtConfirmedFrames % 15 == 0) {
                             // Use fallback: during confirmed tracking, even an unmasked
                             // embedding is better than no embedding for gallery diversity
                             val emb = appearanceEmbedder.embedWithFallback(bitmap, rawBox)
                             if (emb != null) {
-                                reacquisition.addEmbedding(emb)
-                                android.util.Log.d("AppearEmbed", "Gallery +1 → ${reacquisition.embeddingGallery.size} (accumulated)")
+                                // Diversity check: only add if meaningfully different from centroid
+                                val centroidSim = reacquisition.centroidSimilarity(emb)
+                                if (centroidSim < 0.92f || reacquisition.embeddingGallery.size < 8) {
+                                    reacquisition.addEmbedding(emb)
+                                    android.util.Log.d("AppearEmbed", "Gallery +1 → ${reacquisition.embeddingGallery.size} (centroidSim=${centroidSim})")
+                                }
                             }
                             // Progressive face embedding: try to capture face during tracking
                             // Use rawBox (rotated-image coords) since bitmap is the rotated image
@@ -284,7 +299,12 @@ class ObjectTracker(
                             }
                         }
                     } else {
-                        vtUnconfirmedFrames++
+                        // Only count as unconfirmed if detector actually found detections
+                        // (found objects but none match VT position = likely drift).
+                        // Empty detector output = poor conditions, not drift evidence.
+                        if (detectorFoundSomething) {
+                            vtUnconfirmedFrames++
+                        }
                     }
 
                     // If too many frames without detector confirmation, tracker is drifting.
@@ -357,17 +377,10 @@ class ObjectTracker(
             val needEmbeddings = reacquisition.hasEmbeddings &&
                 reacquisition.isSearching && !hasDirectMatch
 
-            // Enrich labels with YOLOv8 during search (every 10 frames, not every frame)
-            val searchFrame = reacquisition.framesLost
-            val shouldEnrichLabels = reacquisition.isSearching && tracked.isNotEmpty() &&
-                (searchFrame <= 1 || searchFrame % 10 == 0)
-            val enrichedIds = if (shouldEnrichLabels) labelEnricher.enrichLabels(bitmap, tracked) else emptyMap()
-            val withLabels = if (enrichedIds.isNotEmpty()) {
-                tracked.map { obj ->
-                    val enriched = enrichedIds[obj.id]
-                    if (enriched != null) obj.copy(label = enriched) else obj
-                }
-            } else tracked
+            // YOLOv8 label enrichment skipped during search — person/not-person gate
+            // doesn't need specific labels, and COCO labels from EfficientDet suffice
+            // for the binary category check. Saves ~270ms per enrichment call.
+            val withLabels = tracked
 
             val withEmbeddings = if (needEmbeddings) {
                 // Collect results from previous frame's async embedding computation.
