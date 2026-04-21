@@ -55,8 +55,11 @@ class ReacquisitionEngine(
         private set
     var lockedLabel: String? = null
         private set
-    /** Original COCO label before enrichment — used for label matching during search. */
+    /** Original COCO label before enrichment — kept for logging/display. */
     var lockedCocoLabel: String? = null
+        private set
+    /** Binary category gate: person vs not-person. Replaces per-label matching. */
+    var lockedIsPerson: Boolean = false
         private set
     /** Gallery of reference embeddings — augmented at lock time, accumulated during tracking. */
     private var _embeddingGallery: MutableList<FloatArray> = mutableListOf()
@@ -130,6 +133,7 @@ class ReacquisitionEngine(
         lockedId = trackingId
         lockedLabel = label
         lockedCocoLabel = cocoLabel
+        lockedIsPerson = (cocoLabel ?: label) == "person"
         _embeddingGallery = embeddings.map { it.copyOf() }.toMutableList()
         recomputeCentroid()
         lockedColorHistogram = colorHist?.copyOf()
@@ -173,6 +177,7 @@ class ReacquisitionEngine(
         lockedId = null
         lockedLabel = null
         lockedCocoLabel = null
+        lockedIsPerson = false
         _embeddingGallery.clear()
         _embeddingCentroid = null
         _negativeExamples.clear()
@@ -292,24 +297,19 @@ class ReacquisitionEngine(
         val posConf = positionConfidence()
         val posThreshold = effectivePositionThreshold()
 
-        // Label is a gate inside scoreCandidate(), not a pre-filter here.
-        // Wrong-label candidates are rejected by the label gate unless a
-        // strong embedding (>0.7) overrides — handles label flicker.
+        // Person/not-person gate is inside scoreCandidate(). Pre-filter only removes invalid IDs.
         val validCandidates = candidates.filter { it.id >= 0 }
 
-        // Single-candidate fast path: if exactly one same-label candidate exists,
+        // Single-candidate fast path: if exactly one same-category candidate exists,
         // bypass the EMBEDDING_REQUIRED_FRAMES wait. With no ambiguity about which
         // object to pick, waiting for embeddings just delays the inevitable reacquisition.
-        val sameLabelCandidates = validCandidates.filter { candidate ->
-            val label = candidate.label ?: return@filter false
-            label == lockedLabel || label == lockedCocoLabel
-        }
-        val isSoleSameLabel = sameLabelCandidates.size == 1
+        val sameCategoryCandidates = validCandidates.filter { (it.label == "person") == lockedIsPerson }
+        val isSoleSameCategory = sameCategoryCandidates.size == 1
 
         val logThis = framesLost % 10 == 1 || validCandidates.isNotEmpty()
 
         val scored = validCandidates.mapNotNull { candidate ->
-            val score = scoreCandidate(candidate, refBox, posConf, posThreshold, isSoleSameLabel)
+            val score = scoreCandidate(candidate, refBox, posConf, posThreshold, isSoleSameCategory)
             val sim = if (hasEmbeddings && candidate.embedding != null) {
                 bestGallerySimilarity(candidate.embedding!!)
             } else null
@@ -377,7 +377,7 @@ class ReacquisitionEngine(
         refBox: RectF,
         positionConfidence: Float = positionConfidence(),
         posThreshold: Float = effectivePositionThreshold(),
-        soleSameLabelCandidate: Boolean = false
+        soleSameCategoryCandidate: Boolean = false
     ): Float? {
         val candBox = candidate.boundingBox
 
@@ -394,7 +394,7 @@ class ReacquisitionEngine(
         // the async pipeline hasn't caught up (wait) or the object is too different.
         // With immature gallery (<8): allow fallback after EMBEDDING_REQUIRED_FRAMES
         // to avoid deadlock when embeddings fail consistently.
-        val canBypassEmbedding = soleSameLabelCandidate && _embeddingGallery.size < 8
+        val canBypassEmbedding = soleSameCategoryCandidate && _embeddingGallery.size < 8
         val galleryMature = _embeddingGallery.size >= 8
         if (hasEmbeddings && candidate.embedding == null) {
             if (galleryMature || (framesLost < EMBEDDING_REQUIRED_FRAMES && !canBypassEmbedding)) {
@@ -455,25 +455,18 @@ class ReacquisitionEngine(
             dualLog(Log.DEBUG, "  OVERRIDE size: ratio=${fmtF(sizeRatio)} > thresh=${fmtF(effectiveSizeThreshold)}, but sim=${fmtF(appearanceScore)}")
         }
 
-        // --- GATE B: Label gate ---
-        // Wrong-label candidates are rejected outright unless a strong embedding
-        // indicates it's the same object with a flickered label. This prevents
-        // cross-category leakage (e.g. person matching a locked chair via color).
-        // Uses higher threshold (0.7) than geometric gates.
-        val labelMatches = lockedLabel != null && (
-            candidate.label == lockedLabel || candidate.label == lockedCocoLabel
-        )
-        when {
-            lockedLabel == null -> { /* pass: no label constraint */ }
-            labelMatches -> { /* pass: correct label */ }
-            labelOverride -> {
-                dualLog(Log.DEBUG, "  OVERRIDE label: \"${candidate.label}\" != \"$lockedLabel\", but sim=${fmtF(appearanceScore)}")
-            }
-            else -> {
-                // Store as negative example — helps sharpen identity boundary
-                if (hasAppearance) addNegativeExample(candidate.embedding!!)
-                return null  // REJECT: wrong label, no embedding override
-            }
+        // --- GATE B: Person/not-person category gate ---
+        // Binary gate: a locked person only accepts person candidates, and vice versa.
+        // Specific labels don't matter — embedding handles identity within each bucket.
+        // This eliminates label flicker problems (bowl/potted plant, deer/sheep/dog).
+        val candidateIsPerson = candidate.label == "person"
+        if (lockedIsPerson != candidateIsPerson && !labelOverride) {
+            // Store as negative example — helps sharpen identity boundary
+            if (hasAppearance) addNegativeExample(candidate.embedding!!)
+            return null  // REJECT: person/non-person mismatch
+        }
+        if (lockedIsPerson != candidateIsPerson && labelOverride) {
+            dualLog(Log.DEBUG, "  OVERRIDE category: candidate=${if (candidateIsPerson) "person" else "non-person"}, locked=${if (lockedIsPerson) "person" else "non-person"}, sim=${fmtF(appearanceScore)}")
         }
 
         // --- RANKING: score survivors for selection ---
@@ -502,8 +495,7 @@ class ReacquisitionEngine(
             cosineSimilarity(lockedReIdEmbedding!!, candidate.reIdEmbedding!!).coerceIn(0f, 1f)
         } else 0f
 
-        // Small bonus for exact label match (vs passing via embedding override)
-        val labelBonus = if (lockedLabel != null && labelMatches) 0.05f else 0f
+        // No label bonus — person/not-person gate handles category, embedding handles identity
 
         if (hasFace) {
             // Face available: strongest identity signal, dominates ranking.
@@ -523,7 +515,7 @@ class ReacquisitionEngine(
                    (positionScore * basePosW) +
                    (colorScore * baseColorW) +
                    (attrScore * baseAttrW) +
-                   labelBonus
+                   0f
         } else if (hasReId) {
             // Re-ID available but no face: re-ID is primary, generic embedding secondary
             val baseReIdW = 0.40f
@@ -541,7 +533,7 @@ class ReacquisitionEngine(
                    (sizeScore * baseSizeW) +
                    (colorScore * baseColorW) +
                    (attrScore * baseAttrW) +
-                   labelBonus
+                   0f
         } else if (hasAppearance) {
             // Generic embedding only (non-person, or person without re-ID)
             // Use centroid similarity for ranking (more stable than best-of-gallery)
@@ -561,7 +553,7 @@ class ReacquisitionEngine(
                    (sizeScore * baseSizeW) +
                    (colorScore * baseColorW) +
                    (attrScore * baseAttrW) +
-                   labelBonus - negPenalty
+                   0f - negPenalty
         } else {
             // No embedding fallback: position + size only
             val basePosW = 0.50f * positionConfidence
@@ -573,7 +565,7 @@ class ReacquisitionEngine(
             return (positionScore * basePosW) +
                    (sizeScore * effSizeW) +
                    baseBonus +
-                   labelBonus
+                   0f
         }
     }
 

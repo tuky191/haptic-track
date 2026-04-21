@@ -374,17 +374,10 @@ class ObjectTracker(
             val needEmbeddings = reacquisition.hasEmbeddings &&
                 reacquisition.isSearching && !hasDirectMatch
 
-            // Enrich labels with YOLOv8 during search (every 10 frames, not every frame)
-            val searchFrame = reacquisition.framesLost
-            val shouldEnrichLabels = reacquisition.isSearching && tracked.isNotEmpty() &&
-                (searchFrame <= 1 || searchFrame % 10 == 0)
-            val enrichedIds = if (shouldEnrichLabels) labelEnricher.enrichLabels(bitmap, tracked) else emptyMap()
-            val withLabels = if (enrichedIds.isNotEmpty()) {
-                tracked.map { obj ->
-                    val enriched = enrichedIds[obj.id]
-                    if (enriched != null) obj.copy(label = enriched) else obj
-                }
-            } else tracked
+            // YOLOv8 label enrichment skipped during search — person/not-person gate
+            // doesn't need specific labels, and COCO labels from EfficientDet suffice
+            // for the binary category check. Saves ~270ms per enrichment call.
+            val withLabels = tracked
 
             val withEmbeddings = if (needEmbeddings) {
                 // Collect results from previous frame's async embedding computation.

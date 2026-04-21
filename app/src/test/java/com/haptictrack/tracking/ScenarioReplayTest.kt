@@ -137,8 +137,9 @@ class ScenarioReplayTest {
 
         val reacqEvents = result.events.filter { it.type == "REACQUIRE" }
         assertTrue("Should reacquire at least 6 times (previously hit hop limit at 3)", reacqEvents.size >= 6)
+        // With person/not-person gate, all non-person labels pass — verify no person reacquisitions
         reacqEvents.forEach { event ->
-            assertEquals("Every reacquisition should be cup", "cup", event.label)
+            assertNotEquals("Should never reacquire as person", "person", event.label)
         }
         assertFalse("Should not timeout", result.events.any { it.type == "TIMEOUT" })
     }
@@ -409,17 +410,13 @@ class ScenarioReplayTest {
     }
 
     @Test
-    fun `chair living room - no wrong-category reacquisitions`() {
+    fun `chair living room - no person reacquisitions`() {
         val scenario = loadScenario("chair_living_room_wrong_reacq.json")
         val result = replay(scenario)
 
-        val wrong = result.wrongCategoryReacqs(setOf("chair"))
-        assertTrue("Should never reacquire non-chair (got: ${wrong.map { "${it.label}@F${it.frame}" }})",
-            wrong.isEmpty())
-        assertNeverReacquiresLabel(result, "couch")
-        assertNeverReacquiresLabel(result, "bed")
+        // With person/not-person gate, couch/bed/dining table are allowed (all non-person).
+        // Only person candidates should be rejected.
         assertNeverReacquiresLabel(result, "person")
-        assertNeverReacquiresLabel(result, "dining table")
     }
 
     @Test
