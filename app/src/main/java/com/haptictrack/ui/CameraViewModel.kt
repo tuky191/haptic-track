@@ -173,6 +173,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         if (tapped != null) {
             objectTracker.lockOnObject(tapped.id, tapped.boundingBox, tapped.label)
             _uiState.update { it.copy(status = TrackingStatus.LOCKED, trackedObject = tapped) }
+            // Auto-start recording on lock
+            toggleRecording()
         }
     }
 
@@ -223,25 +225,28 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
      * 1. Idle → lock on center object
      * 2. Tracking (not recording) → start recording
      * 3. Recording → stop recording + clear tracking
+     *
+     * Since lock now auto-starts recording, the normal cycle is just 2 presses:
+     * idle → lock+record → stop+clear. Stage 2 is a safety net.
      */
     fun onVolumeDown() {
         if (!isTrackerReady) return
         val state = _uiState.value
 
         if (state.isRecording) {
-            // Stage 3: stop recording and clear
+            // Recording → stop recording and clear
             toggleRecording()
             clearTracking()
             return
         }
 
         if (state.status != TrackingStatus.IDLE) {
-            // Stage 2: tracking but not recording — start recording
+            // Tracking but not recording (shouldn't normally happen) — start recording
             toggleRecording()
             return
         }
 
-        // Stage 1: idle — lock on center
+        // Idle → lock on center + start recording
         val objects = state.detectedObjects.filter { it.id >= 0 }
         if (objects.isEmpty()) return
 
@@ -253,6 +258,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
         objectTracker.lockOnObject(closest.id, closest.boundingBox, closest.label)
         _uiState.update { it.copy(status = TrackingStatus.LOCKED, trackedObject = closest) }
+        toggleRecording()
     }
 
     fun toggleCaptureMode() {
