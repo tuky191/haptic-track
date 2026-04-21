@@ -253,8 +253,11 @@ class ObjectTracker(
                     val confirmed = if (skipDetector) {
                         true  // trust VT on skipped frames
                     } else {
+                        // Confirmation = any detection overlaps VT's position.
+                        // Label doesn't matter for drift detection — we only care that
+                        // VT is tracking a real object, not empty space. Label flicker
+                        // (bowl→potted plant) was killing VT on stationary objects.
                         tracked.any { det ->
-                            det.label == reacquisition.lockedLabel &&
                             FrameToFrameTracker.computeIou(det.boundingBox, vtBox) > 0.15f
                         }
                     }
