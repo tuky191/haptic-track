@@ -389,13 +389,17 @@ class ReacquisitionEngine(
         // --- GATE: Require embedding when gallery exists ---
         // If we have reference embeddings but the candidate has none (async not ready),
         // reject it — accepting without identity verification causes wrong-object locks.
-        // Allow fallback after EMBEDDING_REQUIRED_FRAMES to avoid permanent deadlock.
-        // Exception: sole same-label candidate with immature gallery (< 8 embeddings)
-        // bypasses this — early in tracking, label match is sufficient.
-        // Once gallery is mature, always require identity verification even for sole candidates.
+        // With mature gallery (≥8): ALWAYS require embeddings. No fallback. The gallery
+        // proves we can compute embeddings — if a candidate doesn't have one, either
+        // the async pipeline hasn't caught up (wait) or the object is too different.
+        // With immature gallery (<8): allow fallback after EMBEDDING_REQUIRED_FRAMES
+        // to avoid deadlock when embeddings fail consistently.
         val canBypassEmbedding = soleSameLabelCandidate && _embeddingGallery.size < 8
-        if (hasEmbeddings && candidate.embedding == null && framesLost < EMBEDDING_REQUIRED_FRAMES && !canBypassEmbedding) {
-            return null
+        val galleryMature = _embeddingGallery.size >= 8
+        if (hasEmbeddings && candidate.embedding == null) {
+            if (galleryMature || (framesLost < EMBEDDING_REQUIRED_FRAMES && !canBypassEmbedding)) {
+                return null
+            }
         }
 
         // --- GATE: Embedding floor ---
