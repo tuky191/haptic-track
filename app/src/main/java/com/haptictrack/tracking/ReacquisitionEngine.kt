@@ -355,7 +355,7 @@ class ReacquisitionEngine(
                 bestGallerySimilarity(sortedScored[1].first.embedding!!)
             } else 0f
             val margin = bestSim - secondSim
-            if (margin > 0.2f && bestSim > 0.4f && best.second >= minScoreThreshold * 0.8f) {
+            if (margin > 0.2f && bestSim > 0.4f && best.second >= minScoreThreshold * 0.9f) {
                 if (logThis) dualLog(Log.DEBUG, "  RELATIVE_MARGIN: best sim=${fmtF(bestSim)} margin=${fmtF(margin)} — accepting")
                 return best.first
             }
@@ -409,6 +409,7 @@ class ReacquisitionEngine(
         // category (e.g. keyboard accepted when tracking mouse, both non-person).
         val embeddingFloor = if (galleryMature) 0.45f else MIN_EMBEDDING_SIMILARITY
         if (hasAppearance && appearanceScore < embeddingFloor) {
+            addNegativeExample(candidate.embedding!!)
             return null
         }
 
@@ -516,8 +517,7 @@ class ReacquisitionEngine(
                    (appearanceScore * baseEmbW) +
                    (positionScore * basePosW) +
                    (colorScore * baseColorW) +
-                   (attrScore * baseAttrW) +
-                   0f
+                   (attrScore * baseAttrW)
         } else if (hasReId) {
             // Re-ID available but no face: re-ID is primary, generic embedding secondary
             val baseReIdW = 0.40f
@@ -534,8 +534,7 @@ class ReacquisitionEngine(
                    (positionScore * basePosW) +
                    (sizeScore * baseSizeW) +
                    (colorScore * baseColorW) +
-                   (attrScore * baseAttrW) +
-                   0f
+                   (attrScore * baseAttrW)
         } else if (hasAppearance) {
             // Generic embedding only (non-person, or person without re-ID)
             // Use centroid similarity for ranking (more stable than best-of-gallery)
@@ -554,8 +553,8 @@ class ReacquisitionEngine(
                    (positionScore * basePosW) +
                    (sizeScore * baseSizeW) +
                    (colorScore * baseColorW) +
-                   (attrScore * baseAttrW) +
-                   0f - negPenalty
+                   (attrScore * baseAttrW) -
+                   negPenalty
         } else {
             // No embedding fallback: position + size only
             val basePosW = 0.50f * positionConfidence

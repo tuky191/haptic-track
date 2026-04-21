@@ -173,8 +173,6 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         if (tapped != null) {
             objectTracker.lockOnObject(tapped.id, tapped.boundingBox, tapped.label)
             _uiState.update { it.copy(status = TrackingStatus.LOCKED, trackedObject = tapped) }
-            // Auto-start recording on lock
-            toggleRecording()
         }
     }
 

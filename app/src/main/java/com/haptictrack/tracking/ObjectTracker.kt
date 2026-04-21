@@ -253,12 +253,15 @@ class ObjectTracker(
                     val confirmed = if (skipDetector) {
                         true  // trust VT on skipped frames
                     } else {
-                        // Confirmation = any detection overlaps VT's position.
-                        // Label doesn't matter for drift detection — we only care that
-                        // VT is tracking a real object, not empty space. Label flicker
-                        // (bowl→potted plant) was killing VT on stationary objects.
+                        // Confirmation = detection overlaps VT's position.
+                        // Accept same-category at low IoU (0.15) or any category at high IoU (0.4).
+                        // High IoU means it's the same object regardless of label.
+                        // Low IoU with different category (e.g. person walking past a cup) doesn't confirm.
+                        val lockedIsPerson = reacquisition.lockedIsPerson
                         tracked.any { det ->
-                            FrameToFrameTracker.computeIou(det.boundingBox, vtBox) > 0.15f
+                            val iou = FrameToFrameTracker.computeIou(det.boundingBox, vtBox)
+                            val sameCategory = (det.label == "person") == lockedIsPerson
+                            (sameCategory && iou > 0.15f) || iou > 0.4f
                         }
                     }
                     // Distinguish non-confirmation from contradiction:

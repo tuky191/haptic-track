@@ -571,6 +571,38 @@ class ReacquisitionEngineTest {
             scoreA, scoreB, 0.001f)
     }
 
+    // --- Adaptive embedding floor ---
+
+    @Test
+    fun `adaptive embedding floor is lenient with immature gallery`() {
+        // Lock with 1 embedding — immature gallery
+        val lockedEmb = floatArrayOf(0.8f, 0.5f, 0.2f)
+        engine.lock(42, RectF(0.3f, 0.3f, 0.7f, 0.7f), "mouse", lockedEmb)
+        engine.processFrame(emptyList())
+
+        // Candidate with sim=0.3 — above MIN_EMBEDDING_SIMILARITY (0.15) but below mature floor (0.45)
+        val weakCandidate = obj(id = 55, left = 0.32f, top = 0.32f, right = 0.68f, bottom = 0.68f, label = "keyboard")
+            .copy(embedding = floatArrayOf(0.3f, 0.9f, 0.2f))
+
+        val score = engine.scoreCandidate(weakCandidate, engine.lastKnownBox!!)
+        assertNotNull("With immature gallery, sim=0.3 should pass lenient floor (0.15)", score)
+    }
+
+    @Test
+    fun `adaptive embedding floor is strict with mature gallery`() {
+        // Lock with many embeddings to reach mature gallery (≥8)
+        val embeddings = List(8) { floatArrayOf(0.8f + it * 0.01f, 0.5f, 0.2f) }
+        engine.lock(42, RectF(0.3f, 0.3f, 0.7f, 0.7f), "mouse", embeddings)
+        engine.processFrame(emptyList())
+
+        // Candidate with orthogonal embedding — very low similarity (~0.2)
+        val weakCandidate = obj(id = 55, left = 0.32f, top = 0.32f, right = 0.68f, bottom = 0.68f, label = "keyboard")
+            .copy(embedding = floatArrayOf(0.1f, 0.1f, 0.98f))
+
+        val score = engine.scoreCandidate(weakCandidate, engine.lastKnownBox!!)
+        assertNull("With mature gallery, low-sim candidate should be rejected by strict floor (0.45)", score)
+    }
+
     // --- Two same-label objects: embedding must discriminate ---
 
     @Test
