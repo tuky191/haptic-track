@@ -1292,19 +1292,67 @@ class ReacquisitionEngineTest {
     }
 
     @Test
-    fun `decent embedding bypasses tentative confirmation`() {
+    fun `decent embedding bypasses tentative when classifier not trained`() {
         val emb = floatArrayOf(1f, 0f, 0f, 0f)
-        // sim > TENTATIVE_BYPASS_THRESHOLD (0.65) but < APPEARANCE_OVERRIDE (0.7)
+        // sim > TENTATIVE_BYPASS_THRESHOLD (0.65) — used as fallback when classifier not trained
         val decentEmb = floatArrayOf(0.8f, 0.5f, 0.1f, 0f)  // sim ~0.84
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", emb)
         engine.processFrame(emptyList())
 
+        assertFalse("Classifier should not be trained yet", engine.classifierTrained)
         val detections = listOf(
             obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
                 label = "cup", embedding = decentEmb)
         )
         val result = engine.processFrame(detections)
-        assertNotNull("Decent embedding (>0.55) should bypass tentative", result)
+        assertNotNull("High sim (>0.65) should bypass tentative when classifier not trained", result)
+    }
+
+    @Test
+    fun `confident classifier bypasses tentative confirmation`() {
+        // Build enough gallery + negatives to train classifier
+        val embs = (1..5).map { floatArrayOf(0.9f + it * 0.01f, 0.1f, 0f, 0f) }
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", embs)
+        repeat(5) { i ->
+            engine.addSceneNegative(floatArrayOf(0.1f, 0.9f + i * 0.01f, 0f, 0f))
+        }
+        assertTrue("Classifier should be trained", engine.classifierTrained)
+        engine.processFrame(emptyList()) // trigger search
+
+        // Candidate similar to positives — classifier should be confident
+        val goodMatch = floatArrayOf(0.92f, 0.12f, 0f, 0f)
+        assertTrue("Classifier should be confident for positive-like embedding",
+            engine.classifierScore(goodMatch) >= 0.8f)
+
+        val detections = listOf(
+            obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+                label = "cup", embedding = goodMatch)
+        )
+        val result = engine.processFrame(detections)
+        assertNotNull("Confident classifier should bypass tentative", result)
+    }
+
+    @Test
+    fun `uncertain classifier does not bypass tentative`() {
+        val embs = (1..5).map { floatArrayOf(0.9f + it * 0.01f, 0.1f, 0f, 0f) }
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", embs)
+        repeat(5) { i ->
+            engine.addSceneNegative(floatArrayOf(0.1f, 0.9f + i * 0.01f, 0f, 0f))
+        }
+        assertTrue(engine.classifierTrained)
+        engine.processFrame(emptyList())
+
+        // Candidate in between positives and negatives — classifier uncertain
+        val ambiguous = floatArrayOf(0.5f, 0.5f, 0f, 0f)
+        assertTrue("Classifier should be uncertain for ambiguous embedding",
+            engine.classifierScore(ambiguous) < 0.8f)
+
+        val detections = listOf(
+            obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+                label = "cup", embedding = ambiguous)
+        )
+        val result = engine.processFrame(detections)
+        assertNull("Uncertain classifier should NOT bypass tentative (single frame)", result)
     }
 
     // --- Lowe's ratio test (SIFT-style) ---

@@ -315,12 +315,18 @@ class ReacquisitionEngine(
 
         // --- Tentative confirmation (DeepSORT-style) ---
         // Don't commit on a single frame. Require the same detection to win
-        // for TENTATIVE_MIN_FRAMES consecutive frames. A couch that briefly
-        // wins at sim=0.41 for one frame won't reach the threshold.
-        // Skip tentative when embedding similarity is strong enough (>0.65).
-        // This is higher than geometric override (0.55) because skipping multi-frame
-        // confirmation is a bigger risk than overriding position/size gates.
-        val skipTentative = strongMatch || (hasEmbeddings && sim >= TENTATIVE_BYPASS_THRESHOLD)
+        // for TENTATIVE_MIN_FRAMES consecutive frames.
+        //
+        // Skip tentative when identity is confident:
+        //   1. Strong embedding match (sim >= 0.7) — clearly the same object
+        //   2. Trained classifier is confident (P >= 0.8) — learned boundary says yes
+        //   3. Fallback: high embedding similarity (>= 0.65) when classifier not trained
+        // The classifier adapts per object — keyboard at cls=0.581 won't bypass,
+        // but a genuine mouse at cls=0.95 will.
+        val classifierConfident = _classifier.isTrained && candidate.embedding != null &&
+            _classifier.predict(candidate.embedding!!) >= 0.8f
+        val skipTentative = strongMatch || classifierConfident ||
+            (!_classifier.isTrained && hasEmbeddings && sim >= TENTATIVE_BYPASS_THRESHOLD)
         if (!skipTentative) {
             val prevBox = tentativeBox
             val candBox = candidate.boundingBox
