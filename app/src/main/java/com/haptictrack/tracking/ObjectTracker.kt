@@ -115,6 +115,9 @@ class ObjectTracker(
         onLoadingStatus?.invoke("Ready")
     }
 
+    /** Detections from the last processed frame — used to collect scene negatives at lock time. */
+    @Volatile private var lastDetections: List<TrackedObject> = emptyList()
+
     /**
      * Lock onto an object. If a frame bitmap is available, computes and stores
      * the visual embedding for identity-aware re-acquisition.
@@ -153,6 +156,13 @@ class ObjectTracker(
             debugCapture.sessionDir?.let { dir ->
                 scenarioRecorder.start(dir, trackingId, enrichedLabel, label,
                     boundingBox, augResult.embeddings, colorHist, personAttrs)
+            }
+
+            // Collect scene negatives from other objects visible at lock time.
+            for (det in lastDetections) {
+                if (det.id == trackingId) continue
+                val negEmb = appearanceEmbedder.embed(bmp, det.boundingBox)
+                if (negEmb != null) reacquisition.addSceneNegative(negEmb)
             }
 
             val locked = TrackedObject(trackingId, boundingBox, enrichedLabel)
@@ -298,6 +308,15 @@ class ObjectTracker(
                                 if (faceEmb != null) reacquisition.addFaceEmbedding(faceEmb)
                             }
                         }
+
+                        // Collect scene negatives every 5 confirmed frames
+                        if (vtConfirmedFrames % 5 == 0) {
+                            for (det in tracked) {
+                                if (det.id == reacquisition.lockedId) continue
+                                val negEmb = appearanceEmbedder.embed(bitmap, det.boundingBox)
+                                if (negEmb != null) reacquisition.addSceneNegative(negEmb)
+                            }
+                        }
                     } else {
                         // Only count as unconfirmed if detector actually found detections
                         // (found objects but none match VT position = likely drift).
@@ -343,6 +362,7 @@ class ObjectTracker(
                             }
                         }
 
+                        lastDetections = displayObjects
                         onDetectionResult?.invoke(displayObjects, lockedObj, frameWidth, frameHeight, cachedContour)
 
                         synchronized(lastFrameLock) {
@@ -501,6 +521,7 @@ class ObjectTracker(
                 }
             }
 
+            lastDetections = displayObjects
             onDetectionResult?.invoke(displayObjects, lockedObject, frameWidth, frameHeight, cachedContour)
         } finally {
             imageProxy?.close()

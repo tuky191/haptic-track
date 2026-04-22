@@ -46,9 +46,7 @@ class ReacquisitionEngine(
         /** Maximum embeddings to keep in gallery. */
         const val MAX_GALLERY_SIZE = 12
         /** Maximum negative examples to store. */
-        const val MAX_NEGATIVE_EXAMPLES = 5
-        /** Penalty applied when candidate is closer to a negative than to centroid. */
-        const val NEGATIVE_PENALTY = 0.1f
+        const val MAX_NEGATIVE_EXAMPLES = 10
     }
 
     var lockedId: Int? = null
@@ -85,12 +83,26 @@ class ReacquisitionEngine(
         _negativeExamples.add(embedding.copyOf())
     }
 
-    /** Penalty if candidate is closer to a negative example than to the centroid. */
-    private fun negativePenalty(candidateEmbedding: FloatArray): Float {
+    /** Add a scene negative — an embedding from a non-locked detection seen during tracking.
+     *  Builds the negative prototype for discriminative scoring. */
+    fun addSceneNegative(embedding: FloatArray) {
+        val centroid = _embeddingCentroid ?: return
+        val sim = cosineSimilarity(embedding, centroid)
+        if (sim < 0.95f) {
+            addNegativeExample(embedding)
+            Log.d(TAG, "Scene negative added (sim=${"%.3f".format(sim)}) — total=${_negativeExamples.size}")
+        }
+    }
+
+    /** Prototype margin: sim(candidate, pos_centroid) - sim(candidate, neg_centroid).
+     *  Returns margin in [-1, 1]. Positive = closer to locked object than to scene.
+     *  Returns 0 when no negatives exist (no discrimination possible). */
+    private fun prototypeMargin(candidateEmbedding: FloatArray): Float {
         if (_negativeExamples.isEmpty() || _embeddingCentroid == null) return 0f
-        val centroidSim = cosineSimilarity(candidateEmbedding, _embeddingCentroid!!)
-        val worstNegSim = _negativeExamples.maxOf { cosineSimilarity(candidateEmbedding, it) }
-        return if (worstNegSim > centroidSim) NEGATIVE_PENALTY else 0f
+        val posSim = cosineSimilarity(candidateEmbedding, _embeddingCentroid!!)
+        val negCentroid = computeCentroid(_negativeExamples) ?: return 0f
+        val negSim = cosineSimilarity(candidateEmbedding, negCentroid)
+        return posSim - negSim
     }
     /** Reference color histogram from lock time. */
     var lockedColorHistogram: FloatArray? = null
@@ -136,6 +148,7 @@ class ReacquisitionEngine(
         lockedIsPerson = (cocoLabel ?: label) == "person"
         _embeddingGallery = embeddings.map { it.copyOf() }.toMutableList()
         recomputeCentroid()
+        _negativeExamples.clear()
         lockedColorHistogram = colorHist?.copyOf()
         lockedPersonAttributes = personAttrs
         lockedReIdEmbedding = reIdEmbedding?.copyOf()
@@ -327,7 +340,10 @@ class ReacquisitionEngine(
                     val faceStr = if (lockedFaceEmbedding != null && candidate.faceEmbedding != null) {
                         " face=${fmtF(cosineSimilarity(lockedFaceEmbedding!!, candidate.faceEmbedding!!))}"
                     } else ""
-                    dualLog(Log.DEBUG, "  scored id=${candidate.id} label=\"${candidate.label}\" score=${fmtF(score)} sim=${sim?.let { fmtF(it) } ?: "n/a"} color=${colorSim?.let { fmtF(it) } ?: "n/a"}$attrStr$reIdStr$faceStr (min=${fmtF(minScoreThreshold)})")
+                    val marginStr = if (candidate.embedding != null && _negativeExamples.isNotEmpty()) {
+                        " margin=${fmtF(prototypeMargin(candidate.embedding!!))}"
+                    } else ""
+                    dualLog(Log.DEBUG, "  scored id=${candidate.id} label=\"${candidate.label}\" score=${fmtF(score)} sim=${sim?.let { fmtF(it) } ?: "n/a"} color=${colorSim?.let { fmtF(it) } ?: "n/a"}$attrStr$reIdStr$faceStr$marginStr (min=${fmtF(minScoreThreshold)})")
                 }
                 Pair(candidate, score)
             } else {
@@ -540,21 +556,30 @@ class ReacquisitionEngine(
             // Use centroid similarity for ranking (more stable than best-of-gallery)
             val centroidScore = centroidSimilarity(candidate.embedding!!).coerceIn(0f, 1f)
             val embScore = (appearanceScore + centroidScore) / 2f  // blend best-match + centroid
-            val baseEmbW = 0.50f
+
+            // Prototype scoring: when negatives exist, use the margin between
+            // positive and negative centroids as primary identity discriminator.
+            // This is the key "learning" signal — the tracker learns what the
+            // object is NOT from scene context during tracking.
+            val margin = prototypeMargin(candidate.embedding!!)
+
+            val baseEmbW = 0.40f
+            val baseMarginW = if (margin != 0f) 0.20f else 0f
             val basePosW = 0.15f * positionConfidence
             val baseSizeW = 0.10f
             val baseColorW = if (hasColor) 0.15f else 0f
             val baseAttrW = if (hasAttrs) 0.10f else 0f
-            val unused = (1f - baseEmbW - basePosW - baseSizeW - baseColorW - baseAttrW).coerceAtLeast(0f)
+            val unused = (1f - baseEmbW - baseMarginW - basePosW - baseSizeW - baseColorW - baseAttrW).coerceAtLeast(0f)
             val effEmbW = baseEmbW + unused
 
-            val negPenalty = negativePenalty(candidate.embedding!!)
+            // margin is [-1, 1]; scale to [0, 1] for weighting
+            val marginScore = ((margin + 1f) / 2f).coerceIn(0f, 1f)
             return (embScore * effEmbW) +
+                   (marginScore * baseMarginW) +
                    (positionScore * basePosW) +
                    (sizeScore * baseSizeW) +
                    (colorScore * baseColorW) +
-                   (attrScore * baseAttrW) -
-                   negPenalty
+                   (attrScore * baseAttrW)
         } else {
             // No embedding fallback: position + size only
             val basePosW = 0.50f * positionConfidence
