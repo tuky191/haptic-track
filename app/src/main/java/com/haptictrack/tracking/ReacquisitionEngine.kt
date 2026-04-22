@@ -317,16 +317,17 @@ class ReacquisitionEngine(
         // Don't commit on a single frame. Require the same detection to win
         // for TENTATIVE_MIN_FRAMES consecutive frames.
         //
-        // Skip tentative when identity is confident:
-        //   1. Strong embedding match (sim >= 0.7) — clearly the same object
-        //   2. Trained classifier is confident (P >= 0.8) — learned boundary says yes
-        //   3. Fallback: high embedding similarity (>= 0.65) when classifier not trained
-        // The classifier adapts per object — keyboard at cls=0.581 won't bypass,
-        // but a genuine mouse at cls=0.95 will.
-        val classifierConfident = _classifier.isTrained && candidate.embedding != null &&
-            _classifier.predict(candidate.embedding!!) >= 0.8f
-        val skipTentative = strongMatch || classifierConfident ||
-            (!_classifier.isTrained && hasEmbeddings && sim >= TENTATIVE_BYPASS_THRESHOLD)
+        // Tentative bypass logic:
+        //   - Strong match (sim >= 0.7): always bypass
+        //   - Classifier trained + confident (P >= 0.8): bypass — learned boundary says yes
+        //   - Classifier trained + uncertain (P < 0.8): require tentative (classifier tightens)
+        //   - Classifier NOT trained: bypass if sim >= 0.55 (geometric override level)
+        // The classifier only tightens the gate, never loosens beyond geometric override.
+        val clsP = if (_classifier.isTrained && candidate.embedding != null)
+            _classifier.predict(candidate.embedding!!) else -1f
+        val skipTentative = strongMatch ||
+            (clsP >= 0.8f) ||
+            (clsP < 0f && hasEmbeddings && sim >= GEOMETRIC_OVERRIDE_THRESHOLD)
         if (!skipTentative) {
             val prevBox = tentativeBox
             val candBox = candidate.boundingBox
