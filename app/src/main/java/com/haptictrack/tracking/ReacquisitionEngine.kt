@@ -127,7 +127,10 @@ class ReacquisitionEngine(
     fun addSceneNegative(embedding: FloatArray) {
         val centroid = _embeddingCentroid ?: return
         val sim = cosineSimilarity(embedding, centroid)
-        if (sim < 0.95f) {
+        // Filter: reject near-positives (sim >= 0.85) — these are likely the target itself
+        // from overlapping detections or slightly different crops. Adding them as negatives
+        // poisons the classifier boundary. Only genuine scene objects (sim < 0.85) qualify.
+        if (sim < 0.85f) {
             addNegativeExample(embedding)
             maybeRetrainClassifier()
             Log.d(TAG, "Scene negative added (sim=${"%.3f".format(sim)}) — total=${_negativeExamples.size}")
