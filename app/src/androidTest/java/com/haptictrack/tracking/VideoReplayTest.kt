@@ -202,6 +202,35 @@ class VideoReplayTest {
             result.trackingRate >= 65)
     }
 
+    // mouse_desk_rotation: mouse on desk, phone rotated multiple times.
+    // During rotation, MobileNetV3 can confuse keyboard with mouse (sim=0.58).
+    // Tests that geometric override threshold (0.65) and tentative confirmation
+    // prevent wrong reacquisition on orientation change.
+
+    @Test
+    fun mouse_desk_rotation_reacquires_correctly() {
+        val result = replayVideo("mouse_desk_rotation")
+
+        assertTrue("Should reacquire at least once, got ${result.reacquisitions}",
+            result.reacquisitions >= 1)
+
+        val wrong = result.wrongCategoryReacqs(setOf("mouse"))
+        assertTrue("Should never reacquire non-mouse (got: ${wrong.map { "${it.label}@F${it.frame}" }})",
+            wrong.isEmpty())
+
+        Log.i(TAG, "mouse_desk_rotation: trackingRate=${result.trackingRate}% " +
+            "reacqs=${result.reacquisitions} losses=${result.losses} " +
+            "totalFrames=${result.totalFrames}")
+    }
+
+    @Test
+    fun mouse_desk_rotation_tracking_rate() {
+        val result = replayVideo("mouse_desk_rotation")
+
+        assertTrue("Tracking rate should be >= 40%, got ${result.trackingRate}%",
+            result.trackingRate >= 40)
+    }
+
     // --- Replay infrastructure ---
 
     data class ReplayEvent(

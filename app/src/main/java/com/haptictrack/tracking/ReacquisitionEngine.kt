@@ -31,9 +31,10 @@ class ReacquisitionEngine(
         /** Embedding similarity above this bypasses the label gate (cross-category protection). */
         const val APPEARANCE_OVERRIDE_THRESHOLD = 0.7f
         /** Embedding similarity above this bypasses position/size hard filters.
-         *  Lower than label override because position rejection is a different risk
-         *  than cross-category leakage — 0.55 is enough to say "same object, just moved." */
-        const val GEOMETRIC_OVERRIDE_THRESHOLD = 0.55f
+         *  Was 0.55 but keyboard (sim=0.582) overrode both position and size gates
+         *  when tracking mouse during phone rotation. 0.65 is high enough that
+         *  only genuine same-object matches override geometric rejection. */
+        const val GEOMETRIC_OVERRIDE_THRESHOLD = 0.65f
         /** Minimum embedding similarity to consider a candidate at all.
          *  If the primary embedder says the candidate is a different object (sim < this),
          *  no amount of re-ID, attributes, or color can rescue it. */
