@@ -79,7 +79,7 @@ class ReacquisitionEngineTest {
             obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "Food")
         )
 
-        val result = engine.processFrame(detections)
+        val result = processFramesUntilReacquire(detections)
 
         assertNotNull(result)
         assertEquals(55, result!!.id)
@@ -113,7 +113,7 @@ class ReacquisitionEngineTest {
         val close = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "Food")
         val far = obj(id = 66, left = 0.25f, top = 0.25f, right = 0.45f, bottom = 0.45f, label = "Food")
 
-        val result = engine.processFrame(listOf(far, close))
+        val result = processFramesUntilReacquire(listOf(far, close))
         assertNotNull(result)
         assertEquals(55, result!!.id)
     }
@@ -128,7 +128,7 @@ class ReacquisitionEngineTest {
         val nonPerson = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "Food")
         val person = obj(id = 66, left = 0.41f, top = 0.41f, right = 0.61f, bottom = 0.61f, label = "person")
 
-        val result = engine.processFrame(listOf(person, nonPerson))
+        val result = processFramesUntilReacquire(listOf(person, nonPerson))
         assertNotNull(result)
         assertEquals("Should pick non-person over person when locked on non-person", 55, result!!.id)
     }
@@ -186,7 +186,7 @@ class ReacquisitionEngineTest {
         val detections = listOf(
             obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "laptop")
         )
-        val result = engine.processFrame(detections)
+        val result = processFramesUntilReacquire(detections)
         assertNotNull("Should allow reacquisition when original had no label", result)
     }
 
@@ -238,7 +238,7 @@ class ReacquisitionEngineTest {
             obj(id = 192, left = 0.1f, top = 0.7f, right = 0.3f, bottom = 0.9f, label = "Food")
         )
 
-        val result = engine.processFrame(detections)
+        val result = processFramesUntilReacquire(detections)
         assertNotNull("Should reacquire distant same-label object after position decay", result)
         assertEquals(192, result!!.id)
     }
@@ -314,7 +314,7 @@ class ReacquisitionEngineTest {
         val detections = listOf(
             obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "Food")
         )
-        val result = engine.processFrame(detections)
+        val result = processFramesUntilReacquire(detections)
         assertNotNull(result)
         assertEquals(0, engine.framesLost)
     }
@@ -1211,6 +1211,154 @@ class ReacquisitionEngineTest {
         val score = engine.scoreCandidate(candidate, engine.lastKnownBox!!)
         assertNotNull("Should score via generic embedding fallback", score)
         assertTrue("Score should be reasonable: $score", score!! > 0.4f)
+    }
+
+    // --- Tentative confirmation (DeepSORT-style) ---
+
+    @Test
+    fun `tentative confirmation blocks single-frame reacquisition`() {
+        // Weak embedding — requires tentative confirmation
+        val emb = floatArrayOf(1f, 0f, 0f, 0f)
+        val weakEmb = floatArrayOf(0.5f, 0.1f, 0.85f, 0f)  // sim ~0.42 — below GEOMETRIC_OVERRIDE
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", emb)
+        engine.processFrame(emptyList()) // trigger search
+
+        val detections = listOf(
+            obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+                label = "cup", embedding = weakEmb)
+        )
+        // Single frame should NOT reacquire
+        val result = engine.processFrame(detections)
+        assertNull("Single frame should not reacquire with weak embedding", result)
+    }
+
+    @Test
+    fun `tentative confirmation commits after enough consecutive frames`() {
+        val emb = floatArrayOf(1f, 0f, 0f, 0f)
+        val weakEmb = floatArrayOf(0.5f, 0.1f, 0.85f, 0f)  // weak sim
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", emb)
+        engine.processFrame(emptyList())
+
+        val detections = listOf(
+            obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+                label = "cup", embedding = weakEmb)
+        )
+        val result = processFramesUntilReacquire(detections)
+        assertNotNull("Should reacquire after ${ReacquisitionEngine.TENTATIVE_MIN_FRAMES} frames", result)
+        assertEquals(55, result!!.id)
+    }
+
+    @Test
+    fun `tentative resets when different detection wins`() {
+        val emb = floatArrayOf(1f, 0f, 0f, 0f)
+        val weakEmb = floatArrayOf(0.5f, 0.1f, 0.85f, 0f)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", emb)
+        engine.processFrame(emptyList())
+
+        val couch = listOf(
+            obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+                label = "cup", embedding = weakEmb)
+        )
+        // 2 frames of couch (not enough)
+        engine.processFrame(couch)
+        engine.processFrame(couch)
+
+        // Different object at different position — resets tentative
+        val bed = listOf(
+            obj(id = 66, left = 0.1f, top = 0.1f, right = 0.3f, bottom = 0.3f,
+                label = "cup", embedding = weakEmb)
+        )
+        engine.processFrame(bed)
+
+        // Back to couch — needs 3 more frames (streak was reset)
+        val result = engine.processFrame(couch)
+        assertNull("Tentative should reset when different detection wins", result)
+    }
+
+    @Test
+    fun `strong embedding bypasses tentative confirmation`() {
+        val emb = floatArrayOf(1f, 0f, 0f, 0f)
+        val strongEmb = floatArrayOf(0.98f, 0.05f, 0.05f, 0f)  // sim ~0.98 > 0.7
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", emb)
+        engine.processFrame(emptyList())
+
+        val detections = listOf(
+            obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+                label = "cup", embedding = strongEmb)
+        )
+        val result = engine.processFrame(detections)
+        assertNotNull("Strong embedding should bypass tentative", result)
+        assertEquals(55, result!!.id)
+    }
+
+    @Test
+    fun `decent embedding bypasses tentative confirmation`() {
+        val emb = floatArrayOf(1f, 0f, 0f, 0f)
+        // sim > GEOMETRIC_OVERRIDE_THRESHOLD (0.55) but < APPEARANCE_OVERRIDE (0.7)
+        val decentEmb = floatArrayOf(0.8f, 0.5f, 0.1f, 0f)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", emb)
+        engine.processFrame(emptyList())
+
+        val detections = listOf(
+            obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+                label = "cup", embedding = decentEmb)
+        )
+        val result = engine.processFrame(detections)
+        assertNotNull("Decent embedding (>0.55) should bypass tentative", result)
+    }
+
+    // --- Lowe's ratio test (SIFT-style) ---
+
+    @Test
+    fun `ratio test rejects ambiguous candidates`() {
+        val emb = floatArrayOf(1f, 0f, 0f, 0f)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", emb)
+        repeat(2) { engine.processFrame(emptyList()) }
+
+        // Two candidates with very similar embedding similarity — ambiguous
+        val cand1 = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "cup", embedding = floatArrayOf(0.7f, 0.5f, 0.3f, 0f))  // sim ~0.7
+        val cand2 = obj(id = 66, left = 0.38f, top = 0.38f, right = 0.58f, bottom = 0.58f,
+            label = "cup", embedding = floatArrayOf(0.65f, 0.55f, 0.3f, 0f)) // similar sim
+
+        val result = engine.findBestCandidate(listOf(cand1, cand2))
+        // Whether accepted or rejected depends on exact ratio — verify the mechanism exists
+        val sim1 = bestGallerySimilarity(cand1.embedding!!, engine.embeddingGallery)
+        val sim2 = bestGallerySimilarity(cand2.embedding!!, engine.embeddingGallery)
+        val ratio = sim2 / sim1
+        if (ratio > ReacquisitionEngine.RATIO_TEST_THRESHOLD) {
+            assertNull("Ambiguous candidates (ratio=${ratio}) should be rejected", result)
+        }
+    }
+
+    @Test
+    fun `ratio test allows clear winner`() {
+        val emb = floatArrayOf(1f, 0f, 0f, 0f)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", emb)
+        repeat(2) { engine.processFrame(emptyList()) }
+
+        // One candidate much closer to reference than the other
+        val good = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "cup", embedding = floatArrayOf(0.95f, 0.1f, 0.1f, 0f))  // sim ~0.96
+        val poor = obj(id = 66, left = 0.38f, top = 0.38f, right = 0.58f, bottom = 0.58f,
+            label = "cup", embedding = floatArrayOf(0.3f, 0.8f, 0.3f, 0f))  // sim ~0.35
+
+        val result = engine.findBestCandidate(listOf(good, poor))
+        assertNotNull("Clear winner should pass ratio test", result)
+        assertEquals(55, result!!.id)
+    }
+
+    /** Feed the same detections for N frames to satisfy tentative confirmation. */
+    private fun processFramesUntilReacquire(
+        detections: List<TrackedObject>,
+        frames: Int = ReacquisitionEngine.TENTATIVE_MIN_FRAMES
+    ): TrackedObject? {
+        var result: TrackedObject? = null
+        repeat(frames) {
+            result = engine.processFrame(detections)
+            if (result != null) return result
+        }
+        return result
     }
 
     private fun obj(

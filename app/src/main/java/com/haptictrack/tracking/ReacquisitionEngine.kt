@@ -42,6 +42,12 @@ class ReacquisitionEngine(
         const val MAX_GALLERY_SIZE = 12
         /** Maximum negative examples to store. */
         const val MAX_NEGATIVE_EXAMPLES = 10
+        /** Consecutive frames the same detection must win before committing (DeepSORT-style). */
+        const val TENTATIVE_MIN_FRAMES = 3
+        /** IoU threshold to consider a detection "the same" across consecutive frames. */
+        const val TENTATIVE_IOU_THRESHOLD = 0.3f
+        /** Lowe's ratio test: reject when secondBestSim / bestSim exceeds this (SIFT-style). */
+        const val RATIO_TEST_THRESHOLD = 0.85f
     }
 
     var lockedId: Int? = null
@@ -125,6 +131,13 @@ class ReacquisitionEngine(
     var framesLost: Int = 0
         private set
 
+    // --- Tentative confirmation state (DeepSORT-style) ---
+    // A candidate must win scoring for TENTATIVE_MIN_FRAMES consecutive frames
+    // before we commit to reacquisition. Eliminates single-frame flukes like
+    // couch (sim=0.41) briefly appearing when tracking a chair.
+    private var tentativeBox: RectF? = null
+    private var tentativeCount: Int = 0
+
     val isLocked: Boolean get() = lockedId != null
     val isSearching: Boolean get() = lockedId != null && framesLost > 0 && framesLost <= maxFramesLost
     val hasTimedOut: Boolean get() = framesLost > maxFramesLost
@@ -154,6 +167,8 @@ class ReacquisitionEngine(
         lastKnownVelocityX = 0f
         lastKnownVelocityY = 0f
         framesLost = 0
+        tentativeBox = null
+        tentativeCount = 0
         val attrStr = personAttrs?.summary() ?: "n/a"
         dualLog(Log.INFO, "LOCK id=$trackingId label=\"$label\" box=${fmtBox(boundingBox)} size=${fmtF(lastKnownSize)} gallery=${embeddingGallery.size} colorHist=${colorHist != null} attrs=\"$attrStr\"")
     }
@@ -199,6 +214,8 @@ class ReacquisitionEngine(
         lastKnownVelocityY = 0f
         lastKnownSize = 0f
         framesLost = 0
+        tentativeBox = null
+        tentativeCount = 0
     }
 
     fun processFrame(detections: List<TrackedObject>): TrackedObject? {
@@ -237,24 +254,56 @@ class ReacquisitionEngine(
             }
         }
 
-        val reacquired = findBestCandidate(detections)
-        if (reacquired != null) {
-            val sim = if (hasEmbeddings && reacquired.embedding != null) {
-                bestGallerySimilarity(reacquired.embedding!!)
-            } else 0f
-            val reIdSim = if (lockedReIdEmbedding != null && reacquired.reIdEmbedding != null) {
-                " reId=${fmtF(cosineSimilarity(lockedReIdEmbedding!!, reacquired.reIdEmbedding!!))}"
-            } else ""
-            val faceSim = if (lockedFaceEmbedding != null && reacquired.faceEmbedding != null) {
-                " face=${fmtF(cosineSimilarity(lockedFaceEmbedding!!, reacquired.faceEmbedding!!))}"
-            } else ""
-            dualLog(Log.INFO, "REACQUIRE id=${reacquired.id} label=\"${reacquired.label}\" after $framesLost frames (lockedLabel=\"$lockedLabel\") sim=${fmtF(sim)}$reIdSim$faceSim box=${fmtBox(reacquired.boundingBox)}")
-            lockedId = reacquired.id
-            updateFromMatch(reacquired)
-            return reacquired
+        val candidate = findBestCandidate(detections)
+        if (candidate == null) {
+            tentativeBox = null
+            tentativeCount = 0
+            return null
         }
 
-        return null
+        val sim = if (hasEmbeddings && candidate.embedding != null) {
+            bestGallerySimilarity(candidate.embedding!!)
+        } else 0f
+        val strongMatch = sim >= APPEARANCE_OVERRIDE_THRESHOLD
+
+        // --- Tentative confirmation (DeepSORT-style) ---
+        // Don't commit on a single frame. Require the same detection to win
+        // for TENTATIVE_MIN_FRAMES consecutive frames. A couch that briefly
+        // wins at sim=0.41 for one frame won't reach the threshold.
+        // Skip tentative when embedding similarity is decent (>0.55) — the identity
+        // signal is strong enough to trust without multi-frame confirmation.
+        val skipTentative = strongMatch || (hasEmbeddings && sim >= GEOMETRIC_OVERRIDE_THRESHOLD)
+        if (!skipTentative) {
+            val prevBox = tentativeBox
+            val candBox = candidate.boundingBox
+            if (prevBox != null && computeIou(prevBox, candBox) >= TENTATIVE_IOU_THRESHOLD) {
+                tentativeCount++
+            } else {
+                tentativeCount = 1
+            }
+            tentativeBox = RectF(candBox)
+
+            if (tentativeCount < TENTATIVE_MIN_FRAMES) {
+                val logThis = framesLost % 10 == 1
+                if (logThis) dualLog(Log.DEBUG, "TENTATIVE: id=${candidate.id} label=\"${candidate.label}\" sim=${fmtF(sim)} count=$tentativeCount/$TENTATIVE_MIN_FRAMES — waiting")
+                return null
+            }
+            dualLog(Log.DEBUG, "CONFIRMED: id=${candidate.id} label=\"${candidate.label}\" sim=${fmtF(sim)} after $tentativeCount frames")
+        }
+
+        tentativeBox = null
+        tentativeCount = 0
+
+        val reIdSim = if (lockedReIdEmbedding != null && candidate.reIdEmbedding != null) {
+            " reId=${fmtF(cosineSimilarity(lockedReIdEmbedding!!, candidate.reIdEmbedding!!))}"
+        } else ""
+        val faceSim = if (lockedFaceEmbedding != null && candidate.faceEmbedding != null) {
+            " face=${fmtF(cosineSimilarity(lockedFaceEmbedding!!, candidate.faceEmbedding!!))}"
+        } else ""
+        dualLog(Log.INFO, "REACQUIRE id=${candidate.id} label=\"${candidate.label}\" after $framesLost frames (lockedLabel=\"$lockedLabel\") sim=${fmtF(sim)}$reIdSim$faceSim box=${fmtBox(candidate.boundingBox)}")
+        lockedId = candidate.id
+        updateFromMatch(candidate)
+        return candidate
     }
 
     private fun updateFromMatch(obj: TrackedObject) {
@@ -348,21 +397,19 @@ class ReacquisitionEngine(
         val sortedScored = scored.sortedByDescending { it.second }
         val best = sortedScored[0]
 
-        // Relative scoring: if the best candidate has a clear embedding margin over
-        // the rest of the scene, it's almost certainly the target — even if its absolute
-        // score is borderline. This handles label-flicker cases where sim=0.6 is clearly
-        // the target but doesn't clear absolute thresholds.
-        if (sortedScored.size >= 2) {
-            val bestSim = if (hasEmbeddings && best.first.embedding != null) {
-                bestGallerySimilarity(best.first.embedding!!)
-            } else 0f
-            val secondSim = if (hasEmbeddings && sortedScored[1].first.embedding != null) {
-                bestGallerySimilarity(sortedScored[1].first.embedding!!)
-            } else 0f
-            val margin = bestSim - secondSim
-            if (margin > 0.2f && bestSim > 0.4f && best.second >= minScoreThreshold * 0.9f) {
-                if (logThis) dualLog(Log.DEBUG, "  RELATIVE_MARGIN: best sim=${fmtF(bestSim)} margin=${fmtF(margin)} — accepting")
-                return best.first
+        // --- Lowe's ratio test (SIFT-style) ---
+        // If two candidates have similar embedding similarity, the match is ambiguous.
+        // Reject and wait for a frame where one candidate is clearly better.
+        // This is structural: no threshold on the absolute value, only the ratio.
+        if (sortedScored.size >= 2 && hasEmbeddings) {
+            val bestSim = if (best.first.embedding != null) bestGallerySimilarity(best.first.embedding!!) else 0f
+            val secondSim = if (sortedScored[1].first.embedding != null) bestGallerySimilarity(sortedScored[1].first.embedding!!) else 0f
+            if (bestSim > 0f && secondSim > 0f) {
+                val ratio = secondSim / bestSim
+                if (ratio > RATIO_TEST_THRESHOLD) {
+                    if (logThis) dualLog(Log.DEBUG, "  RATIO_REJECT: best=${fmtF(bestSim)} second=${fmtF(secondSim)} ratio=${fmtF(ratio)} > ${fmtF(RATIO_TEST_THRESHOLD)} — ambiguous, waiting")
+                    return null
+                }
             }
         }
 
