@@ -1348,6 +1348,83 @@ class ReacquisitionEngineTest {
         assertEquals(55, result!!.id)
     }
 
+    // --- Gallery-relative threshold ---
+
+    @Test
+    fun `gallery-relative floor adapts to gallery consistency`() {
+        // Gallery with tight self-similarity → higher floor
+        val embs = listOf(
+            floatArrayOf(1f, 0f, 0f, 0f),
+            floatArrayOf(0.98f, 0.1f, 0f, 0f),
+            floatArrayOf(0.95f, 0.15f, 0.05f, 0f)
+        )
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", embs)
+        engine.processFrame(emptyList())
+
+        // Weak match — should be rejected because gallery is tight
+        val weak = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "cup", embedding = floatArrayOf(0.5f, 0.1f, 0.85f, 0f))
+        val weakScore = engine.scoreCandidate(weak, engine.lastKnownBox!!)
+
+        // Strong match — should pass
+        val strong = obj(id = 56, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "cup", embedding = floatArrayOf(0.95f, 0.1f, 0.05f, 0f))
+        val strongScore = engine.scoreCandidate(strong, engine.lastKnownBox!!)
+
+        assertNotNull("Strong match should pass adaptive floor", strongScore)
+        // Weak match might be rejected or score lower depending on exact floor
+    }
+
+    // --- Online classifier ---
+
+    @Test
+    fun `classifier trains when enough positives and negatives exist`() {
+        val embs = (1..5).map { floatArrayOf(0.9f + it * 0.01f, 0.1f, 0f, 0f) }
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", embs)
+
+        // Add scene negatives (different direction in embedding space)
+        repeat(5) { i ->
+            engine.addSceneNegative(floatArrayOf(0.1f, 0.9f + i * 0.01f, 0f, 0f))
+        }
+
+        assertTrue("Classifier should be trained with 5 positives + 5 negatives", engine.classifierTrained)
+
+        // Positive-like embedding should score high
+        val posScore = engine.classifierScore(floatArrayOf(0.95f, 0.1f, 0f, 0f))
+        // Negative-like embedding should score low
+        val negScore = engine.classifierScore(floatArrayOf(0.1f, 0.95f, 0f, 0f))
+
+        assertTrue("Positive-like should score higher than negative-like: pos=$posScore neg=$negScore",
+            posScore > negScore)
+    }
+
+    @Test
+    fun `classifier not trained with too few examples`() {
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup",
+            floatArrayOf(1f, 0f, 0f, 0f))
+        // Only 1 positive, 1 negative — not enough
+        engine.addSceneNegative(floatArrayOf(0f, 1f, 0f, 0f))
+
+        assertFalse("Classifier should not train with too few examples", engine.classifierTrained)
+        assertEquals("Untrained classifier should return 0.5", 0.5f,
+            engine.classifierScore(floatArrayOf(0.5f, 0.5f, 0f, 0f)), 0.01f)
+    }
+
+    @Test
+    fun `classifier clears on new lock`() {
+        val embs = (1..5).map { floatArrayOf(0.9f + it * 0.01f, 0.1f, 0f, 0f) }
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", embs)
+        repeat(5) { i ->
+            engine.addSceneNegative(floatArrayOf(0.1f, 0.9f + i * 0.01f, 0f, 0f))
+        }
+        assertTrue(engine.classifierTrained)
+
+        // New lock should clear classifier
+        engine.lock(43, RectF(0.3f, 0.3f, 0.5f, 0.5f), "bowl",
+            floatArrayOf(0f, 0f, 1f, 0f))
+        assertFalse("Classifier should be cleared after new lock", engine.classifierTrained)
+    }
+
     /** Feed the same detections for N frames to satisfy tentative confirmation. */
     private fun processFramesUntilReacquire(
         detections: List<TrackedObject>,

@@ -68,13 +68,45 @@ class ReacquisitionEngine(
     val hasEmbeddings: Boolean get() = _embeddingGallery.isNotEmpty()
     /** Centroid (L2-normalized mean) of the gallery — stable identity representation. */
     private var _embeddingCentroid: FloatArray? = null
-    private fun recomputeCentroid() { _embeddingCentroid = computeCentroid(_embeddingGallery) }
+    private fun recomputeCentroid() {
+        _embeddingCentroid = computeCentroid(_embeddingGallery)
+        recomputeMinGallerySim()
+    }
 
     /** Cosine similarity between a candidate and the gallery centroid. */
     fun centroidSimilarity(candidate: FloatArray): Float {
         val centroid = _embeddingCentroid ?: return 0f
         return cosineSimilarity(candidate, centroid)
     }
+
+    /** Minimum pairwise sim within gallery — drives adaptive embedding floor. */
+    private var _minGallerySim: Float = 1f
+    private fun recomputeMinGallerySim() { _minGallerySim = minPairwiseSimilarity(_embeddingGallery) }
+
+    /** Online classifier trained from gallery (positives) + scene negatives. */
+    private val _classifier = OnlineClassifier()
+    val classifierTrained: Boolean get() = _classifier.isTrained
+
+    /** Retrain classifier when gallery or negatives change enough. */
+    private var _lastTrainPositives = 0
+    private var _lastTrainNegatives = 0
+    private fun maybeRetrainClassifier() {
+        val posCount = _embeddingGallery.size
+        val negCount = _negativeExamples.size
+        // Retrain when we have new data (at least 2 new examples since last train)
+        if (posCount >= 3 && negCount >= 3 &&
+            (posCount + negCount) - (_lastTrainPositives + _lastTrainNegatives) >= 2) {
+            _classifier.train(_embeddingGallery, _negativeExamples)
+            _lastTrainPositives = posCount
+            _lastTrainNegatives = negCount
+            if (_classifier.isTrained) {
+                Log.d(TAG, "Classifier retrained: $posCount positives, $negCount negatives")
+            }
+        }
+    }
+
+    /** Classifier prediction for a candidate embedding. Returns [0, 1]. */
+    fun classifierScore(candidate: FloatArray): Float = _classifier.predict(candidate)
 
     /** Embeddings of rejected candidates — sharpens identity boundary. */
     private val _negativeExamples = mutableListOf<FloatArray>()
@@ -91,6 +123,7 @@ class ReacquisitionEngine(
         val sim = cosineSimilarity(embedding, centroid)
         if (sim < 0.95f) {
             addNegativeExample(embedding)
+            maybeRetrainClassifier()
             Log.d(TAG, "Scene negative added (sim=${"%.3f".format(sim)}) — total=${_negativeExamples.size}")
         }
     }
@@ -157,6 +190,9 @@ class ReacquisitionEngine(
         _embeddingGallery = embeddings.map { it.copyOf() }.toMutableList()
         recomputeCentroid()
         _negativeExamples.clear()
+        _classifier.clear()
+        _lastTrainPositives = 0
+        _lastTrainNegatives = 0
         lockedColorHistogram = colorHist?.copyOf()
         lockedPersonAttributes = personAttrs
         lockedReIdEmbedding = reIdEmbedding?.copyOf()
@@ -193,6 +229,7 @@ class ReacquisitionEngine(
         }
         _embeddingGallery.add(embedding.copyOf())
         recomputeCentroid()
+        maybeRetrainClassifier()
     }
 
     fun clear() {
@@ -203,7 +240,11 @@ class ReacquisitionEngine(
         lockedIsPerson = false
         _embeddingGallery.clear()
         _embeddingCentroid = null
+        _minGallerySim = 1f
         _negativeExamples.clear()
+        _classifier.clear()
+        _lastTrainPositives = 0
+        _lastTrainNegatives = 0
         lockedColorHistogram = null
         lockedPersonAttributes = null
         lockedReIdEmbedding = null
@@ -381,7 +422,10 @@ class ReacquisitionEngine(
                     val marginStr = if (candidate.embedding != null && _negativeExamples.isNotEmpty()) {
                         " margin=${fmtF(prototypeMargin(candidate.embedding!!))}"
                     } else ""
-                    dualLog(Log.DEBUG, "  scored id=${candidate.id} label=\"${candidate.label}\" score=${fmtF(score)} sim=${sim?.let { fmtF(it) } ?: "n/a"} color=${colorSim?.let { fmtF(it) } ?: "n/a"}$attrStr$reIdStr$faceStr$marginStr (min=${fmtF(minScoreThreshold)})")
+                    val clsStr = if (_classifier.isTrained && candidate.embedding != null) {
+                        " cls=${fmtF(_classifier.predict(candidate.embedding!!))}"
+                    } else ""
+                    dualLog(Log.DEBUG, "  scored id=${candidate.id} label=\"${candidate.label}\" score=${fmtF(score)} sim=${sim?.let { fmtF(it) } ?: "n/a"} color=${colorSim?.let { fmtF(it) } ?: "n/a"}$attrStr$reIdStr$faceStr$marginStr$clsStr (min=${fmtF(minScoreThreshold)})")
                 }
                 Pair(candidate, score)
             } else {
@@ -448,12 +492,13 @@ class ReacquisitionEngine(
         }
         val galleryMature = _embeddingGallery.size >= 8
 
-        // --- GATE: Embedding floor ---
-        // If the primary embedder says this is a different object, reject outright.
-        // Single floor for all galleries — 0.15 was too permissive (let laptop
-        // pass when tracking chair at sim=0.376). Mature gallery uses a higher
-        // floor since we have a strong identity reference.
-        val embeddingFloor = if (galleryMature) 0.45f else 0.4f
+        // --- GATE: Embedding floor (gallery-relative) ---
+        // Instead of a fixed floor, adapt to how consistent the gallery is.
+        // A tight gallery (min pair sim=0.8) demands higher similarity from candidates.
+        // A diverse gallery (min pair sim=0.4) is more lenient.
+        // Floor = minGallerySim * 0.75, clamped to [0.3, 0.5].
+        val adaptiveFloor = (_minGallerySim * 0.75f).coerceIn(0.3f, 0.5f)
+        val embeddingFloor = if (galleryMature) maxOf(adaptiveFloor, 0.4f) else adaptiveFloor
         if (hasAppearance && appearanceScore < embeddingFloor) {
             addNegativeExample(candidate.embedding!!)
             return null
@@ -583,28 +628,29 @@ class ReacquisitionEngine(
                    (attrScore * baseAttrW)
         } else if (hasAppearance) {
             // Generic embedding only (non-person, or person without re-ID)
-            // Use centroid similarity for ranking (more stable than best-of-gallery)
             val centroidScore = centroidSimilarity(candidate.embedding!!).coerceIn(0f, 1f)
-            val embScore = (appearanceScore + centroidScore) / 2f  // blend best-match + centroid
+            val embScore = (appearanceScore + centroidScore) / 2f
 
-            // Prototype scoring: when negatives exist, use the margin between
-            // positive and negative centroids as primary identity discriminator.
-            // This is the key "learning" signal — the tracker learns what the
-            // object is NOT from scene context during tracking.
+            // Discriminative scoring: classifier > prototype margin > raw cosine.
+            // The classifier learns a decision boundary from positives+negatives.
+            // Falls back to prototype margin when classifier isn't trained yet.
+            val clsScore = if (_classifier.isTrained) _classifier.predict(candidate.embedding!!) else -1f
             val margin = prototypeMargin(candidate.embedding!!)
+            val hasDiscriminator = clsScore >= 0f || margin != 0f
 
-            val baseEmbW = 0.40f
-            val baseMarginW = if (margin != 0f) 0.20f else 0f
-            val basePosW = 0.15f * positionConfidence
+            val baseEmbW = if (hasDiscriminator) 0.30f else 0.50f
+            val baseClsW = if (clsScore >= 0f) 0.25f else 0f
+            val baseMarginW = if (clsScore < 0f && margin != 0f) 0.20f else 0f
+            val basePosW = 0.10f * positionConfidence
             val baseSizeW = 0.10f
-            val baseColorW = if (hasColor) 0.15f else 0f
-            val baseAttrW = if (hasAttrs) 0.10f else 0f
-            val unused = (1f - baseEmbW - baseMarginW - basePosW - baseSizeW - baseColorW - baseAttrW).coerceAtLeast(0f)
+            val baseColorW = if (hasColor) 0.10f else 0f
+            val baseAttrW = if (hasAttrs) 0.05f else 0f
+            val unused = (1f - baseEmbW - baseClsW - baseMarginW - basePosW - baseSizeW - baseColorW - baseAttrW).coerceAtLeast(0f)
             val effEmbW = baseEmbW + unused
 
-            // margin is [-1, 1]; scale to [0, 1] for weighting
             val marginScore = ((margin + 1f) / 2f).coerceIn(0f, 1f)
             return (embScore * effEmbW) +
+                   (clsScore.coerceAtLeast(0f) * baseClsW) +
                    (marginScore * baseMarginW) +
                    (positionScore * basePosW) +
                    (sizeScore * baseSizeW) +
