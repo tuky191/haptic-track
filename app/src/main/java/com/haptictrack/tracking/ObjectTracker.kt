@@ -36,6 +36,9 @@ class ObjectTracker(
     // Keep last frame for computing embedding when user taps to lock
     private val lastFrameLock = Any()
     private var lastFrameBitmap: Bitmap? = null
+    /** Device rotation when lastFrameBitmap was captured — needed to map screen-space
+     *  detection boxes back to rotated-image space for embedding. */
+    private var lastFrameDeviceRotation: Int = 0
 
     // Track previous state to detect transitions
     private var previouslyLocked: Boolean = false
@@ -159,9 +162,14 @@ class ObjectTracker(
             }
 
             // Collect scene negatives from other objects visible at lock time.
+            // lastDetections has screen-space boxes but bmp is the rotated bitmap,
+            // so convert back to rotated-image space before cropping.
+            val lockDevRot = lastFrameDeviceRotation
             for (det in lastDetections) {
                 if (det.id == trackingId) continue
-                val negEmb = appearanceEmbedder.embed(bmp, det.boundingBox)
+                val rotBox = mapToRotated(det.boundingBox.left, det.boundingBox.top,
+                    det.boundingBox.right, det.boundingBox.bottom, lockDevRot)
+                val negEmb = appearanceEmbedder.embed(bmp, rotBox)
                 if (negEmb != null) reacquisition.addSceneNegative(negEmb)
             }
 
@@ -309,11 +317,15 @@ class ObjectTracker(
                             }
                         }
 
-                        // Collect scene negatives every 5 confirmed frames
+                        // Collect scene negatives every 5 confirmed frames.
+                        // tracked has screen-space boxes but bitmap is rotated,
+                        // so convert back to rotated-image space before cropping.
                         if (vtConfirmedFrames % 5 == 0) {
                             for (det in tracked) {
                                 if (det.id == reacquisition.lockedId) continue
-                                val negEmb = appearanceEmbedder.embed(bitmap, det.boundingBox)
+                                val rotBox = mapToRotated(det.boundingBox.left, det.boundingBox.top,
+                                    det.boundingBox.right, det.boundingBox.bottom, deviceRot)
+                                val negEmb = appearanceEmbedder.embed(bitmap, rotBox)
                                 if (negEmb != null) reacquisition.addSceneNegative(negEmb)
                             }
                         }
@@ -368,6 +380,7 @@ class ObjectTracker(
                         synchronized(lastFrameLock) {
                             lastFrameBitmap?.recycle()
                             lastFrameBitmap = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
+                            lastFrameDeviceRotation = deviceRotation
                         }
                         return
                     }
@@ -494,6 +507,7 @@ class ObjectTracker(
             synchronized(lastFrameLock) {
                 lastFrameBitmap?.recycle()
                 lastFrameBitmap = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
+                lastFrameDeviceRotation = deviceRotation
             }
 
             // Debug frame capture on tracking events

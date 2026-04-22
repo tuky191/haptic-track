@@ -48,6 +48,17 @@ class ReacquisitionEngine(
         const val MAX_GALLERY_SIZE = 12
         /** Maximum negative examples to store. */
         const val MAX_NEGATIVE_EXAMPLES = 10
+        /**
+         * Tentative bypass decision table:
+         * | Condition                          | Bypass tentative? | Rationale                    |
+         * |------------------------------------|-------------------|------------------------------|
+         * | sim >= 0.7 (APPEARANCE_OVERRIDE)   | YES               | Clearly same object          |
+         * | classifier P >= 0.8                | YES               | Learned boundary says yes    |
+         * | classifier not trained, sim >= 0.55| YES               | Fallback to geometric level  |
+         * | classifier trained, P < 0.8        | NO                | Uncertain — require 3 frames |
+         * | sim < 0.55                         | NO                | Weak match — require 3 frames|
+         */
+
         /** Consecutive frames the same detection must win before committing (DeepSORT-style). */
         const val TENTATIVE_MIN_FRAMES = 3
         /** IoU threshold to consider a detection "the same" across consecutive frames. */
@@ -116,10 +127,13 @@ class ReacquisitionEngine(
 
     /** Embeddings of rejected candidates — sharpens identity boundary. */
     private val _negativeExamples = mutableListOf<FloatArray>()
+    /** Cached negative centroid — recomputed on change, same pattern as positive centroid. */
+    private var _negativeCentroid: FloatArray? = null
 
     private fun addNegativeExample(embedding: FloatArray) {
         if (_negativeExamples.size >= MAX_NEGATIVE_EXAMPLES) _negativeExamples.removeAt(0)
         _negativeExamples.add(embedding.copyOf())
+        _negativeCentroid = computeCentroid(_negativeExamples)
     }
 
     /** Add a scene negative — an embedding from a non-locked detection seen during tracking.
@@ -141,9 +155,9 @@ class ReacquisitionEngine(
      *  Returns margin in [-1, 1]. Positive = closer to locked object than to scene.
      *  Returns 0 when no negatives exist (no discrimination possible). */
     private fun prototypeMargin(candidateEmbedding: FloatArray): Float {
-        if (_negativeExamples.isEmpty() || _embeddingCentroid == null) return 0f
-        val posSim = cosineSimilarity(candidateEmbedding, _embeddingCentroid!!)
-        val negCentroid = computeCentroid(_negativeExamples) ?: return 0f
+        val negCentroid = _negativeCentroid ?: return 0f
+        val posCentroid = _embeddingCentroid ?: return 0f
+        val posSim = cosineSimilarity(candidateEmbedding, posCentroid)
         val negSim = cosineSimilarity(candidateEmbedding, negCentroid)
         return posSim - negSim
     }
@@ -199,6 +213,7 @@ class ReacquisitionEngine(
         _embeddingGallery = embeddings.map { it.copyOf() }.toMutableList()
         recomputeCentroid()
         _negativeExamples.clear()
+        _negativeCentroid = null
         _classifier.clear()
         _lastTrainPositives = 0
         _lastTrainNegatives = 0
@@ -251,6 +266,7 @@ class ReacquisitionEngine(
         _embeddingCentroid = null
         _minGallerySim = 1f
         _negativeExamples.clear()
+        _negativeCentroid = null
         _classifier.clear()
         _lastTrainPositives = 0
         _lastTrainNegatives = 0
@@ -459,9 +475,10 @@ class ReacquisitionEngine(
         val best = sortedScored[0]
 
         // --- Lowe's ratio test (SIFT-style) ---
-        // If two candidates have similar embedding similarity, the match is ambiguous.
-        // Reject and wait for a frame where one candidate is clearly better.
-        // This is structural: no threshold on the absolute value, only the ratio.
+        // Compares embedding similarity (not final score) intentionally: the ratio test
+        // asks "can the embedder tell these apart?" not "do other signals differ?"
+        // Two candidates with similar embedding but different color/position are still
+        // ambiguous from an identity standpoint — other signals are noisy tiebreakers.
         if (sortedScored.size >= 2 && hasEmbeddings) {
             val bestSim = if (best.first.embedding != null) bestGallerySimilarity(best.first.embedding!!) else 0f
             val secondSim = if (sortedScored[1].first.embedding != null) bestGallerySimilarity(sortedScored[1].first.embedding!!) else 0f
