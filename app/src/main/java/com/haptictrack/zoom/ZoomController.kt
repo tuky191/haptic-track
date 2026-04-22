@@ -28,6 +28,9 @@ class ZoomController(
 
     /** Counts frames since tracking was lost, for gradual zoom-out delay. */
     private var lossFrameCount = 0
+    /** Zoom level when the object was last locked — floor for search zoom-out.
+     *  Prevents zooming all the way to 1x which makes small objects undetectable. */
+    private var lockedZoom = 1f
 
     /**
      * Set zoom directly from a pinch gesture.
@@ -112,15 +115,20 @@ class ZoomController(
     fun zoomOutForSearchGradual(minZoom: Float, maxZoom: Float): Float {
         lossFrameCount++
         if (lossFrameCount >= ZOOM_OUT_DELAY_FRAMES) {
+            // Don't zoom out below 50% of the locked zoom — keeps the subject
+            // large enough for detection. Zooming to 1x makes small objects
+            // (mouse, cup) undetectable and creates a vicious cycle.
+            val searchFloor = maxOf(minZoom, lockedZoom * 0.5f)
             val pullback = 0.08f
-            currentZoom = (currentZoom - (currentZoom - minZoom) * pullback).coerceIn(minZoom, maxZoom)
+            currentZoom = (currentZoom - (currentZoom - searchFloor) * pullback).coerceIn(searchFloor, maxZoom)
         }
         return currentZoom
     }
 
-    /** Reset the loss frame counter. Call when tracking resumes (LOCKED). */
+    /** Reset the loss frame counter and save current zoom as locked baseline. */
     fun resetLossCounter() {
         lossFrameCount = 0
+        lockedZoom = currentZoom
     }
 
     fun reset() {
