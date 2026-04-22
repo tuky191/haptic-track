@@ -31,10 +31,15 @@ class ReacquisitionEngine(
         /** Embedding similarity above this bypasses the label gate (cross-category protection). */
         const val APPEARANCE_OVERRIDE_THRESHOLD = 0.7f
         /** Embedding similarity above this bypasses position/size hard filters.
-         *  Was 0.55 but keyboard (sim=0.582) overrode both position and size gates
-         *  when tracking mouse during phone rotation. 0.65 is high enough that
-         *  only genuine same-object matches override geometric rejection. */
-        const val GEOMETRIC_OVERRIDE_THRESHOLD = 0.65f
+         *  Lower than label override because position rejection is about camera movement,
+         *  not identity confusion — 0.55 is enough to say "same object, just moved." */
+        const val GEOMETRIC_OVERRIDE_THRESHOLD = 0.55f
+        /** Embedding similarity above this bypasses tentative confirmation.
+         *  Higher than geometric override: overriding position/size is low-risk,
+         *  but skipping multi-frame confirmation needs stronger evidence.
+         *  Keyboard at sim=0.582 overrode geometric gates during phone rotation —
+         *  tentative confirmation would have caught it (single-frame fluke). */
+        const val TENTATIVE_BYPASS_THRESHOLD = 0.65f
         /** Minimum embedding similarity to consider a candidate at all.
          *  If the primary embedder says the candidate is a different object (sim < this),
          *  no amount of re-ID, attributes, or color can rescue it. */
@@ -312,9 +317,10 @@ class ReacquisitionEngine(
         // Don't commit on a single frame. Require the same detection to win
         // for TENTATIVE_MIN_FRAMES consecutive frames. A couch that briefly
         // wins at sim=0.41 for one frame won't reach the threshold.
-        // Skip tentative when embedding similarity is decent (>0.55) — the identity
-        // signal is strong enough to trust without multi-frame confirmation.
-        val skipTentative = strongMatch || (hasEmbeddings && sim >= GEOMETRIC_OVERRIDE_THRESHOLD)
+        // Skip tentative when embedding similarity is strong enough (>0.65).
+        // This is higher than geometric override (0.55) because skipping multi-frame
+        // confirmation is a bigger risk than overriding position/size gates.
+        val skipTentative = strongMatch || (hasEmbeddings && sim >= TENTATIVE_BYPASS_THRESHOLD)
         if (!skipTentative) {
             val prevBox = tentativeBox
             val candBox = candidate.boundingBox

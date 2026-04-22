@@ -213,10 +213,9 @@ class ScenarioReplayTest {
         val result = replay(scenario)
 
         val reacqEvents = result.events.filter { it.type == "REACQUIRE" }
-        // Tentative confirmation + higher geometric override reduce replay reacqs.
-        // Real device performance is better (async embeddings arrive faster).
-        assertTrue("Should reacquire at least 3 times (baseline: 8, replay underestimates), got ${reacqEvents.size}",
-            reacqEvents.size >= 3)
+        // Tentative confirmation reduces replay reacqs (adds 2-frame latency each).
+        assertTrue("Should reacquire at least 4 times (baseline: 8), got ${reacqEvents.size}",
+            reacqEvents.size >= 4)
         reacqEvents.forEach { event ->
             assertTrue("Reacquire label '${event.label}' should be a person variant",
                 event.label in PERSON_LABELS)
@@ -241,9 +240,9 @@ class ScenarioReplayTest {
         val scenario = loadScenario("boy_label_flicker.json")
         val result = replay(scenario)
 
-        // Tentative confirmation adds latency per reacquisition, reducing replay tracking rate.
-        assertTrue("Tracking rate should be >= 40% (baseline: 67%, replay underestimates), got ${result.trackingRate}%",
-            result.trackingRate >= 40)
+        // Tentative confirmation adds latency per reacquisition.
+        assertTrue("Tracking rate should be >= 50% (baseline: 67%), got ${result.trackingRate}%",
+            result.trackingRate >= 50)
         assertFalse("Should not timeout", result.timedOut)
     }
 
@@ -266,10 +265,8 @@ class ScenarioReplayTest {
         val scenario = loadScenario("person_tracking_recovery.json")
         val result = replay(scenario)
 
-        // Higher geometric override threshold (0.65) may delay some person reacquisitions
-        // in replay. On-device video replay is the authoritative test.
-        assertTrue("Tracking rate should be >= 65% (baseline: 89%, replay underestimates), got ${result.trackingRate}%",
-            result.trackingRate >= 65)
+        assertTrue("Tracking rate should be >= 75% (baseline: 89%), got ${result.trackingRate}%",
+            result.trackingRate >= 75)
     }
 
     @Test

@@ -1294,8 +1294,8 @@ class ReacquisitionEngineTest {
     @Test
     fun `decent embedding bypasses tentative confirmation`() {
         val emb = floatArrayOf(1f, 0f, 0f, 0f)
-        // sim > GEOMETRIC_OVERRIDE_THRESHOLD (0.55) but < APPEARANCE_OVERRIDE (0.7)
-        val decentEmb = floatArrayOf(0.8f, 0.5f, 0.1f, 0f)
+        // sim > TENTATIVE_BYPASS_THRESHOLD (0.65) but < APPEARANCE_OVERRIDE (0.7)
+        val decentEmb = floatArrayOf(0.8f, 0.5f, 0.1f, 0f)  // sim ~0.84
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", emb)
         engine.processFrame(emptyList())
 
