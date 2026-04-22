@@ -283,10 +283,10 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                     }
             )
 
-            // Viewfinder from analysis frames during recording.
-            // Preview surface goes to SurfaceTexture for fast frame reading,
-            // so PreviewView is frozen. We render the analysis bitmap instead.
-            if (uiState.isRecording && !uiState.stealthMode) {
+            // Viewfinder from SurfaceTexture GL thread — always active.
+            // Preview surface goes to SurfaceTextureFrameReader, so PreviewView
+            // shows nothing. We render the GL viewfinder bitmap instead.
+            if (!uiState.stealthMode) {
                 val viewfinderBmp by viewModel.viewfinderBitmap.collectAsStateWithLifecycle()
                 viewfinderBmp?.let { bmp ->
                     Image(

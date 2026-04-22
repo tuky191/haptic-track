@@ -7,11 +7,8 @@ import android.util.Log
 import androidx.camera.core.CameraControl
 import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
-import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.core.resolutionselector.ResolutionSelector
-import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.video.FallbackStrategy
 import androidx.camera.video.Quality
 import androidx.camera.video.QualitySelector
@@ -21,7 +18,6 @@ import androidx.camera.view.PreviewView
 import androidx.lifecycle.LifecycleOwner
 import android.os.Handler
 import android.os.Looper
-import android.util.Size
 import java.util.concurrent.Executors
 
 class CameraManager(private val context: Context) {
@@ -48,34 +44,16 @@ class CameraManager(private val context: Context) {
     var isFrontCamera: Boolean = false
         private set
 
-    /** When true, ImageAnalysis is unbound to free a stream for higher video resolution. */
-    private var recordingMode: Boolean = false
-
-    /** Whether ImageAnalysis is currently active (false during recording). */
-    var analysisActive: Boolean = true
-        private set
-
-    /** Reads frames from Preview surface via OpenGL during recording mode. */
+    /** Reads frames from Preview surface via OpenGL. Always active. */
     private var frameReader: SurfaceTextureFrameReader? = null
 
-    /** Callback for frames read from the Preview surface during recording (processing thread). */
-    var onRecordingFrame: ((android.graphics.Bitmap) -> Unit)? = null
+    /** Callback for analysis frames from SurfaceTexture (processing thread, ~10-12fps). */
+    var onAnalysisFrame: ((android.graphics.Bitmap) -> Unit)? = null
 
-    /** Callback for viewfinder display frames during recording (GL thread, ~29fps). */
+    /** Callback for viewfinder display frames from SurfaceTexture (GL thread, ~29fps). */
     var onViewfinderFrame: ((android.graphics.Bitmap) -> Unit)? = null
 
     val preview = Preview.Builder().build()
-
-    val imageAnalysis: ImageAnalysis = ImageAnalysis.Builder()
-        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-        .setResolutionSelector(
-            ResolutionSelector.Builder()
-                .setResolutionStrategy(
-                    ResolutionStrategy(Size(854, 640), ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER)
-                )
-                .build()
-        )
-        .build()
 
     private val videoExecutor = Executors.newSingleThreadExecutor()
     var videoCapture = createVideoCapture()
@@ -122,29 +100,10 @@ class CameraManager(private val context: Context) {
     }
 
     /**
-     * Switch to recording mode (2 streams: preview + video → higher video resolution).
-     * Analysis frames must be obtained via PreviewView.getBitmap().
+     * Rebind camera use cases. Always uses 2-stream (Preview + VideoCapture) with
+     * SurfaceTextureFrameReader providing both analysis and viewfinder frames.
+     * No mode switching — recording is just toggling VideoCapture on/off.
      */
-    fun enterRecordingMode() {
-        if (recordingMode) return
-        recordingMode = true
-        val owner = lifecycleOwnerRef ?: return
-        val view = previewViewRef ?: return
-        bindUseCases(owner, view)
-    }
-
-    /**
-     * Switch back to tracking mode (3 streams: preview + analysis + video).
-     * ImageAnalysis provides full-quality frames for detection.
-     */
-    fun exitRecordingMode() {
-        if (!recordingMode) return
-        recordingMode = false
-        val owner = lifecycleOwnerRef ?: return
-        val view = previewViewRef ?: return
-        bindUseCases(owner, view)
-    }
-
     private fun bindUseCases(lifecycleOwner: LifecycleOwner, previewView: PreviewView) {
         val provider = cameraProvider ?: return
         provider.unbindAll()
@@ -153,58 +112,49 @@ class CameraManager(private val context: Context) {
         frameReader?.stop()
         frameReader = null
 
-        // Recreate VideoCapture to avoid resolution mismatch when switching modes
+        // Recreate VideoCapture for fresh recorder per session
         videoCapture = createVideoCapture()
 
         val selector = if (isFrontCamera) CameraSelector.DEFAULT_FRONT_CAMERA
                        else CameraSelector.DEFAULT_BACK_CAMERA
 
-        val camera = if (recordingMode) {
-            // 2 streams: preview + video → 4K video
-            // Preview goes to SurfaceTextureFrameReader for fast off-thread frame capture
-            // instead of PreviewView.getBitmap() (slow, main-thread, 7-10fps)
-            preview.surfaceProvider = Preview.SurfaceProvider { request ->
-                val inputSize = request.resolution // camera's native buffer size (landscape, e.g. 1600x1200)
-                // Output in portrait at analysis resolution.
-                // Camera outputs landscape; transform matrix rotates 90°.
-                // So output width = min dim scaled, height = max dim scaled.
-                val analysisShort = 640 // short edge of output
-                val aspect = inputSize.width.toFloat() / inputSize.height
-                val analysisLong = (analysisShort * aspect).toInt()
-                // Portrait: width=short, height=long
-                val outW = analysisShort
-                val outH = analysisLong
-                Log.i(TAG, "SurfaceTexture: input=${inputSize}, output=${outW}x${outH}")
+        // Always route Preview to SurfaceTextureFrameReader for fast off-thread frame capture.
+        // 2-stream binding (preview + video) enables 4K recording.
+        preview.surfaceProvider = Preview.SurfaceProvider { request ->
+            val inputSize = request.resolution // camera's native buffer size (landscape, e.g. 1600x1200)
+            // Output in portrait at analysis resolution.
+            // Camera outputs landscape; transform matrix rotates 90°.
+            // So output width = min dim scaled, height = max dim scaled.
+            val analysisShort = 640 // short edge of output
+            val aspect = inputSize.width.toFloat() / inputSize.height
+            val analysisLong = (analysisShort * aspect).toInt()
+            // Portrait: width=short, height=long
+            val outW = analysisShort
+            val outH = analysisLong
+            Log.i(TAG, "SurfaceTexture: input=${inputSize}, output=${outW}x${outH}")
 
-                val reader = SurfaceTextureFrameReader(
-                    inputWidth = inputSize.width,
-                    inputHeight = inputSize.height,
-                    outputWidth = outW,
-                    outputHeight = outH,
-                    onFrame = { bitmap -> onRecordingFrame?.invoke(bitmap) },
-                    onViewfinderFrame = { bitmap -> onViewfinderFrame?.invoke(bitmap) }
-                )
-                val readerSurface = reader.start()
-                frameReader = reader
+            val reader = SurfaceTextureFrameReader(
+                inputWidth = inputSize.width,
+                inputHeight = inputSize.height,
+                outputWidth = outW,
+                outputHeight = outH,
+                onFrame = { bitmap -> onAnalysisFrame?.invoke(bitmap) },
+                onViewfinderFrame = { bitmap -> onViewfinderFrame?.invoke(bitmap) }
+            )
+            val readerSurface = reader.start()
+            frameReader = reader
 
-                request.provideSurface(readerSurface, java.util.concurrent.Executors.newSingleThreadExecutor()) { result ->
-                    Log.d(TAG, "Preview surface result: ${result.resultCode}")
-                }
+            request.provideSurface(readerSurface, Executors.newSingleThreadExecutor()) { result ->
+                Log.d(TAG, "Preview surface result: ${result.resultCode}")
             }
-            provider.bindToLifecycle(lifecycleOwner, selector, preview, videoCapture)
-        } else {
-            // 3 streams: preview + analysis + video → full-quality analysis
-            preview.surfaceProvider = previewView.surfaceProvider
-            provider.bindToLifecycle(lifecycleOwner, selector, preview, imageAnalysis, videoCapture)
         }
-        analysisActive = !recordingMode
+        val camera = provider.bindToLifecycle(lifecycleOwner, selector, preview, videoCapture)
 
         cameraControl = camera.cameraControl
         cameraInfo = camera.cameraInfo
 
         val previewRes = preview.resolutionInfo?.resolution
-        val analysisRes = if (!recordingMode) imageAnalysis.resolutionInfo?.resolution else null
-        Log.i(TAG, "Bound use cases — preview: $previewRes, analysis: $analysisRes, frameReader: ${frameReader != null}, mode: ${if (recordingMode) "recording (2-stream)" else "tracking (3-stream)"}")
+        Log.i(TAG, "Bound use cases — preview: $previewRes, frameReader: ${frameReader != null}, mode: always SurfaceTexture (2-stream)")
     }
 
     fun setZoomRatio(ratio: Float) {
