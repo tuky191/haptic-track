@@ -171,8 +171,11 @@ class VideoReplayTest {
         val result = replayVideo("chair_living_room_wrong_reacq")
 
         // Baseline: 86% tracked, 5 reacqs, 5 losses. All chair-only.
-        assertTrue("Tracking rate should be >= 70%, got ${result.trackingRate}%",
-            result.trackingRate >= 70)
+        // Tentative confirmation adds ~2 frames latency per reacquisition,
+        // reducing tracking rate from ~70% to ~62%. Worth the tradeoff:
+        // zero wrong reacquisitions (couch/bed eliminated).
+        assertTrue("Tracking rate should be >= 55%, got ${result.trackingRate}%",
+            result.trackingRate >= 55)
     }
 
     // flowerpot_wrong_reacq: white bowl/flowerpot on table, camera zooms away and returns.
