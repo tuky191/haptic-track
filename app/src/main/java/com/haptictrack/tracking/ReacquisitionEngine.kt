@@ -38,11 +38,6 @@ class ReacquisitionEngine(
          *  If the primary embedder says the candidate is a different object (sim < this),
          *  no amount of re-ID, attributes, or color can rescue it. */
         const val MIN_EMBEDDING_SIMILARITY = 0.15f
-        /** Frames to require embedding before allowing fallback scoring.
-         *  Async embeddings typically arrive within 2-3 frames. Allow a short grace
-         *  period, then fall back to position/label scoring if embeddings never arrive
-         *  (e.g. object left frame entirely, no detections to embed). */
-        const val EMBEDDING_REQUIRED_FRAMES = 5
         /** Maximum embeddings to keep in gallery. */
         const val MAX_GALLERY_SIZE = 12
         /** Maximum negative examples to store. */
@@ -313,16 +308,10 @@ class ReacquisitionEngine(
         // Person/not-person gate is inside scoreCandidate(). Pre-filter only removes invalid IDs.
         val validCandidates = candidates.filter { it.id >= 0 }
 
-        // Single-candidate fast path: if exactly one same-category candidate exists,
-        // bypass the EMBEDDING_REQUIRED_FRAMES wait. With no ambiguity about which
-        // object to pick, waiting for embeddings just delays the inevitable reacquisition.
-        val sameCategoryCandidates = validCandidates.filter { (it.label == "person") == lockedIsPerson }
-        val isSoleSameCategory = sameCategoryCandidates.size == 1
-
         val logThis = framesLost % 10 == 1 || validCandidates.isNotEmpty()
 
         val scored = validCandidates.mapNotNull { candidate ->
-            val score = scoreCandidate(candidate, refBox, posConf, posThreshold, isSoleSameCategory)
+            val score = scoreCandidate(candidate, refBox, posConf, posThreshold)
             val sim = if (hasEmbeddings && candidate.embedding != null) {
                 bestGallerySimilarity(candidate.embedding!!)
             } else null
@@ -392,8 +381,7 @@ class ReacquisitionEngine(
         candidate: TrackedObject,
         refBox: RectF,
         positionConfidence: Float = positionConfidence(),
-        posThreshold: Float = effectivePositionThreshold(),
-        soleSameCategoryCandidate: Boolean = false
+        posThreshold: Float = effectivePositionThreshold()
     ): Float? {
         val candBox = candidate.boundingBox
 
@@ -405,25 +393,20 @@ class ReacquisitionEngine(
         // --- GATE: Require embedding when gallery exists ---
         // If we have reference embeddings but the candidate has none (async not ready),
         // reject it — accepting without identity verification causes wrong-object locks.
-        // With mature gallery (≥8): ALWAYS require embeddings. No fallback. The gallery
-        // proves we can compute embeddings — if a candidate doesn't have one, either
-        // the async pipeline hasn't caught up (wait) or the object is too different.
-        // With immature gallery (<8): allow fallback after EMBEDDING_REQUIRED_FRAMES
-        // to avoid deadlock when embeddings fail consistently.
-        val canBypassEmbedding = soleSameCategoryCandidate && _embeddingGallery.size < 8
-        val galleryMature = _embeddingGallery.size >= 8
+        // Always require embeddings. The async pipeline delivers within 2-3 frames.
+        // Accepting without embeddings leads to wrong-category reacquisitions
+        // (e.g. laptop accepted when tracking chair, scored on position alone).
         if (hasEmbeddings && candidate.embedding == null) {
-            if (galleryMature || (framesLost < EMBEDDING_REQUIRED_FRAMES && !canBypassEmbedding)) {
-                return null
-            }
+            return null
         }
+        val galleryMature = _embeddingGallery.size >= 8
 
         // --- GATE: Embedding floor ---
         // If the primary embedder says this is a different object, reject outright.
-        // With mature gallery, raise the floor: we have strong identity reference,
-        // so demand higher similarity. Prevents cross-object confusion within same
-        // category (e.g. keyboard accepted when tracking mouse, both non-person).
-        val embeddingFloor = if (galleryMature) 0.45f else MIN_EMBEDDING_SIMILARITY
+        // Single floor for all galleries — 0.15 was too permissive (let laptop
+        // pass when tracking chair at sim=0.376). Mature gallery uses a higher
+        // floor since we have a strong identity reference.
+        val embeddingFloor = if (galleryMature) 0.45f else 0.4f
         if (hasAppearance && appearanceScore < embeddingFloor) {
             addNegativeExample(candidate.embedding!!)
             return null

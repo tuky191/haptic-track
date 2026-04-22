@@ -400,7 +400,7 @@ class ReacquisitionEngineTest {
         val similar = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "cup")
             .copy(embedding = floatArrayOf(0.9f, 0.1f, 0f))  // similar direction
         val different = obj(id = 66, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "cup")
-            .copy(embedding = floatArrayOf(0.2f, 0.1f, 0.9f))  // mostly different but above floor
+            .copy(embedding = floatArrayOf(0.5f, 0.1f, 0.85f))  // mostly different but above floor
 
         val similarScore = engine.scoreCandidate(similar, engine.lastKnownBox!!)!!
         val differentScore = engine.scoreCandidate(different, engine.lastKnownBox!!)!!
@@ -421,7 +421,7 @@ class ReacquisitionEngineTest {
         val rightCup = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "cup")
             .copy(embedding = floatArrayOf(0.6f, 0.8f, 0f))  // similar visual
         val wrongCup = obj(id = 66, left = 0.38f, top = 0.38f, right = 0.58f, bottom = 0.58f, label = "cup")
-            .copy(embedding = floatArrayOf(0.3f, 0.2f, 0.8f))  // different visual but above floor
+            .copy(embedding = floatArrayOf(0.5f, 0.2f, 0.8f))  // different visual but above floor
 
         val result = engine.processFrame(listOf(wrongCup, rightCup))
         assertNotNull(result)
@@ -449,7 +449,7 @@ class ReacquisitionEngineTest {
         val similar = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "cup")
             .copy(embedding = floatArrayOf(0.9f, 0.1f, 0f))
         val different = obj(id = 66, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "cup")
-            .copy(embedding = floatArrayOf(0.2f, 0.1f, 0.9f))  // different but above floor
+            .copy(embedding = floatArrayOf(0.5f, 0.1f, 0.85f))  // different but above floor
 
         // Early gap between similar vs different
         val earlyGap = engine.scoreCandidate(similar, engine.lastKnownBox!!)!! -
@@ -634,7 +634,7 @@ class ReacquisitionEngineTest {
         val orangeTruck = obj(id = 55, left = 0.32f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "truck")
             .copy(embedding = floatArrayOf(0.85f, 0.35f, 0.1f))
         val blueTruck = obj(id = 66, left = 0.32f, top = 0.42f, right = 0.62f, bottom = 0.62f, label = "truck")
-            .copy(embedding = floatArrayOf(0.1f, 0.2f, 0.9f))
+            .copy(embedding = floatArrayOf(0.5f, 0.2f, 0.8f))
 
         val orangeScore = engine.scoreCandidate(orangeTruck, engine.lastKnownBox!!)!!
         val blueScore = engine.scoreCandidate(blueTruck, engine.lastKnownBox!!)!!
