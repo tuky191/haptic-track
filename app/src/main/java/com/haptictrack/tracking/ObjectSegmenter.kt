@@ -6,56 +6,57 @@ import android.graphics.Color
 import android.graphics.PointF
 import android.graphics.RectF
 import android.util.Log
-import com.google.mediapipe.framework.image.BitmapImageBuilder
-import com.google.mediapipe.framework.image.ByteBufferExtractor
-import com.google.mediapipe.tasks.components.containers.NormalizedKeypoint
-import com.google.mediapipe.tasks.core.BaseOptions
-import com.google.mediapipe.tasks.core.Delegate
-import com.google.mediapipe.tasks.vision.interactivesegmenter.InteractiveSegmenter
 import org.opencv.core.CvType
 import org.opencv.core.Mat
 import org.opencv.core.MatOfPoint
 import org.opencv.core.MatOfPoint2f
 import org.opencv.imgproc.Imgproc
+import org.tensorflow.lite.Interpreter
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 /**
- * Segments an object from its background using MediaPipe Interactive Segmenter.
+ * Segments an object from its background using the magic_touch model via raw TFLite.
  *
  * Given a full frame and a bounding box, returns a cropped bitmap where background
  * pixels are zeroed out (transparent black). This ensures embeddings encode only the
- * object's appearance, not the surrounding context — preventing false matches when
- * a large detection (e.g. "dining table") happens to contain the target object.
+ * object's appearance, not the surrounding context.
  *
- * Model: magic_touch.tflite (~6MB). Uses a keypoint (box center) as the ROI.
+ * Model: magic_touch.tflite (~6MB).
+ * Input:  [1, 512, 512, 4] float32 — RGB (0-1) + keypoint channel (1.0 at ROI center)
+ * Output: [1, 512, 512, 1] float32 — confidence mask (0-1)
+ *
+ * Runs via raw TFLite GPU delegate (bypasses MediaPipe's broken GPU mask readback).
  */
 class ObjectSegmenter(context: Context) {
 
     companion object {
         private const val TAG = "ObjSegmenter"
-        private const val MODEL_PATH = "magic_touch.tflite"
+        private const val MODEL_ASSET = "magic_touch.tflite"
+        private const val MODEL_SIZE = 512
         /** Confidence threshold: pixels below this are considered background. */
-        /** Higher threshold = tighter mask = more discriminative embeddings.
-         *  Python tests show 0.85 gives best same-vs-different gap (+0.195). */
         private const val MASK_THRESHOLD = 0.8f
-        /** Max pixels for GPU segmenter input. Adreno 740 returns empty masks above ~100K pixels. */
+        /** Max pixels for segmenter input. Large crops downscaled for speed. */
         private const val MAX_SEGMENT_PIXELS = 90_000  // ~300x300
+        /** Radius (in model pixels) for the keypoint indicator blob. */
+        private const val KEYPOINT_RADIUS = 8
     }
 
-    private val segmenter: InteractiveSegmenter
+    private val gpu: GpuInterpreter
+    private val interpreter: Interpreter get() = gpu.interpreter
+
+    // Pre-allocated buffers
+    private val inputBuffer: ByteBuffer = ByteBuffer.allocateDirect(4 * MODEL_SIZE * MODEL_SIZE * 4).apply {
+        order(ByteOrder.nativeOrder())
+    }
+    private val outputBuffer: ByteBuffer = ByteBuffer.allocateDirect(4 * MODEL_SIZE * MODEL_SIZE * 1).apply {
+        order(ByteOrder.nativeOrder())
+    }
 
     init {
-        val baseOptions = BaseOptions.builder()
-            .setModelAssetPath(MODEL_PATH)
-            .setDelegate(Delegate.GPU)
-            .build()
-
-        val options = InteractiveSegmenter.InteractiveSegmenterOptions.builder()
-            .setBaseOptions(baseOptions)
-            .setOutputConfidenceMasks(true)
-            .setOutputCategoryMask(true)
-            .build()
-
-        segmenter = InteractiveSegmenter.createFromOptions(context, options)
+        val model = loadTfliteModel(context, MODEL_ASSET)
+        gpu = createGpuInterpreter(model, modelName = "magic_touch-seg")
+        Log.i(TAG, "Loaded magic_touch segmenter (${MODEL_SIZE}x${MODEL_SIZE}, raw TFLite)")
     }
 
     /**
@@ -64,6 +65,7 @@ class ObjectSegmenter(context: Context) {
      * Returns a cropped bitmap where background pixels are zeroed, or null on failure.
      * The crop region matches [normalizedBox] (same as AppearanceEmbedder.cropBitmap).
      */
+    @Synchronized
     fun segmentAndCrop(bitmap: Bitmap, normalizedBox: RectF): Bitmap? {
         var cropBitmap: Bitmap? = null
         return try {
@@ -71,8 +73,6 @@ class ObjectSegmenter(context: Context) {
             val imgH = bitmap.height
 
             // Crop to bounding box with padding FIRST, then segment the crop.
-            // Segmenting a close-up produces much tighter masks than segmenting
-            // the full frame where the object is a small part of the scene.
             val pad = 0.05f
             val cl = ((normalizedBox.left - pad) * imgW).toInt().coerceIn(0, imgW - 1)
             val ct = ((normalizedBox.top - pad) * imgH).toInt().coerceIn(0, imgH - 1)
@@ -82,6 +82,10 @@ class ObjectSegmenter(context: Context) {
             val ch = cb - ct
             if (cw < 10 || ch < 10) return null
 
+            // Skip segmentation for crops that cover most of the frame
+            val cropFraction = (cw.toFloat() * ch) / (imgW.toFloat() * imgH)
+            if (cropFraction > 0.5f) return null
+
             cropBitmap = Bitmap.createBitmap(bitmap, cl, ct, cw, ch)
             val inputCrop = if (cropBitmap!!.config != Bitmap.Config.ARGB_8888) {
                 val c = cropBitmap!!.copy(Bitmap.Config.ARGB_8888, false)
@@ -89,37 +93,24 @@ class ObjectSegmenter(context: Context) {
                 c.also { cropBitmap = it }
             } else cropBitmap!!
 
-            // Downscale large crops for GPU segmenter — Adreno 740 returns empty
-            // masks above ~100K pixels. Mask is applied to original-size pixels.
-            val pixels = cw * ch
-            val segInput = if (pixels > MAX_SEGMENT_PIXELS) {
-                val scale = kotlin.math.sqrt(MAX_SEGMENT_PIXELS.toFloat() / pixels)
-                Bitmap.createScaledBitmap(inputCrop, (cw * scale).toInt(), (ch * scale).toInt(), true)
-            } else null
+            // Resize to model input size
+            val resized = Bitmap.createScaledBitmap(inputCrop, MODEL_SIZE, MODEL_SIZE, true)
 
-            val mpImage = BitmapImageBuilder(segInput ?: inputCrop).build()
+            // Fill input buffer: RGB normalized to [0,1] + keypoint channel
+            fillInputBuffer(resized)
+            if (resized !== inputCrop) resized.recycle()
 
-            // Keypoint at center of the crop (normalized [0,1] coordinates)
-            val roi = InteractiveSegmenter.RegionOfInterest.create(
-                NormalizedKeypoint.create(0.5f, 0.5f)
-            )
+            val t0 = android.os.SystemClock.elapsedRealtimeNanos()
+            outputBuffer.rewind()
+            interpreter.run(inputBuffer, outputBuffer)
+            val segMs = (android.os.SystemClock.elapsedRealtimeNanos() - t0) / 1_000_000f
 
-            val result = segmenter.segment(mpImage, roi)
-            segInput?.recycle()
+            // Read mask from output buffer
+            outputBuffer.rewind()
+            val mask = FloatArray(MODEL_SIZE * MODEL_SIZE)
+            outputBuffer.asFloatBuffer().get(mask)
 
-            val maskPixels = extractConfidenceMask(result)
-                ?: extractCategoryMask(result)
-
-            if (maskPixels == null) {
-                Log.w(TAG, "No masks returned")
-                return null
-            }
-
-            val maskWidth = maskPixels.first
-            val maskHeight = maskPixels.second
-            val mask = maskPixels.third
-
-            // Apply mask to the crop pixels
+            // Apply mask to the crop pixels (map model coords back to crop coords)
             val srcPixels = IntArray(cw * ch)
             inputCrop.getPixels(srcPixels, 0, cw, 0, 0, cw, ch)
 
@@ -128,9 +119,9 @@ class ObjectSegmenter(context: Context) {
             val black = Color.BLACK
             for (y in 0 until ch) {
                 for (x in 0 until cw) {
-                    val maskX = (x.toFloat() / cw * maskWidth).toInt().coerceIn(0, maskWidth - 1)
-                    val maskY = (y.toFloat() / ch * maskHeight).toInt().coerceIn(0, maskHeight - 1)
-                    if (mask[maskY * maskWidth + maskX] >= MASK_THRESHOLD) {
+                    val maskX = (x.toFloat() / cw * MODEL_SIZE).toInt().coerceIn(0, MODEL_SIZE - 1)
+                    val maskY = (y.toFloat() / ch * MODEL_SIZE).toInt().coerceIn(0, MODEL_SIZE - 1)
+                    if (mask[maskY * MODEL_SIZE + maskX] >= MASK_THRESHOLD) {
                         fgCount++
                     } else {
                         srcPixels[y * cw + x] = black
@@ -139,7 +130,7 @@ class ObjectSegmenter(context: Context) {
             }
 
             val fgPct = if (totalPixels > 0) fgCount * 100 / totalPixels else 0
-            Log.d(TAG, "Mask: ${fgCount}/${totalPixels} fg pixels (${fgPct}%) crop=${cw}x${ch}")
+            Log.d(TAG, "Mask: ${fgCount}/${totalPixels} fg pixels (${fgPct}%) crop=${cw}x${ch} ${String.format("%.0f", segMs)}ms")
 
             if (fgPct < 5 || fgPct > 95) {
                 Log.d(TAG, "Mask not useful (${fgPct}%), falling back to raw crop")
@@ -157,53 +148,34 @@ class ObjectSegmenter(context: Context) {
         }
     }
 
-    /** Extract foreground mask from confidence masks (float 0..1). */
-    private fun extractConfidenceMask(
-        result: com.google.mediapipe.tasks.vision.imagesegmenter.ImageSegmenterResult
-    ): Triple<Int, Int, FloatArray>? {
-        val masks = result.confidenceMasks()
-        if (!masks.isPresent || masks.get().isEmpty()) return null
+    /**
+     * Fill the input buffer with RGB [0,1] + keypoint channel.
+     * Channel 4 is 1.0 in a small circle at the center, 0.0 elsewhere.
+     */
+    private fun fillInputBuffer(bitmap: Bitmap) {
+        inputBuffer.rewind()
+        val pixels = IntArray(MODEL_SIZE * MODEL_SIZE)
+        bitmap.getPixels(pixels, 0, MODEL_SIZE, 0, 0, MODEL_SIZE, MODEL_SIZE)
 
-        val maskList = masks.get()
-        val foregroundMask = if (maskList.size >= 2) maskList[1] else maskList[0]
-        val w = foregroundMask.width
-        val h = foregroundMask.height
+        val cx = MODEL_SIZE / 2
+        val cy = MODEL_SIZE / 2
+        val radiusSq = KEYPOINT_RADIUS * KEYPOINT_RADIUS
 
-        return try {
-            val byteBuffer = ByteBufferExtractor.extract(foregroundMask)
-            val floatBuffer = byteBuffer.asFloatBuffer()
-            val pixels = FloatArray(w * h)
-            floatBuffer.get(pixels)
-            Triple(w, h, pixels)
-        } catch (e: Exception) {
-            Log.d(TAG, "Confidence mask extraction failed: ${e.message}")
-            null
+        for (i in pixels.indices) {
+            val y = i / MODEL_SIZE
+            val x = i % MODEL_SIZE
+            val pixel = pixels[i]
+
+            inputBuffer.putFloat(Color.red(pixel) / 255f)
+            inputBuffer.putFloat(Color.green(pixel) / 255f)
+            inputBuffer.putFloat(Color.blue(pixel) / 255f)
+
+            // Keypoint channel: 1.0 within radius of center
+            val dx = x - cx
+            val dy = y - cy
+            inputBuffer.putFloat(if (dx * dx + dy * dy <= radiusSq) 1f else 0f)
         }
-    }
-
-    /** Extract foreground mask from category mask (uint8: 0=bg, >0=fg) → convert to float. */
-    private fun extractCategoryMask(
-        result: com.google.mediapipe.tasks.vision.imagesegmenter.ImageSegmenterResult
-    ): Triple<Int, Int, FloatArray>? {
-        val mask = result.categoryMask()
-        if (!mask.isPresent) return null
-
-        val catMask = mask.get()
-        val w = catMask.width
-        val h = catMask.height
-
-        return try {
-            val byteBuffer = ByteBufferExtractor.extract(catMask)
-            val pixels = FloatArray(w * h)
-            for (i in pixels.indices) {
-                // Category 0 = background, anything else = foreground
-                pixels[i] = if ((byteBuffer.get(i).toInt() and 0xFF) > 0) 1f else 0f
-            }
-            Triple(w, h, pixels)
-        } catch (e: Exception) {
-            Log.d(TAG, "Category mask extraction failed: ${e.message}")
-            null
-        }
+        inputBuffer.rewind()
     }
 
     /**
@@ -211,14 +183,13 @@ class ObjectSegmenter(context: Context) {
      * Uses the segmentation mask + OpenCV findContours + approxPolyDP for a smooth outline.
      * Returns an empty list on failure.
      */
+    @Synchronized
     fun extractContour(bitmap: Bitmap, normalizedBox: RectF): List<PointF> {
         var crop: Bitmap? = null
         return try {
-            // Crop to bounding box with padding, then segment the crop.
-            // This gives the segmenter a close-up view → much tighter mask.
             val imgW = bitmap.width
             val imgH = bitmap.height
-            val pad = 0.05f // 5% padding around the box
+            val pad = 0.05f
             val cropLeft = ((normalizedBox.left - pad) * imgW).toInt().coerceIn(0, imgW - 1)
             val cropTop = ((normalizedBox.top - pad) * imgH).toInt().coerceIn(0, imgH - 1)
             val cropRight = ((normalizedBox.right + pad) * imgW).toInt().coerceIn(cropLeft + 1, imgW)
@@ -234,29 +205,27 @@ class ObjectSegmenter(context: Context) {
                 c.also { crop = it }
             } else crop!!
 
-            val mpImage = BitmapImageBuilder(inputCrop).build()
+            // Resize to model input size
+            val resized = Bitmap.createScaledBitmap(inputCrop, MODEL_SIZE, MODEL_SIZE, true)
+            fillInputBuffer(resized)
+            if (resized !== inputCrop) resized.recycle()
 
-            // Keypoint at center of the crop (normalized [0,1] coordinates)
-            val roi = InteractiveSegmenter.RegionOfInterest.create(
-                NormalizedKeypoint.create(0.5f, 0.5f)
-            )
+            outputBuffer.rewind()
+            interpreter.run(inputBuffer, outputBuffer)
 
-            val result = segmenter.segment(mpImage, roi)
-            val maskData = extractConfidenceMask(result) ?: extractCategoryMask(result) ?: return emptyList()
-            val maskW = maskData.first
-            val maskH = maskData.second
-            val pixels = maskData.third
+            outputBuffer.rewind()
+            val mask = FloatArray(MODEL_SIZE * MODEL_SIZE)
+            outputBuffer.asFloatBuffer().get(mask)
 
             // Build binary mask
-            val maskMat = Mat(maskH, maskW, CvType.CV_8UC1)
-            val maskBytes = ByteArray(maskW * maskH)
-            for (i in pixels.indices) {
-                maskBytes[i] = if (pixels[i] >= MASK_THRESHOLD) 255.toByte() else 0
+            val maskMat = Mat(MODEL_SIZE, MODEL_SIZE, CvType.CV_8UC1)
+            val maskBytes = ByteArray(MODEL_SIZE * MODEL_SIZE)
+            for (i in mask.indices) {
+                maskBytes[i] = if (mask[i] >= MASK_THRESHOLD) 255.toByte() else 0
             }
             maskMat.put(0, 0, maskBytes)
 
             // Heavy erosion to shrink mask well inside the object boundary.
-            // This ensures the glow sits on the object, not on the background.
             val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, org.opencv.core.Size(15.0, 15.0))
             Imgproc.erode(maskMat, maskMat, kernel)
             kernel.release()
@@ -280,8 +249,8 @@ class ObjectSegmenter(context: Context) {
 
             // Convert mask-space points → full image normalized [0,1] coordinates
             val points = approx.toArray().map { pt ->
-                val pixX = cropLeft + pt.x.toFloat() / maskW * cropW
-                val pixY = cropTop + pt.y.toFloat() / maskH * cropH
+                val pixX = cropLeft + pt.x.toFloat() / MODEL_SIZE * cropW
+                val pixY = cropTop + pt.y.toFloat() / MODEL_SIZE * cropH
                 PointF(pixX / imgW, pixY / imgH)
             }
 
@@ -300,6 +269,6 @@ class ObjectSegmenter(context: Context) {
     }
 
     fun shutdown() {
-        segmenter.close()
+        gpu.close()
     }
 }

@@ -38,6 +38,23 @@ fun bestGallerySimilarity(candidate: FloatArray, gallery: List<FloatArray>): Flo
 }
 
 /**
+ * Minimum pairwise cosine similarity within a gallery.
+ * Measures how internally consistent the gallery is — used for adaptive thresholds.
+ * Returns 1.0 for galleries with < 2 embeddings.
+ */
+fun minPairwiseSimilarity(gallery: List<FloatArray>): Float {
+    if (gallery.size < 2) return 0f  // No self-similarity info → conservative (low floor)
+    var minSim = 1f
+    for (i in gallery.indices) {
+        for (j in i + 1 until gallery.size) {
+            val sim = cosineSimilarity(gallery[i], gallery[j])
+            if (sim < minSim) minSim = sim
+        }
+    }
+    return minSim
+}
+
+/**
  * Compute the centroid (mean) of a gallery of L2-normalized embeddings, then L2-normalize.
  * More stable identity representation than any single embedding.
  */
@@ -198,6 +215,88 @@ fun computeIou(a: RectF, b: RectF): Float {
     val unionArea = aArea + bArea - interArea
 
     return if (unionArea > 0f) interArea / unionArea else 0f
+}
+
+// ---------------------------------------------------------------------------
+// Online Logistic Regression — learns to separate locked object from scene
+// ---------------------------------------------------------------------------
+
+/**
+ * Lightweight logistic regression trained on-device from gallery (positive)
+ * and scene negative embeddings. Learns a hyperplane in embedding space that
+ * separates THIS object from EVERYTHING ELSE in the scene.
+ *
+ * Training takes <1ms for typical gallery sizes (12 positives + 10 negatives).
+ * Inference is a single dot product + sigmoid.
+ */
+class OnlineClassifier {
+    private var weights: FloatArray? = null
+    private var bias: Float = 0f
+    /** True after successful training with enough data. */
+    var isTrained: Boolean = false
+        private set
+
+    /**
+     * Train on positive (gallery) and negative (scene) embeddings.
+     * Uses mini-batch gradient descent with L2 regularization.
+     */
+    fun train(positives: List<FloatArray>, negatives: List<FloatArray>,
+              iterations: Int = 80, learningRate: Float = 0.5f, l2Lambda: Float = 0.01f) {
+        if (positives.size < 3 || negatives.size < 3) {
+            isTrained = false
+            return
+        }
+        val dim = positives[0].size
+        val w = FloatArray(dim) // zero-initialized
+        var b = 0f
+
+        // Combine into training set with labels
+        val data = positives.map { Pair(it, 1f) } + negatives.map { Pair(it, 0f) }
+
+        for (iter in 0 until iterations) {
+            var gradB = 0f
+            val gradW = FloatArray(dim)
+            for ((x, y) in data) {
+                // Forward: sigmoid(w·x + b)
+                var z = b
+                for (i in 0 until dim) z += w[i] * x[i]
+                val pred = 1f / (1f + kotlin.math.exp(-z.coerceIn(-10f, 10f)))
+
+                // Gradient of binary cross-entropy
+                val err = pred - y
+                gradB += err
+                for (i in 0 until dim) gradW[i] += err * x[i]
+            }
+
+            val n = data.size.toFloat()
+            b -= learningRate * (gradB / n)
+            for (i in 0 until dim) {
+                w[i] -= learningRate * (gradW[i] / n + l2Lambda * w[i])
+            }
+        }
+
+        weights = w
+        bias = b
+        isTrained = true
+    }
+
+    /**
+     * Predict probability that the candidate is the locked object.
+     * Returns value in [0, 1]. Returns 0.5 if not trained.
+     */
+    fun predict(candidate: FloatArray): Float {
+        val w = weights ?: return 0.5f
+        if (!isTrained || w.size != candidate.size) return 0.5f
+        var z = bias
+        for (i in w.indices) z += w[i] * candidate[i]
+        return 1f / (1f + kotlin.math.exp(-z.coerceIn(-10f, 10f)))
+    }
+
+    fun clear() {
+        weights = null
+        bias = 0f
+        isTrained = false
+    }
 }
 
 /** L2 norm of a float array. */

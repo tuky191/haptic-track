@@ -171,8 +171,11 @@ class VideoReplayTest {
         val result = replayVideo("chair_living_room_wrong_reacq")
 
         // Baseline: 86% tracked, 5 reacqs, 5 losses. All chair-only.
-        assertTrue("Tracking rate should be >= 70%, got ${result.trackingRate}%",
-            result.trackingRate >= 70)
+        // Tentative confirmation adds ~2 frames latency per reacquisition,
+        // reducing tracking rate from ~70% to ~62%. Worth the tradeoff:
+        // zero wrong reacquisitions (couch/bed eliminated).
+        assertTrue("Tracking rate should be >= 55%, got ${result.trackingRate}%",
+            result.trackingRate >= 55)
     }
 
     // flowerpot_wrong_reacq: white bowl/flowerpot on table, camera zooms away and returns.
@@ -197,6 +200,35 @@ class VideoReplayTest {
         // Baseline: 80% tracked, 4 reacqs, 5 losses. No wrong-plant lock.
         assertTrue("Tracking rate should be >= 65%, got ${result.trackingRate}%",
             result.trackingRate >= 65)
+    }
+
+    // mouse_desk_rotation: mouse on desk, phone rotated multiple times.
+    // During rotation, MobileNetV3 can confuse keyboard with mouse (sim=0.58).
+    // Tests that geometric override threshold (0.65) and tentative confirmation
+    // prevent wrong reacquisition on orientation change.
+
+    @Test
+    fun mouse_desk_rotation_reacquires_correctly() {
+        val result = replayVideo("mouse_desk_rotation")
+
+        assertTrue("Should reacquire at least once, got ${result.reacquisitions}",
+            result.reacquisitions >= 1)
+
+        val wrong = result.wrongCategoryReacqs(setOf("mouse"))
+        assertTrue("Should never reacquire non-mouse (got: ${wrong.map { "${it.label}@F${it.frame}" }})",
+            wrong.isEmpty())
+
+        Log.i(TAG, "mouse_desk_rotation: trackingRate=${result.trackingRate}% " +
+            "reacqs=${result.reacquisitions} losses=${result.losses} " +
+            "totalFrames=${result.totalFrames}")
+    }
+
+    @Test
+    fun mouse_desk_rotation_tracking_rate() {
+        val result = replayVideo("mouse_desk_rotation")
+
+        assertTrue("Tracking rate should be >= 40%, got ${result.trackingRate}%",
+            result.trackingRate >= 40)
     }
 
     // --- Replay infrastructure ---

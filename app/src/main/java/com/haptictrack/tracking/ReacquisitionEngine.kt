@@ -31,24 +31,40 @@ class ReacquisitionEngine(
         /** Embedding similarity above this bypasses the label gate (cross-category protection). */
         const val APPEARANCE_OVERRIDE_THRESHOLD = 0.7f
         /** Embedding similarity above this bypasses position/size hard filters.
-         *  Lower than label override because position rejection is a different risk
-         *  than cross-category leakage — 0.55 is enough to say "same object, just moved." */
+         *  Lower than label override because position rejection is about camera movement,
+         *  not identity confusion — 0.55 is enough to say "same object, just moved." */
         const val GEOMETRIC_OVERRIDE_THRESHOLD = 0.55f
+        /** Embedding similarity above this bypasses tentative confirmation.
+         *  Higher than geometric override: overriding position/size is low-risk,
+         *  but skipping multi-frame confirmation needs stronger evidence.
+         *  Keyboard at sim=0.582 overrode geometric gates during phone rotation —
+         *  tentative confirmation would have caught it (single-frame fluke). */
+        const val TENTATIVE_BYPASS_THRESHOLD = 0.65f
         /** Minimum embedding similarity to consider a candidate at all.
          *  If the primary embedder says the candidate is a different object (sim < this),
          *  no amount of re-ID, attributes, or color can rescue it. */
         const val MIN_EMBEDDING_SIMILARITY = 0.15f
-        /** Frames to require embedding before allowing fallback scoring.
-         *  Async embeddings typically arrive within 2-3 frames. Allow a short grace
-         *  period, then fall back to position/label scoring if embeddings never arrive
-         *  (e.g. object left frame entirely, no detections to embed). */
-        const val EMBEDDING_REQUIRED_FRAMES = 5
         /** Maximum embeddings to keep in gallery. */
         const val MAX_GALLERY_SIZE = 12
         /** Maximum negative examples to store. */
-        const val MAX_NEGATIVE_EXAMPLES = 5
-        /** Penalty applied when candidate is closer to a negative than to centroid. */
-        const val NEGATIVE_PENALTY = 0.1f
+        const val MAX_NEGATIVE_EXAMPLES = 10
+        /**
+         * Tentative bypass decision table:
+         * | Condition                          | Bypass tentative? | Rationale                    |
+         * |------------------------------------|-------------------|------------------------------|
+         * | sim >= 0.7 (APPEARANCE_OVERRIDE)   | YES               | Clearly same object          |
+         * | classifier P >= 0.8                | YES               | Learned boundary says yes    |
+         * | classifier not trained, sim >= 0.55| YES               | Fallback to geometric level  |
+         * | classifier trained, P < 0.8        | NO                | Uncertain — require 3 frames |
+         * | sim < 0.55                         | NO                | Weak match — require 3 frames|
+         */
+
+        /** Consecutive frames the same detection must win before committing (DeepSORT-style). */
+        const val TENTATIVE_MIN_FRAMES = 3
+        /** IoU threshold to consider a detection "the same" across consecutive frames. */
+        const val TENTATIVE_IOU_THRESHOLD = 0.3f
+        /** Lowe's ratio test: reject when secondBestSim / bestSim exceeds this (SIFT-style). */
+        const val RATIO_TEST_THRESHOLD = 0.85f
     }
 
     var lockedId: Int? = null
@@ -69,7 +85,10 @@ class ReacquisitionEngine(
     val hasEmbeddings: Boolean get() = _embeddingGallery.isNotEmpty()
     /** Centroid (L2-normalized mean) of the gallery — stable identity representation. */
     private var _embeddingCentroid: FloatArray? = null
-    private fun recomputeCentroid() { _embeddingCentroid = computeCentroid(_embeddingGallery) }
+    private fun recomputeCentroid() {
+        _embeddingCentroid = computeCentroid(_embeddingGallery)
+        recomputeMinGallerySim()
+    }
 
     /** Cosine similarity between a candidate and the gallery centroid. */
     fun centroidSimilarity(candidate: FloatArray): Float {
@@ -77,20 +96,70 @@ class ReacquisitionEngine(
         return cosineSimilarity(candidate, centroid)
     }
 
+    /** Minimum pairwise sim within gallery — drives adaptive embedding floor. */
+    private var _minGallerySim: Float = 1f
+    private fun recomputeMinGallerySim() { _minGallerySim = minPairwiseSimilarity(_embeddingGallery) }
+
+    /** Online classifier trained from gallery (positives) + scene negatives. */
+    private val _classifier = OnlineClassifier()
+    val classifierTrained: Boolean get() = _classifier.isTrained
+
+    /** Retrain classifier when gallery or negatives change enough. */
+    private var _lastTrainPositives = 0
+    private var _lastTrainNegatives = 0
+    private fun maybeRetrainClassifier() {
+        val posCount = _embeddingGallery.size
+        val negCount = _negativeExamples.size
+        // Retrain when we have new data (at least 2 new examples since last train)
+        if (posCount >= 3 && negCount >= 3 &&
+            (posCount + negCount) - (_lastTrainPositives + _lastTrainNegatives) >= 2) {
+            _classifier.train(_embeddingGallery, _negativeExamples)
+            _lastTrainPositives = posCount
+            _lastTrainNegatives = negCount
+            if (_classifier.isTrained) {
+                Log.d(TAG, "Classifier retrained: $posCount positives, $negCount negatives")
+            }
+        }
+    }
+
+    /** Classifier prediction for a candidate embedding. Returns [0, 1]. */
+    fun classifierScore(candidate: FloatArray): Float = _classifier.predict(candidate)
+
     /** Embeddings of rejected candidates — sharpens identity boundary. */
     private val _negativeExamples = mutableListOf<FloatArray>()
+    /** Cached negative centroid — recomputed on change, same pattern as positive centroid. */
+    private var _negativeCentroid: FloatArray? = null
 
     private fun addNegativeExample(embedding: FloatArray) {
         if (_negativeExamples.size >= MAX_NEGATIVE_EXAMPLES) _negativeExamples.removeAt(0)
         _negativeExamples.add(embedding.copyOf())
+        _negativeCentroid = computeCentroid(_negativeExamples)
     }
 
-    /** Penalty if candidate is closer to a negative example than to the centroid. */
-    private fun negativePenalty(candidateEmbedding: FloatArray): Float {
-        if (_negativeExamples.isEmpty() || _embeddingCentroid == null) return 0f
-        val centroidSim = cosineSimilarity(candidateEmbedding, _embeddingCentroid!!)
-        val worstNegSim = _negativeExamples.maxOf { cosineSimilarity(candidateEmbedding, it) }
-        return if (worstNegSim > centroidSim) NEGATIVE_PENALTY else 0f
+    /** Add a scene negative — an embedding from a non-locked detection seen during tracking.
+     *  Builds the negative prototype for discriminative scoring. */
+    fun addSceneNegative(embedding: FloatArray) {
+        val centroid = _embeddingCentroid ?: return
+        val sim = cosineSimilarity(embedding, centroid)
+        // Filter: reject near-positives (sim >= 0.85) — these are likely the target itself
+        // from overlapping detections or slightly different crops. Adding them as negatives
+        // poisons the classifier boundary. Only genuine scene objects (sim < 0.85) qualify.
+        if (sim < 0.85f) {
+            addNegativeExample(embedding)
+            maybeRetrainClassifier()
+            Log.d(TAG, "Scene negative added (sim=${"%.3f".format(sim)}) — total=${_negativeExamples.size}")
+        }
+    }
+
+    /** Prototype margin: sim(candidate, pos_centroid) - sim(candidate, neg_centroid).
+     *  Returns margin in [-1, 1]. Positive = closer to locked object than to scene.
+     *  Returns 0 when no negatives exist (no discrimination possible). */
+    private fun prototypeMargin(candidateEmbedding: FloatArray): Float {
+        val negCentroid = _negativeCentroid ?: return 0f
+        val posCentroid = _embeddingCentroid ?: return 0f
+        val posSim = cosineSimilarity(candidateEmbedding, posCentroid)
+        val negSim = cosineSimilarity(candidateEmbedding, negCentroid)
+        return posSim - negSim
     }
     /** Reference color histogram from lock time. */
     var lockedColorHistogram: FloatArray? = null
@@ -118,6 +187,13 @@ class ReacquisitionEngine(
     var framesLost: Int = 0
         private set
 
+    // --- Tentative confirmation state (DeepSORT-style) ---
+    // A candidate must win scoring for TENTATIVE_MIN_FRAMES consecutive frames
+    // before we commit to reacquisition. Eliminates single-frame flukes like
+    // couch (sim=0.41) briefly appearing when tracking a chair.
+    private var tentativeBox: RectF? = null
+    private var tentativeCount: Int = 0
+
     val isLocked: Boolean get() = lockedId != null
     val isSearching: Boolean get() = lockedId != null && framesLost > 0 && framesLost <= maxFramesLost
     val hasTimedOut: Boolean get() = framesLost > maxFramesLost
@@ -136,6 +212,11 @@ class ReacquisitionEngine(
         lockedIsPerson = (cocoLabel ?: label) == "person"
         _embeddingGallery = embeddings.map { it.copyOf() }.toMutableList()
         recomputeCentroid()
+        _negativeExamples.clear()
+        _negativeCentroid = null
+        _classifier.clear()
+        _lastTrainPositives = 0
+        _lastTrainNegatives = 0
         lockedColorHistogram = colorHist?.copyOf()
         lockedPersonAttributes = personAttrs
         lockedReIdEmbedding = reIdEmbedding?.copyOf()
@@ -146,6 +227,8 @@ class ReacquisitionEngine(
         lastKnownVelocityX = 0f
         lastKnownVelocityY = 0f
         framesLost = 0
+        tentativeBox = null
+        tentativeCount = 0
         val attrStr = personAttrs?.summary() ?: "n/a"
         dualLog(Log.INFO, "LOCK id=$trackingId label=\"$label\" box=${fmtBox(boundingBox)} size=${fmtF(lastKnownSize)} gallery=${embeddingGallery.size} colorHist=${colorHist != null} attrs=\"$attrStr\"")
     }
@@ -170,6 +253,7 @@ class ReacquisitionEngine(
         }
         _embeddingGallery.add(embedding.copyOf())
         recomputeCentroid()
+        maybeRetrainClassifier()
     }
 
     fun clear() {
@@ -180,7 +264,12 @@ class ReacquisitionEngine(
         lockedIsPerson = false
         _embeddingGallery.clear()
         _embeddingCentroid = null
+        _minGallerySim = 1f
         _negativeExamples.clear()
+        _negativeCentroid = null
+        _classifier.clear()
+        _lastTrainPositives = 0
+        _lastTrainNegatives = 0
         lockedColorHistogram = null
         lockedPersonAttributes = null
         lockedReIdEmbedding = null
@@ -191,6 +280,8 @@ class ReacquisitionEngine(
         lastKnownVelocityY = 0f
         lastKnownSize = 0f
         framesLost = 0
+        tentativeBox = null
+        tentativeCount = 0
     }
 
     fun processFrame(detections: List<TrackedObject>): TrackedObject? {
@@ -229,24 +320,64 @@ class ReacquisitionEngine(
             }
         }
 
-        val reacquired = findBestCandidate(detections)
-        if (reacquired != null) {
-            val sim = if (hasEmbeddings && reacquired.embedding != null) {
-                bestGallerySimilarity(reacquired.embedding!!)
-            } else 0f
-            val reIdSim = if (lockedReIdEmbedding != null && reacquired.reIdEmbedding != null) {
-                " reId=${fmtF(cosineSimilarity(lockedReIdEmbedding!!, reacquired.reIdEmbedding!!))}"
-            } else ""
-            val faceSim = if (lockedFaceEmbedding != null && reacquired.faceEmbedding != null) {
-                " face=${fmtF(cosineSimilarity(lockedFaceEmbedding!!, reacquired.faceEmbedding!!))}"
-            } else ""
-            dualLog(Log.INFO, "REACQUIRE id=${reacquired.id} label=\"${reacquired.label}\" after $framesLost frames (lockedLabel=\"$lockedLabel\") sim=${fmtF(sim)}$reIdSim$faceSim box=${fmtBox(reacquired.boundingBox)}")
-            lockedId = reacquired.id
-            updateFromMatch(reacquired)
-            return reacquired
+        val candidate = findBestCandidate(detections)
+        if (candidate == null) {
+            tentativeBox = null
+            tentativeCount = 0
+            return null
         }
 
-        return null
+        val sim = if (hasEmbeddings && candidate.embedding != null) {
+            bestGallerySimilarity(candidate.embedding!!)
+        } else 0f
+        val strongMatch = sim >= APPEARANCE_OVERRIDE_THRESHOLD
+
+        // --- Tentative confirmation (DeepSORT-style) ---
+        // Don't commit on a single frame. Require the same detection to win
+        // for TENTATIVE_MIN_FRAMES consecutive frames.
+        //
+        // Tentative bypass logic:
+        //   - Strong match (sim >= 0.7): always bypass
+        //   - Classifier trained + confident (P >= 0.8): bypass — learned boundary says yes
+        //   - Classifier trained + uncertain (P < 0.8): require tentative (classifier tightens)
+        //   - Classifier NOT trained: bypass if sim >= 0.55 (geometric override level)
+        // The classifier only tightens the gate, never loosens beyond geometric override.
+        val clsP = if (_classifier.isTrained && candidate.embedding != null)
+            _classifier.predict(candidate.embedding!!) else -1f
+        val skipTentative = strongMatch ||
+            (clsP >= 0.8f) ||
+            (clsP < 0f && hasEmbeddings && sim >= GEOMETRIC_OVERRIDE_THRESHOLD)
+        if (!skipTentative) {
+            val prevBox = tentativeBox
+            val candBox = candidate.boundingBox
+            if (prevBox != null && computeIou(prevBox, candBox) >= TENTATIVE_IOU_THRESHOLD) {
+                tentativeCount++
+            } else {
+                tentativeCount = 1
+            }
+            tentativeBox = RectF(candBox)
+
+            if (tentativeCount < TENTATIVE_MIN_FRAMES) {
+                val logThis = framesLost % 10 == 1
+                if (logThis) dualLog(Log.DEBUG, "TENTATIVE: id=${candidate.id} label=\"${candidate.label}\" sim=${fmtF(sim)} count=$tentativeCount/$TENTATIVE_MIN_FRAMES — waiting")
+                return null
+            }
+            dualLog(Log.DEBUG, "CONFIRMED: id=${candidate.id} label=\"${candidate.label}\" sim=${fmtF(sim)} after $tentativeCount frames")
+        }
+
+        tentativeBox = null
+        tentativeCount = 0
+
+        val reIdSim = if (lockedReIdEmbedding != null && candidate.reIdEmbedding != null) {
+            " reId=${fmtF(cosineSimilarity(lockedReIdEmbedding!!, candidate.reIdEmbedding!!))}"
+        } else ""
+        val faceSim = if (lockedFaceEmbedding != null && candidate.faceEmbedding != null) {
+            " face=${fmtF(cosineSimilarity(lockedFaceEmbedding!!, candidate.faceEmbedding!!))}"
+        } else ""
+        dualLog(Log.INFO, "REACQUIRE id=${candidate.id} label=\"${candidate.label}\" after $framesLost frames (lockedLabel=\"$lockedLabel\") sim=${fmtF(sim)}$reIdSim$faceSim box=${fmtBox(candidate.boundingBox)}")
+        lockedId = candidate.id
+        updateFromMatch(candidate)
+        return candidate
     }
 
     private fun updateFromMatch(obj: TrackedObject) {
@@ -300,16 +431,10 @@ class ReacquisitionEngine(
         // Person/not-person gate is inside scoreCandidate(). Pre-filter only removes invalid IDs.
         val validCandidates = candidates.filter { it.id >= 0 }
 
-        // Single-candidate fast path: if exactly one same-category candidate exists,
-        // bypass the EMBEDDING_REQUIRED_FRAMES wait. With no ambiguity about which
-        // object to pick, waiting for embeddings just delays the inevitable reacquisition.
-        val sameCategoryCandidates = validCandidates.filter { (it.label == "person") == lockedIsPerson }
-        val isSoleSameCategory = sameCategoryCandidates.size == 1
-
         val logThis = framesLost % 10 == 1 || validCandidates.isNotEmpty()
 
         val scored = validCandidates.mapNotNull { candidate ->
-            val score = scoreCandidate(candidate, refBox, posConf, posThreshold, isSoleSameCategory)
+            val score = scoreCandidate(candidate, refBox, posConf, posThreshold)
             val sim = if (hasEmbeddings && candidate.embedding != null) {
                 bestGallerySimilarity(candidate.embedding!!)
             } else null
@@ -327,7 +452,13 @@ class ReacquisitionEngine(
                     val faceStr = if (lockedFaceEmbedding != null && candidate.faceEmbedding != null) {
                         " face=${fmtF(cosineSimilarity(lockedFaceEmbedding!!, candidate.faceEmbedding!!))}"
                     } else ""
-                    dualLog(Log.DEBUG, "  scored id=${candidate.id} label=\"${candidate.label}\" score=${fmtF(score)} sim=${sim?.let { fmtF(it) } ?: "n/a"} color=${colorSim?.let { fmtF(it) } ?: "n/a"}$attrStr$reIdStr$faceStr (min=${fmtF(minScoreThreshold)})")
+                    val marginStr = if (candidate.embedding != null && _negativeExamples.isNotEmpty()) {
+                        " margin=${fmtF(prototypeMargin(candidate.embedding!!))}"
+                    } else ""
+                    val clsStr = if (_classifier.isTrained && candidate.embedding != null) {
+                        " cls=${fmtF(_classifier.predict(candidate.embedding!!))}"
+                    } else ""
+                    dualLog(Log.DEBUG, "  scored id=${candidate.id} label=\"${candidate.label}\" score=${fmtF(score)} sim=${sim?.let { fmtF(it) } ?: "n/a"} color=${colorSim?.let { fmtF(it) } ?: "n/a"}$attrStr$reIdStr$faceStr$marginStr$clsStr (min=${fmtF(minScoreThreshold)})")
                 }
                 Pair(candidate, score)
             } else {
@@ -343,21 +474,20 @@ class ReacquisitionEngine(
         val sortedScored = scored.sortedByDescending { it.second }
         val best = sortedScored[0]
 
-        // Relative scoring: if the best candidate has a clear embedding margin over
-        // the rest of the scene, it's almost certainly the target — even if its absolute
-        // score is borderline. This handles label-flicker cases where sim=0.6 is clearly
-        // the target but doesn't clear absolute thresholds.
-        if (sortedScored.size >= 2) {
-            val bestSim = if (hasEmbeddings && best.first.embedding != null) {
-                bestGallerySimilarity(best.first.embedding!!)
-            } else 0f
-            val secondSim = if (hasEmbeddings && sortedScored[1].first.embedding != null) {
-                bestGallerySimilarity(sortedScored[1].first.embedding!!)
-            } else 0f
-            val margin = bestSim - secondSim
-            if (margin > 0.2f && bestSim > 0.4f && best.second >= minScoreThreshold * 0.9f) {
-                if (logThis) dualLog(Log.DEBUG, "  RELATIVE_MARGIN: best sim=${fmtF(bestSim)} margin=${fmtF(margin)} — accepting")
-                return best.first
+        // --- Lowe's ratio test (SIFT-style) ---
+        // Compares embedding similarity (not final score) intentionally: the ratio test
+        // asks "can the embedder tell these apart?" not "do other signals differ?"
+        // Two candidates with similar embedding but different color/position are still
+        // ambiguous from an identity standpoint — other signals are noisy tiebreakers.
+        if (sortedScored.size >= 2 && hasEmbeddings) {
+            val bestSim = if (best.first.embedding != null) bestGallerySimilarity(best.first.embedding!!) else 0f
+            val secondSim = if (sortedScored[1].first.embedding != null) bestGallerySimilarity(sortedScored[1].first.embedding!!) else 0f
+            if (bestSim > 0f && secondSim > 0f) {
+                val ratio = secondSim / bestSim
+                if (ratio > RATIO_TEST_THRESHOLD) {
+                    if (logThis) dualLog(Log.DEBUG, "  RATIO_REJECT: best=${fmtF(bestSim)} second=${fmtF(secondSim)} ratio=${fmtF(ratio)} > ${fmtF(RATIO_TEST_THRESHOLD)} — ambiguous, waiting")
+                    return null
+                }
             }
         }
 
@@ -376,8 +506,7 @@ class ReacquisitionEngine(
         candidate: TrackedObject,
         refBox: RectF,
         positionConfidence: Float = positionConfidence(),
-        posThreshold: Float = effectivePositionThreshold(),
-        soleSameCategoryCandidate: Boolean = false
+        posThreshold: Float = effectivePositionThreshold()
     ): Float? {
         val candBox = candidate.boundingBox
 
@@ -389,25 +518,21 @@ class ReacquisitionEngine(
         // --- GATE: Require embedding when gallery exists ---
         // If we have reference embeddings but the candidate has none (async not ready),
         // reject it — accepting without identity verification causes wrong-object locks.
-        // With mature gallery (≥8): ALWAYS require embeddings. No fallback. The gallery
-        // proves we can compute embeddings — if a candidate doesn't have one, either
-        // the async pipeline hasn't caught up (wait) or the object is too different.
-        // With immature gallery (<8): allow fallback after EMBEDDING_REQUIRED_FRAMES
-        // to avoid deadlock when embeddings fail consistently.
-        val canBypassEmbedding = soleSameCategoryCandidate && _embeddingGallery.size < 8
-        val galleryMature = _embeddingGallery.size >= 8
+        // Always require embeddings. The async pipeline delivers within 2-3 frames.
+        // Accepting without embeddings leads to wrong-category reacquisitions
+        // (e.g. laptop accepted when tracking chair, scored on position alone).
         if (hasEmbeddings && candidate.embedding == null) {
-            if (galleryMature || (framesLost < EMBEDDING_REQUIRED_FRAMES && !canBypassEmbedding)) {
-                return null
-            }
+            return null
         }
+        val galleryMature = _embeddingGallery.size >= 8
 
-        // --- GATE: Embedding floor ---
-        // If the primary embedder says this is a different object, reject outright.
-        // With mature gallery, raise the floor: we have strong identity reference,
-        // so demand higher similarity. Prevents cross-object confusion within same
-        // category (e.g. keyboard accepted when tracking mouse, both non-person).
-        val embeddingFloor = if (galleryMature) 0.45f else MIN_EMBEDDING_SIMILARITY
+        // --- GATE: Embedding floor (gallery-relative) ---
+        // Instead of a fixed floor, adapt to how consistent the gallery is.
+        // A tight gallery (min pair sim=0.8) demands higher similarity from candidates.
+        // A diverse gallery (min pair sim=0.4) is more lenient.
+        // Floor = minGallerySim * 0.75, clamped to [0.3, 0.5].
+        val adaptiveFloor = (_minGallerySim * 0.75f).coerceIn(0.3f, 0.5f)
+        val embeddingFloor = if (galleryMature) maxOf(adaptiveFloor, 0.4f) else adaptiveFloor
         if (hasAppearance && appearanceScore < embeddingFloor) {
             addNegativeExample(candidate.embedding!!)
             return null
@@ -537,24 +662,34 @@ class ReacquisitionEngine(
                    (attrScore * baseAttrW)
         } else if (hasAppearance) {
             // Generic embedding only (non-person, or person without re-ID)
-            // Use centroid similarity for ranking (more stable than best-of-gallery)
             val centroidScore = centroidSimilarity(candidate.embedding!!).coerceIn(0f, 1f)
-            val embScore = (appearanceScore + centroidScore) / 2f  // blend best-match + centroid
-            val baseEmbW = 0.50f
-            val basePosW = 0.15f * positionConfidence
+            val embScore = (appearanceScore + centroidScore) / 2f
+
+            // Discriminative scoring: classifier > prototype margin > raw cosine.
+            // The classifier learns a decision boundary from positives+negatives.
+            // Falls back to prototype margin when classifier isn't trained yet.
+            val clsScore = if (_classifier.isTrained) _classifier.predict(candidate.embedding!!) else -1f
+            val margin = prototypeMargin(candidate.embedding!!)
+            val hasDiscriminator = clsScore >= 0f || margin != 0f
+
+            val baseEmbW = if (hasDiscriminator) 0.30f else 0.50f
+            val baseClsW = if (clsScore >= 0f) 0.25f else 0f
+            val baseMarginW = if (clsScore < 0f && margin != 0f) 0.20f else 0f
+            val basePosW = 0.10f * positionConfidence
             val baseSizeW = 0.10f
-            val baseColorW = if (hasColor) 0.15f else 0f
-            val baseAttrW = if (hasAttrs) 0.10f else 0f
-            val unused = (1f - baseEmbW - basePosW - baseSizeW - baseColorW - baseAttrW).coerceAtLeast(0f)
+            val baseColorW = if (hasColor) 0.10f else 0f
+            val baseAttrW = if (hasAttrs) 0.05f else 0f
+            val unused = (1f - baseEmbW - baseClsW - baseMarginW - basePosW - baseSizeW - baseColorW - baseAttrW).coerceAtLeast(0f)
             val effEmbW = baseEmbW + unused
 
-            val negPenalty = negativePenalty(candidate.embedding!!)
+            val marginScore = ((margin + 1f) / 2f).coerceIn(0f, 1f)
             return (embScore * effEmbW) +
+                   (clsScore.coerceAtLeast(0f) * baseClsW) +
+                   (marginScore * baseMarginW) +
                    (positionScore * basePosW) +
                    (sizeScore * baseSizeW) +
                    (colorScore * baseColorW) +
-                   (attrScore * baseAttrW) -
-                   negPenalty
+                   (attrScore * baseAttrW)
         } else {
             // No embedding fallback: position + size only
             val basePosW = 0.50f * positionConfidence

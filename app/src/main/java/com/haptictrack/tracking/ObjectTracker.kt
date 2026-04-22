@@ -36,6 +36,9 @@ class ObjectTracker(
     // Keep last frame for computing embedding when user taps to lock
     private val lastFrameLock = Any()
     private var lastFrameBitmap: Bitmap? = null
+    /** Device rotation when lastFrameBitmap was captured — needed to map screen-space
+     *  detection boxes back to rotated-image space for embedding. */
+    private var lastFrameDeviceRotation: Int = 0
 
     // Track previous state to detect transitions
     private var previouslyLocked: Boolean = false
@@ -115,6 +118,9 @@ class ObjectTracker(
         onLoadingStatus?.invoke("Ready")
     }
 
+    /** Detections from the last processed frame — used to collect scene negatives at lock time. */
+    @Volatile private var lastDetections: List<TrackedObject> = emptyList()
+
     /**
      * Lock onto an object. If a frame bitmap is available, computes and stores
      * the visual embedding for identity-aware re-acquisition.
@@ -153,6 +159,18 @@ class ObjectTracker(
             debugCapture.sessionDir?.let { dir ->
                 scenarioRecorder.start(dir, trackingId, enrichedLabel, label,
                     boundingBox, augResult.embeddings, colorHist, personAttrs)
+            }
+
+            // Collect scene negatives from other objects visible at lock time.
+            // lastDetections has screen-space boxes but bmp is the rotated bitmap,
+            // so convert back to rotated-image space before cropping.
+            val lockDevRot = lastFrameDeviceRotation
+            for (det in lastDetections) {
+                if (det.id == trackingId) continue
+                val rotBox = mapToRotated(det.boundingBox.left, det.boundingBox.top,
+                    det.boundingBox.right, det.boundingBox.bottom, lockDevRot)
+                val negEmb = appearanceEmbedder.embed(bmp, rotBox)
+                if (negEmb != null) reacquisition.addSceneNegative(negEmb)
             }
 
             val locked = TrackedObject(trackingId, boundingBox, enrichedLabel)
@@ -298,6 +316,19 @@ class ObjectTracker(
                                 if (faceEmb != null) reacquisition.addFaceEmbedding(faceEmb)
                             }
                         }
+
+                        // Collect scene negatives every 5 confirmed frames.
+                        // tracked has screen-space boxes but bitmap is rotated,
+                        // so convert back to rotated-image space before cropping.
+                        if (vtConfirmedFrames % 5 == 0) {
+                            for (det in tracked) {
+                                if (det.id == reacquisition.lockedId) continue
+                                val rotBox = mapToRotated(det.boundingBox.left, det.boundingBox.top,
+                                    det.boundingBox.right, det.boundingBox.bottom, deviceRot)
+                                val negEmb = appearanceEmbedder.embed(bitmap, rotBox)
+                                if (negEmb != null) reacquisition.addSceneNegative(negEmb)
+                            }
+                        }
                     } else {
                         // Only count as unconfirmed if detector actually found detections
                         // (found objects but none match VT position = likely drift).
@@ -343,11 +374,13 @@ class ObjectTracker(
                             }
                         }
 
+                        lastDetections = displayObjects
                         onDetectionResult?.invoke(displayObjects, lockedObj, frameWidth, frameHeight, cachedContour)
 
                         synchronized(lastFrameLock) {
                             lastFrameBitmap?.recycle()
                             lastFrameBitmap = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
+                            lastFrameDeviceRotation = deviceRotation
                         }
                         return
                     }
@@ -474,6 +507,7 @@ class ObjectTracker(
             synchronized(lastFrameLock) {
                 lastFrameBitmap?.recycle()
                 lastFrameBitmap = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
+                lastFrameDeviceRotation = deviceRotation
             }
 
             // Debug frame capture on tracking events
@@ -501,6 +535,7 @@ class ObjectTracker(
                 }
             }
 
+            lastDetections = displayObjects
             onDetectionResult?.invoke(displayObjects, lockedObject, frameWidth, frameHeight, cachedContour)
         } finally {
             imageProxy?.close()
