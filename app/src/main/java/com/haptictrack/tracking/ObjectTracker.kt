@@ -436,7 +436,46 @@ class ObjectTracker(
                     })
                 }
 
-                merged
+                // --- Synchronous embedding fallback for candidates that missed the cache ---
+                // During rotation, IoU between consecutive frames drops below 0.3 so the
+                // async cache can't merge. Without embeddings, the ReacquisitionEngine's
+                // identity gate hard-rejects these candidates, causing multi-second gaps.
+                // Fix: compute embedding synchronously for the single best same-category
+                // candidate that has no embedding. One-time ~23ms cost per new candidate.
+                val withSyncFallback = if (reacquisition.hasEmbeddings) {
+                    val refBox = reacquisition.lastKnownBox
+                    val lockedIsPerson = reacquisition.lockedIsPerson
+                    // Find same-category candidates missing embeddings
+                    val needsSync = merged.filter { obj ->
+                        obj.embedding == null && obj.id >= 0 &&
+                            ((obj.label == "person") == lockedIsPerson)
+                    }
+                    if (needsSync.isNotEmpty() && refBox != null) {
+                        // Pick the closest one by center distance to last known position
+                        val best = needsSync.minByOrNull { obj ->
+                            val dx = obj.boundingBox.centerX() - refBox.centerX()
+                            val dy = obj.boundingBox.centerY() - refBox.centerY()
+                            dx * dx + dy * dy
+                        }!!
+                        // Compute embedding synchronously (raw crop fallback, ~8-23ms)
+                        val embResult = appearanceEmbedder.embedAndCrop(bitmap, best.boundingBox, fallback = true)
+                        val hist = if (embResult.maskedCrop != null) {
+                            val fullBox = RectF(0f, 0f, 1f, 1f)
+                            computeColorHistogram(embResult.maskedCrop, fullBox).also { embResult.maskedCrop.recycle() }
+                        } else computeColorHistogram(bitmap, best.boundingBox)
+                        if (embResult.embedding != null) {
+                            android.util.Log.d("EmbedSync", "Sync embedding for id=${best.id} label=${best.label}")
+                            merged.map { obj ->
+                                if (obj.id == best.id) obj.copy(
+                                    embedding = embResult.embedding,
+                                    colorHistogram = hist
+                                ) else obj
+                            }
+                        } else merged
+                    } else merged
+                } else merged
+
+                withSyncFallback
             } else {
                 pendingEmbeddings = null // clear when not searching
                 withLabels
@@ -446,11 +485,15 @@ class ObjectTracker(
             val wasSearching = reacquisition.isSearching
             val prevLost = reacquisition.framesLost
 
+            // Filter before scoring — removes phantom full-screen detections
+            // (e.g. "airplane" at [0,0,1,0.7]) that appear during rotation/motion blur.
+            val filtered = filter.filter(withEmbeddings)
+
             // Record frame for scenario replay (before processFrame consumes it)
-            scenarioRecorder.recordFrame(withEmbeddings)
+            scenarioRecorder.recordFrame(filtered)
 
             // Re-acquisition
-            val lockedObject = reacquisition.processFrame(withEmbeddings)
+            val lockedObject = reacquisition.processFrame(filtered)
 
             // Record events for scenario replay
             val nowLost = reacquisition.framesLost
@@ -482,7 +525,8 @@ class ObjectTracker(
             captureDebugFrame(bitmap, withEmbeddings, lockedObject, wasSearching, prevLost)
 
             // Filter for display
-            val displayObjects = filter.filter(withEmbeddings)
+            // Already filtered before processFrame — reuse for display
+            val displayObjects = filtered
 
             // Update contour on re-acquire or periodically (gated — disabled until UI uses it)
             if (contourEnabled) {

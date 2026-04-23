@@ -10,7 +10,7 @@ class DetectionFilter(
     /** Minimum bounding box area (normalized, 0..1). Rejects tiny slivers. */
     val minBoxArea: Float = 0.005f,
     /** Maximum bounding box area (normalized, 0..1). Rejects "whole frame" detections. */
-    val maxBoxArea: Float = 0.7f,
+    val maxBoxArea: Float = 0.5f,
     /** Minimum aspect ratio (width/height). Rejects extremely thin boxes. */
     val minAspectRatio: Float = 0.2f,
     /** Maximum aspect ratio (width/height). Rejects extremely wide boxes. */
