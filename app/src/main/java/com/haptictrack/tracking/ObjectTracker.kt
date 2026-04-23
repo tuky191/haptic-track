@@ -176,22 +176,6 @@ class ObjectTracker(
         }
     }
 
-    /**
-     * Prepare for a camera rebind. Stops visual tracker and forces
-     * re-acquisition engine into search mode so it recovers on the
-     * first frame after the camera restarts.
-     */
-    fun prepareForRebind() {
-        if (!reacquisition.isLocked) return
-        visualTracker.stop()
-        vtUnconfirmedFrames = 0
-        vtFrameCounter = 0
-        velocityEstimator.reset()
-        pendingEmbeddings?.cancel(true)
-        pendingEmbeddings = null
-        reacquisition.prepareForRebind()
-    }
-
     fun clearLock() {
         scenarioRecorder.recordEvent("CLEAR")
         scenarioRecorder.stop()
