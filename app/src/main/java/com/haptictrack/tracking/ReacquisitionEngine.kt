@@ -400,17 +400,6 @@ class ReacquisitionEngine(
         lastKnownVelocityY = vy
     }
 
-    /**
-     * Prepare for a camera rebind that will interrupt the frame stream.
-     * Forces into search mode so the first frame after rebind triggers re-acquisition
-     * using the full embedding gallery. Call before unbinding camera use cases.
-     */
-    fun prepareForRebind() {
-        if (!isLocked) return
-        framesLost = 1
-        android.util.Log.i("Reacq", "REBIND_PREPARE — forced search mode, gallery=${embeddingGallery.size}")
-    }
-
     internal fun positionConfidence(): Float {
         if (framesLost <= 0) return 1f
         return (1f - framesLost.toFloat() / positionDecayFrames).coerceIn(0f, 1f)

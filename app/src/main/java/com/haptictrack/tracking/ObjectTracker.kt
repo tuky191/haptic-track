@@ -2,11 +2,8 @@ package com.haptictrack.tracking
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.Matrix
 import android.graphics.PointF
 import android.graphics.RectF
-import androidx.camera.core.ImageAnalysis
-import androidx.camera.core.ImageProxy
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.core.Delegate
@@ -179,22 +176,6 @@ class ObjectTracker(
         }
     }
 
-    /**
-     * Prepare for a camera rebind. Stops visual tracker and forces
-     * re-acquisition engine into search mode so it recovers on the
-     * first frame after the camera restarts.
-     */
-    fun prepareForRebind() {
-        if (!reacquisition.isLocked) return
-        visualTracker.stop()
-        vtUnconfirmedFrames = 0
-        vtFrameCounter = 0
-        velocityEstimator.reset()
-        pendingEmbeddings?.cancel(true)
-        pendingEmbeddings = null
-        reacquisition.prepareForRebind()
-    }
-
     fun clearLock() {
         scenarioRecorder.recordEvent("CLEAR")
         scenarioRecorder.stop()
@@ -212,29 +193,16 @@ class ObjectTracker(
         contourFrameCount = 0
     }
 
-    val analyzer = ImageAnalysis.Analyzer { imageProxy ->
-        processImage(imageProxy)
-    }
-
     /**
      * Process a display-oriented bitmap from PreviewView.getBitmap().
      * Unlike the ImageProxy path, the bitmap is already in screen orientation —
      * no rotation is applied, and detector coordinates are used as-is (deviceRot=0).
      */
     fun processBitmap(bitmap: Bitmap) {
-        processBitmapInternal(bitmap, deviceRotation = 0, imageProxy = null)
+        processBitmapInternal(bitmap, deviceRotation = 0)
     }
 
-    private fun processImage(imageProxy: ImageProxy) {
-        val bitmap = imageProxyToBitmap(imageProxy)
-        if (bitmap == null) {
-            imageProxy.close()
-            return
-        }
-        processBitmapInternal(bitmap, deviceRotation = deviceRotationProvider?.invoke() ?: 0, imageProxy = imageProxy)
-    }
-
-    private fun processBitmapInternal(bitmap: Bitmap, deviceRotation: Int, imageProxy: ImageProxy?) {
+    private fun processBitmapInternal(bitmap: Bitmap, deviceRotation: Int) {
         val frameWidth = bitmap.width
         val frameHeight = bitmap.height
 
@@ -538,7 +506,6 @@ class ObjectTracker(
             lastDetections = displayObjects
             onDetectionResult?.invoke(displayObjects, lockedObject, frameWidth, frameHeight, cachedContour)
         } finally {
-            imageProxy?.close()
             bitmap.recycle()
         }
     }
@@ -563,26 +530,6 @@ class ObjectTracker(
                 confidence = detection.categories().firstOrNull()?.score() ?: 0f
             )
         }
-    }
-
-    private fun imageProxyToBitmap(imageProxy: ImageProxy): Bitmap? {
-        val bitmap = imageProxy.toBitmap()
-
-        // CameraX rotationDegrees assumes the display matches the activity's
-        // declared orientation (portrait). It does NOT account for the user
-        // physically holding the phone in landscape or upside down.
-        // We add the physical device rotation so the image fed to the detector
-        // is always upright relative to the real world.
-        val cameraRotation = imageProxy.imageInfo.rotationDegrees
-        val deviceRot = deviceRotationProvider?.invoke() ?: 0
-        val rotation = (cameraRotation + deviceRot) % 360
-
-        if (rotation == 0) return bitmap
-
-        val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
-        val rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
-        if (rotated !== bitmap) bitmap.recycle()
-        return rotated
     }
 
     private fun captureDebugFrame(

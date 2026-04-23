@@ -12,20 +12,17 @@ import com.haptictrack.camera.CameraManager
 import com.haptictrack.camera.DeviceOrientationListener
 import com.haptictrack.camera.RecordingManager
 import com.haptictrack.haptics.HapticFeedbackManager
-import com.haptictrack.tracking.CaptureMode
 import com.haptictrack.tracking.ObjectTracker
 import com.haptictrack.tracking.TrackedObject
 import com.haptictrack.tracking.TrackingStatus
 import com.haptictrack.tracking.TrackingUiState
+import com.haptictrack.tracking.CaptureMode
 import com.haptictrack.zoom.ZoomController
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 class CameraViewModel(application: Application) : AndroidViewModel(application) {
@@ -40,22 +37,14 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private val _uiState = MutableStateFlow(TrackingUiState())
     val uiState: StateFlow<TrackingUiState> = _uiState.asStateFlow()
 
-    /** Analysis frame for viewfinder during recording (when Preview goes to SurfaceTexture). */
+    /** Viewfinder frame from SurfaceTexture GL thread — always active. */
     private val _viewfinderBitmap = MutableStateFlow<android.graphics.Bitmap?>(null)
     val viewfinderBitmap: StateFlow<android.graphics.Bitmap?> = _viewfinderBitmap.asStateFlow()
-
-    /** Coroutine job for getBitmap() analysis loop during recording. */
-    private var bitmapAnalysisJob: Job? = null
-    private var previewViewRef: PreviewView? = null
 
     companion object {
         private const val TAG = "CameraVM"
         /** Tap target padding in normalized coordinates (~3% of screen on each side). */
         private const val TAP_PADDING = 0.03f
-        /** Target interval between getBitmap() analysis frames (ms). */
-        private const val BITMAP_ANALYSIS_INTERVAL_MS = 50L // ~20fps
-        /** Downscale getBitmap to this width for analysis (matches ImageAnalysis res). */
-        private const val ANALYSIS_TARGET_WIDTH = 640
     }
 
     /** Smooths idle detections by keeping objects alive for a few frames after they disappear. */
@@ -127,23 +116,17 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             }
 
             objectTracker = tracker
-            cameraManager.imageAnalysis.setAnalyzer(
-                java.util.concurrent.Executors.newSingleThreadExecutor(),
-                tracker.analyzer
-            )
-            // During recording, frames come from SurfaceTextureFrameReader instead of ImageAnalysis.
-            // Viewfinder updates at GL rate (~29fps) — always smooth, independent of processing.
-            // Processing thread picks up latest frame when ready (~10-12fps), naturally drops frames.
+            // Analysis frames always come from SurfaceTexture — no ImageAnalysis needed.
+            cameraManager.onAnalysisFrame = { bitmap ->
+                if (isTrackerReady) {
+                    tracker.processBitmap(bitmap)
+                }
+            }
             cameraManager.onViewfinderFrame = { bitmap ->
                 // Don't recycle previous bitmaps — Compose's RenderThread may still be
                 // drawing them asynchronously even after StateFlow emits a new value.
                 // At 480×640 ARGB (~1.2MB each), GC handles this fine on 8GB+ devices.
                 _viewfinderBitmap.value = bitmap
-            }
-            cameraManager.onRecordingFrame = { bitmap ->
-                if (isTrackerReady) {
-                    tracker.processBitmap(bitmap)
-                }
             }
             _uiState.update { it.copy(isReady = true) }
             Log.i(TAG, "ML models loaded, tracking ready")
@@ -151,7 +134,6 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun startCamera(lifecycleOwner: LifecycleOwner, previewView: PreviewView) {
-        previewViewRef = previewView
         cameraManager.startCamera(lifecycleOwner, previewView)
     }
 
@@ -270,17 +252,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     fun toggleStealthMode() {
         val entering = !_uiState.value.stealthMode
         if (!entering && _uiState.value.isRecording) {
-            // Stop recording before exiting stealth — rebind would kill VideoCapture
             recordingManager.stopRecording()
         }
         _uiState.update { it.copy(stealthMode = entering) }
-        objectTracker.prepareForRebind()
-        if (entering) {
-            cameraManager.enterRecordingMode()
-            // Frame reader in CameraManager handles analysis via onRecordingFrame
-        } else {
-            cameraManager.exitRecordingMode()
-        }
+        // No camera rebind needed — SurfaceTexture pipeline is always active.
+        // Stealth is purely a UI overlay change.
     }
 
     fun switchCamera() {
@@ -304,73 +280,21 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         if (recordingManager.isRecording) {
             recordingManager.stopRecording()
         } else {
-            if (!_uiState.value.stealthMode) {
-                objectTracker.prepareForRebind()
-                cameraManager.enterRecordingMode()
-                // Frame reader in CameraManager handles analysis via onRecordingFrame
-            }
+            // No camera rebind needed — SurfaceTexture pipeline is always active.
+            // Just start recording on the existing VideoCapture.
             recordingManager.startRecording(cameraManager.videoCapture) { event ->
                 when (event) {
                     is VideoRecordEvent.Start ->
                         _uiState.update { it.copy(isRecording = true) }
-                    is VideoRecordEvent.Finalize -> {
+                    is VideoRecordEvent.Finalize ->
                         _uiState.update { it.copy(isRecording = false) }
-                        _viewfinderBitmap.value = null
-                        if (!_uiState.value.stealthMode) {
-                            objectTracker.prepareForRebind()
-                            cameraManager.exitRecordingMode()
-                        }
-                    }
                 }
             }
         }
-    }
-
-    /**
-     * Start a coroutine loop that pulls bitmaps from PreviewView for analysis.
-     * Used during recording when ImageAnalysis is unbound.
-     */
-    private fun startBitmapAnalysis() {
-        bitmapAnalysisJob?.cancel()
-        bitmapAnalysisJob = viewModelScope.launch {
-            Log.i(TAG, "Bitmap analysis loop started")
-            while (isActive) {
-                // getBitmap() must be called on main thread
-                val preview = previewViewRef
-                val bitmap = preview?.bitmap
-                if (bitmap != null) {
-                    kotlinx.coroutines.withContext(Dispatchers.Default) {
-                        // Downscale to ~640px wide to match ImageAnalysis resolution.
-                        // Full screen resolution (1440x3200) is 15x more pixels and
-                        // takes ~500ms per frame vs ~30ms at 640px.
-                        val scale = ANALYSIS_TARGET_WIDTH.toFloat() / bitmap.width
-                        val scaled = if (scale < 0.9f) {
-                            val w = (bitmap.width * scale).toInt()
-                            val h = (bitmap.height * scale).toInt()
-                            android.graphics.Bitmap.createScaledBitmap(bitmap, w, h, true).also {
-                                bitmap.recycle()
-                            }
-                        } else bitmap
-
-                        objectTracker.processBitmap(scaled)
-                    }
-                    kotlinx.coroutines.yield()
-                } else {
-                    delay(BITMAP_ANALYSIS_INTERVAL_MS)
-                }
-            }
-            Log.i(TAG, "Bitmap analysis loop stopped")
-        }
-    }
-
-    private fun stopBitmapAnalysis() {
-        bitmapAnalysisJob?.cancel()
-        bitmapAnalysisJob = null
     }
 
     override fun onCleared() {
         super.onCleared()
-        stopBitmapAnalysis()
         orientationListener.stop()
         if (isTrackerReady) objectTracker.shutdown()
         hapticManager.shutdown()
