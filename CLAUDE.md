@@ -70,7 +70,7 @@ MVVM with a single-activity Compose UI. Two-tier tracking: visual tracker for fr
 
 ```
 CameraViewModel
-├── CameraManager              (CameraX: preview, image analysis, zoom, video capture)
+├── CameraManager              (CameraX: SurfaceTexture GL pipeline, zoom, video capture)
 ├── DeviceOrientationListener  (accelerometer: detects upside-down/landscape holds)
 ├── ObjectTracker              (orchestrates the tracking pipeline below)
 │   ├── VisualTracker          (OpenCV VitTracker: primary frame-to-frame pixel tracking)
@@ -90,7 +90,7 @@ CameraViewModel
 ### Data Flow
 
 **Normal tracking (object visible):**
-1. CameraX feeds frames to `ObjectTracker` via `ImageAnalysis`
+1. CameraX feeds frames to `ObjectTracker` via the SurfaceTexture GL pipeline (always active, regardless of recording state)
 2. `DeviceOrientationListener` provides physical rotation → bitmap rotated to upright
 3. `VisualTracker` (VitTracker) updates the locked object's position by pixel correlation
 4. Detector runs in parallel to cross-check — if detector confirms the label at the tracker's box, tracking continues
@@ -113,16 +113,13 @@ CameraViewModel
   - Semantically guarded: COCO "person" can only become Man/Woman/Boy/Girl/Human face
 
 **Recording (4K mode):**
-1. `CameraManager.enterRecordingMode()` unbinds `ImageAnalysis`, rebinds with 2 streams (preview + video) → 4K
-2. `CameraViewModel` starts a coroutine loop calling `PreviewView.getBitmap()` on main thread
-3. Bitmap is downscaled to ~640px width, then fed to `ObjectTracker.processBitmap()` on `Dispatchers.Default`
-4. `processBitmap()` sets `deviceRotation=0` (getBitmap is display-oriented) and processes normally
-5. On recording stop, `Finalize` callback triggers `exitRecordingMode()` → rebinds 3 streams
-6. `prepareForRebind()` called before each rebind: stops VT, forces `framesLost=1` for instant re-acquisition
+1. Recording toggles VideoCapture on/off — no rebind or mode switching needed
+2. Frames always come from the SurfaceTexture GL pipeline, same as normal tracking
+3. 4K recording is always available since the pipeline uses only 2 streams (preview + video)
 
 **Stealth mode:**
-- Black overlay covers full-size PreviewView (preview must render at full size for `getBitmap()`)
-- Same 2-stream mode as recording — 4K video + getBitmap analysis
+- Black overlay covers the preview — purely a UI layer (opaque black Box in Compose)
+- SurfaceTexture pipeline provides frames regardless of UI visibility
 - Volume-down cycle still works: lock → record → stop+clear
 
 **Display:**
@@ -279,7 +276,7 @@ Position (50%, decays) + size (25%) + base bonus (25%). All survivors already pa
 **Recently merged to master:**
 - PR #42 — GPU delegate for all models, FP16 detector, adaptive frame skip, stealth mode, dependency bumps
 - PR #40 — Regression baseline scenarios with quantitative thresholds
-- PR #37 — Manual camera controls: pinch zoom, 4K recording via 2/3-stream switching, stealth mode, volume-down hands-free cycle
+- PR #37 — Manual camera controls: pinch zoom, 4K recording, stealth mode, volume-down hands-free cycle
 - PR #36 — Person identity: face embedding (MobileFaceNet) + body re-ID (OSNet x1.0)
 - PR #31 — Cascade scoring refactor (#30 phases 1+2), scenario recorder + replay harness
 - PR #29 — Two-stage detection (EfficientDet-Lite2 + YOLOv8n-oiv7 label enrichment)
@@ -341,11 +338,11 @@ Camera image aspect ratio differs from phone screen. All bounding box rendering 
 ### Confidence threshold at 50% (decided 2026-04-12)
 Both MediaPipe's detector and `DetectionFilter` use 0.5 minimum confidence.
 
-### Dynamic 2/3-stream switching for 4K recording (decided 2026-04-17)
-Camera hardware (Xiaomi 13 Pro) limits 3 concurrent streams (preview + analysis + video) to 720p. Dropping ImageAnalysis gives 2 streams → 4K. During recording, analysis frames come from `PreviewView.getBitmap()` downscaled to ~640px width (~30ms/frame vs ~500ms at native 1440x3200). Key gotchas: getBitmap must run on main thread, returns rendered pixel size (1dp view = 4x4px), image is display-oriented (deviceRot=0). VideoCapture must be recreated on each rebind to avoid resolution mismatch. `prepareForRebind()` forces search mode for instant recovery.
+### Unified SurfaceTexture pipeline (decided 2026-04-23, replaces 2/3-stream switching)
+Always uses 2-stream mode (SurfaceTexture + VideoCapture). Frames for tracking come from the GL pipeline via SurfaceTexture, not ImageAnalysis. Recording just toggles VideoCapture on/off — no rebind, no mode switching, no `prepareForRebind()`. This replaced the old dynamic 2/3-stream switching where ImageAnalysis was dropped during recording and `PreviewView.getBitmap()` was used as a fallback frame source. The unified pipeline is simpler and always delivers 4K-capable streams.
 
-### Stealth mode: hidden preview with black overlay (decided 2026-04-17)
-PreviewView must render at full size for `getBitmap()` to return usable frames. A 1dp preview returns 4x4px bitmaps. Solution: keep preview full-size, overlay with opaque black Box. Preview still processes frames, `getBitmap()` returns full resolution, user sees black screen with controls.
+### Stealth mode: black overlay over SurfaceTexture preview (decided 2026-04-17, updated 2026-04-23)
+Opaque black Box overlays the preview in Compose. SurfaceTexture pipeline provides frames regardless of UI visibility, so stealth is purely a UI concern. User sees black screen with controls.
 
 ### Volume-down hands-free cycle (decided 2026-04-17)
 Three-stage cycle on volume-down: idle → lock on center object, tracking → start recording, recording → stop recording + clear. Enables fully hands-free operation: point camera, press volume-down three times.
@@ -510,7 +507,7 @@ All in constructor defaults — no settings UI yet:
 - [x] Haptic feedback (continuous pulse, edge intensity, stop on lost)
 - [x] Auto-zoom from bounding box + pinch-to-zoom with manual override
 - [x] Volume-down hands-free cycle: lock center → record → stop+clear
-- [x] 4K video recording via dynamic 2/3-stream switching
+- [x] 4K video recording (unified SurfaceTexture pipeline)
 - [x] Stealth mode (true stealth: blank screen, tap to exit, volume-down only)
 - [x] All-orientation support (portrait, landscape, upside down) with hysteresis
 - [x] GPU delegate for all 9 models (FP16 detector + FP32 others on Adreno 740)
