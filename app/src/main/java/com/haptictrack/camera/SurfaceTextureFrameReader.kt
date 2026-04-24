@@ -46,6 +46,10 @@ class SurfaceTextureFrameReader(
 
     companion object {
         private const val TAG = "STFrameReader"
+        /** Log averaged frame timings every N frames on the GL thread. */
+        private const val TIMING_LOG_INTERVAL = 60
+        /** Bitmaps in each ring. 3 is enough to absorb one-frame hiccups on either side. */
+        private const val POOL_SIZE = 3
     }
 
     private var glThread: Thread? = null
@@ -57,6 +61,16 @@ class SurfaceTextureFrameReader(
 
     /** Latest frame from GL thread. Processing thread swaps it out atomically. */
     private val latestFrame = AtomicReference<Bitmap?>(null)
+
+    /** Bitmaps owned by the processing path; caller releases back via [releaseAnalysisBitmap]. */
+    private val processingPool = BitmapRing(POOL_SIZE, outputWidth, outputHeight)
+    /** Bitmaps owned by the viewfinder path; cycled without a caller release — Compose drops
+     *  references via StateFlow, and we reuse bitmaps that are old enough that Compose has
+     *  already swapped them off the RenderThread. */
+    private val viewfinderPool = BitmapRing(POOL_SIZE, outputWidth, outputHeight)
+    /** In-flight viewfinder bitmaps, oldest first. Once the ring is full, the oldest
+     *  bitmap is recycled back into [viewfinderPool] — Compose is ≥2 frames past it. */
+    private val inflightViewfinder = ArrayDeque<Bitmap>(POOL_SIZE)
 
     // EGL state (initialized on GL thread)
     private var eglDisplay: EGLDisplay = EGL14.EGL_NO_DISPLAY
@@ -111,11 +125,15 @@ class SurfaceTextureFrameReader(
 
                 Log.i(TAG, "GL thread started, output=${outputWidth}x${outputHeight}")
                 var glFrameCount = 0
+                var readPxNs = 0L
+                var copyNs = 0L
+                var totalNs = 0L
 
                 // GL render loop: reads frames at camera rate, stores latest
                 while (running.get()) {
                     if (frameAvailable.compareAndSet(true, false)) {
                         val st = surfaceTexture ?: continue
+                        val frameStart = System.nanoTime()
                         st.updateTexImage()
                         st.getTransformMatrix(texMatrix)
 
@@ -135,26 +153,49 @@ class SurfaceTextureFrameReader(
                         drawQuad(program)
 
                         readBuffer.rewind()
+                        val readStart = System.nanoTime()
                         GLES20.glReadPixels(0, 0, outputWidth, outputHeight,
                             GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, readBuffer)
+                        readPxNs += System.nanoTime() - readStart
+
+                        // Fill processing bitmap from the readback buffer.
+                        val copyStart = System.nanoTime()
                         readBuffer.rewind()
+                        val procBitmap = processingPool.acquire()
+                        procBitmap.copyPixelsFromBuffer(readBuffer)
 
-                        val bitmap = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.ARGB_8888)
-                        bitmap.copyPixelsFromBuffer(readBuffer)
-
-                        // Send to viewfinder at full camera rate (~29fps).
-                        // Viewfinder gets its own copy — not recycled by processing thread.
-                        // Don't recycle old viewfinder bitmaps: Compose may still be drawing them.
+                        // Fill viewfinder bitmap from the same buffer — no bitmap.copy().
+                        // Compose may still hold the previous few viewfinder bitmaps via
+                        // StateFlow + RenderThread; keep a 3-entry in-flight queue and only
+                        // recycle the oldest (≥2 frames behind current) back into the ring.
                         if (onViewfinderFrame != null) {
-                            val vfBitmap = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
+                            readBuffer.rewind()
+                            val vfBitmap = viewfinderPool.acquire()
+                            vfBitmap.copyPixelsFromBuffer(readBuffer)
+                            inflightViewfinder.addLast(vfBitmap)
+                            if (inflightViewfinder.size > POOL_SIZE) {
+                                viewfinderPool.release(inflightViewfinder.removeFirst())
+                            }
                             onViewfinderFrame.invoke(vfBitmap)
                         }
+                        copyNs += System.nanoTime() - copyStart
 
-                        // Store latest frame for processing — recycle any unprocessed previous frame
-                        // No manual flip needed — transform matrix handles orientation
-                        val old = latestFrame.getAndSet(bitmap)
-                        old?.recycle()
+                        // Store latest frame for processing — return any unprocessed previous
+                        // frame to the pool so the ring stays within budget.
+                        // No manual flip needed — transform matrix handles orientation.
+                        val old = latestFrame.getAndSet(procBitmap)
+                        if (old != null) processingPool.release(old)
+
+                        totalNs += System.nanoTime() - frameStart
                         glFrameCount++
+                        if (glFrameCount % TIMING_LOG_INTERVAL == 0) {
+                            val n = TIMING_LOG_INTERVAL
+                            Log.i(TAG, "GL frame avg: readPx=${readPxNs / n / 1_000_000.0}ms " +
+                                "copy=${copyNs / n / 1_000_000.0}ms " +
+                                "total=${totalNs / n / 1_000_000.0}ms " +
+                                "(${glFrameCount} frames)")
+                            readPxNs = 0L; copyNs = 0L; totalNs = 0L
+                        }
                     } else {
                         Thread.sleep(1)
                     }
@@ -185,20 +226,20 @@ class SurfaceTextureFrameReader(
         // naturally drops frames when processing is slower than GL delivery
         processingThread = Thread({
             var processedCount = 0
-            var droppedCount = 0
             Log.i(TAG, "Processing thread started")
             while (running.get()) {
                 val frame = latestFrame.getAndSet(null)
                 if (frame != null) {
                     onFrame(frame)
-                    // onFrame's consumer (processBitmap) recycles the bitmap
+                    // onFrame contract: consumer calls [releaseAnalysisBitmap] when done
+                    // so the bitmap goes back into the pool instead of being recycled.
                     processedCount++
                 } else {
                     Thread.sleep(2) // wait for next frame
                 }
             }
-            // Recycle any remaining frame
-            latestFrame.getAndSet(null)?.recycle()
+            // Return any remaining frame to the pool
+            latestFrame.getAndSet(null)?.let { processingPool.release(it) }
             Log.i(TAG, "Processing thread stopped: $processedCount processed")
         }, "STFrameReader-Process")
         processingThread?.start()
@@ -213,11 +254,24 @@ class SurfaceTextureFrameReader(
         processingThread = null
         glThread?.join(2000)
         glThread = null
-        latestFrame.getAndSet(null)?.recycle()
+        latestFrame.getAndSet(null)?.let { processingPool.release(it) }
+        inflightViewfinder.forEach { viewfinderPool.release(it) }
+        inflightViewfinder.clear()
+        processingPool.releaseAll()
+        viewfinderPool.releaseAll()
         surface?.release()
         surface = null
         surfaceTexture?.release()
         surfaceTexture = null
+    }
+
+    /**
+     * Return a processing bitmap to the pool after the consumer finishes with it.
+     * Replaces the previous contract of [Bitmap.recycle] inside [onFrame]'s consumer —
+     * the pool owns bitmap lifetime now.
+     */
+    fun releaseAnalysisBitmap(bitmap: Bitmap) {
+        processingPool.release(bitmap)
     }
 
     /** The Surface to provide to CameraX Preview. Only valid after [start]. */

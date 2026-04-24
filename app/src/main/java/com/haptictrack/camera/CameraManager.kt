@@ -47,8 +47,17 @@ class CameraManager(private val context: Context) {
     /** Reads frames from Preview surface via OpenGL. Always active. */
     private var frameReader: SurfaceTextureFrameReader? = null
 
-    /** Callback for analysis frames from SurfaceTexture (processing thread, ~10-12fps). */
+    /**
+     * Callback for analysis frames from SurfaceTexture (processing thread, ~10-12fps).
+     * Consumer must call [releaseAnalysisBitmap] when done with the bitmap so it can
+     * be returned to the pool.
+     */
     var onAnalysisFrame: ((android.graphics.Bitmap) -> Unit)? = null
+
+    /** Return a processing bitmap to the frame reader's pool. */
+    fun releaseAnalysisBitmap(bitmap: android.graphics.Bitmap) {
+        frameReader?.releaseAnalysisBitmap(bitmap)
+    }
 
     /** Callback for viewfinder display frames from SurfaceTexture (GL thread, ~29fps). */
     var onViewfinderFrame: ((android.graphics.Bitmap) -> Unit)? = null

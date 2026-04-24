@@ -239,7 +239,9 @@ class ObjectTracker(
         val frameWidth = bitmap.width
         val frameHeight = bitmap.height
 
-        try {
+        // Input bitmap is owned by the caller (production: SurfaceTextureFrameReader pool;
+        // tests: the decoder's own lifecycle). We never recycle it here.
+        run {
             // --- Visual tracker: primary frame-to-frame tracking ---
             // When active, it tracks the locked object by pixel correlation.
             // Cross-checked against the detector to prevent drift.
@@ -635,8 +637,6 @@ class ObjectTracker(
 
             lastDetections = displayObjects
             onDetectionResult?.invoke(displayObjects, lockedObject, frameWidth, frameHeight, cachedContour)
-        } finally {
-            bitmap.recycle()
         }
     }
 

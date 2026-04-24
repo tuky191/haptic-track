@@ -335,10 +335,12 @@ class VideoReplayTest {
             if (frameIndex == lockFrame && !locked) {
                 val forProcess = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
                 ot.processBitmap(forProcess)
+                forProcess.recycle()  // test owns bitmap lifetime; production uses a pool
                 ot.lockOnObject(trackingId = 1, boundingBox = lockBox, label = lockLabel)
                 locked = true
                 framesTracked++
                 Log.i(TAG, "Locked on $lockLabel at frame $frameIndex box=$lockBox")
+                bitmap.recycle()
                 return@decodeAll 0
             } else if (locked) {
                 // Snapshot state BEFORE processing
@@ -348,6 +350,7 @@ class VideoReplayTest {
                 val startMs = System.currentTimeMillis()
                 ot.processBitmap(bitmap)
                 val processingMs = System.currentTimeMillis() - startMs
+                bitmap.recycle()  // test owns bitmap lifetime; production uses a pool
 
                 // Check state AFTER processing to detect transitions
                 val nowLost = ot.reacquisition.framesLost

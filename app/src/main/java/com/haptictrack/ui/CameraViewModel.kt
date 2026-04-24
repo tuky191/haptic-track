@@ -118,8 +118,13 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             objectTracker = tracker
             // Analysis frames always come from SurfaceTexture — no ImageAnalysis needed.
             cameraManager.onAnalysisFrame = { bitmap ->
-                if (isTrackerReady) {
-                    tracker.processBitmap(bitmap)
+                try {
+                    if (isTrackerReady) {
+                        tracker.processBitmap(bitmap)
+                    }
+                } finally {
+                    // Always return the bitmap so the pool doesn't drain on exceptions.
+                    cameraManager.releaseAnalysisBitmap(bitmap)
                 }
             }
             cameraManager.onViewfinderFrame = { bitmap ->
