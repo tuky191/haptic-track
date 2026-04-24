@@ -55,8 +55,11 @@ class ObjectTracker(
 
     /** Skip detector every other frame when VT is confident and recently confirmed. */
     private var vtFrameCounter = 0
-    private val VT_SKIP_INTERVAL = 2  // run detector every Nth frame when skipping
-    private val VT_SKIP_MIN_CONFIRMED = 5  // need this many confirmations before skipping
+    private val VT_SKIP_INTERVAL_BASE = 2  // default: run detector every 2nd frame (50% skip)
+    private val VT_SKIP_INTERVAL_STABLE = 3  // highly confident + long-stable: every 3rd frame (67% skip)
+    private val VT_SKIP_MIN_CONFIRMED = 5  // need this many confirmations before skipping at all
+    private val VT_SKIP_STABLE_CONFIRMED = 10  // confirmations required for wider skip interval
+    private val VT_SKIP_STABLE_CONFIDENCE = 0.7f  // VT confidence required for wider skip interval
 
     /** Tracks object velocity for adaptive drift detection and position prediction. */
     private val velocityEstimator = VelocityEstimator()
@@ -267,11 +270,18 @@ class ObjectTracker(
 
                     // Skip detector when VT is confident and recently confirmed.
                     // Saves ~35ms per skipped frame. Still run every Nth frame for drift detection.
+                    // Widen the interval once VT has been confirmed for a long stretch at high
+                    // confidence — the detector's role at that point is a slow safety net,
+                    // template self-verification (every 5 frames) is the primary drift signal.
                     vtFrameCounter++
                     val canSkip = vtConfirmedFrames >= VT_SKIP_MIN_CONFIRMED &&
                         vtUnconfirmedFrames == 0 &&
                         vtResult.confidence > 0.6f
-                    val skipDetector = canSkip && (vtFrameCounter % VT_SKIP_INTERVAL != 0)
+                    val skipInterval = if (
+                        vtConfirmedFrames >= VT_SKIP_STABLE_CONFIRMED &&
+                        vtResult.confidence > VT_SKIP_STABLE_CONFIDENCE
+                    ) VT_SKIP_INTERVAL_STABLE else VT_SKIP_INTERVAL_BASE
+                    val skipDetector = canSkip && (vtFrameCounter % skipInterval != 0)
 
                     val tracked = if (skipDetector) {
                         emptyList()
