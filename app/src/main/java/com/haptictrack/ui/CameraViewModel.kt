@@ -259,6 +259,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         // Stealth is purely a UI overlay change.
     }
 
+    /** Volume-up: toggle stealth mode. Entry/exit point for hands-free stealth. */
+    fun onVolumeUp() {
+        toggleStealthMode()
+    }
+
     fun switchCamera() {
         clearTracking()
         cameraManager.switchCamera()

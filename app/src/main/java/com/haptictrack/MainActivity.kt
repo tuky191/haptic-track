@@ -29,6 +29,10 @@ class MainActivity : ComponentActivity() {
             viewModel.onVolumeDown()
             return true
         }
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
+            viewModel.onVolumeUp()
+            return true
+        }
         return super.onKeyDown(keyCode, event)
     }
 }
