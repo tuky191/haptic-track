@@ -63,11 +63,26 @@ class ObjectTracker(
      * resembles the locked object → VT has drifted. Detector-independent,
      * so it catches drift even when the detector can't see the target
      * (small objects, uniform surfaces, label flicker).
+     *
+     * Asymmetric thresholds (hysteresis): increment the counter when sim falls
+     * below TEMPLATE_SIM_LOW, reset only when sim rises above TEMPLATE_SIM_OK.
+     * This prevents oscillation around a single threshold from masking drift.
      */
     private val TEMPLATE_CHECK_INTERVAL = 5    // embed VT crop every N frames
-    private val TEMPLATE_SIM_THRESHOLD = 0.4f  // below this = drift suspicion
+    private val TEMPLATE_SIM_LOW = 0.4f        // below this = drift suspicion (increment)
+    private val TEMPLATE_SIM_OK = 0.5f         // above this = safe (reset counter)
     private val TEMPLATE_MISMATCH_MAX = 3      // consecutive low-sim checks → kill (≈0.5s)
     private var templateMismatchCount = 0
+
+    /**
+     * VT box size sanity check: the tracker's output box shouldn't grow
+     * dramatically relative to the box it was initialized with. Objects don't
+     * physically grow 5x in a fraction of a second — if VT is producing a
+     * much larger box, it has latched onto a larger texture pattern (e.g.
+     * the whole screen) instead of the locked object.
+     */
+    private val VT_BOX_AREA_MAX_RATIO = 5f
+    private var vtLockedBoxArea = 0f  // area of VT's init box (normalized 0..1)
 
     /** Async embedding pipeline: compute embeddings on background thread, use results next frame. */
     private val embeddingExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "EmbeddingAsync") }
@@ -160,6 +175,7 @@ class ObjectTracker(
             reacquisition.lock(trackingId, boundingBox, enrichedLabel, augResult.embeddings, colorHist, personAttrs,
                 cocoLabel = label, reIdEmbedding = reIdEmb, faceEmbedding = faceEmb)
             visualTracker.init(bmp, boundingBox)
+            vtLockedBoxArea = boundingBox.width() * boundingBox.height()
 
             debugCapture.startSession(enrichedLabel, trackingId)
             val attrStr = personAttrs?.summary() ?: "n/a"
@@ -200,6 +216,7 @@ class ObjectTracker(
         vtConfirmedFrames = 0
         vtFrameCounter = 0
         templateMismatchCount = 0
+        vtLockedBoxArea = 0f
         velocityEstimator.reset()
         pendingEmbeddings?.cancel(true)
         pendingEmbeddings = null
@@ -330,20 +347,34 @@ class ObjectTracker(
                     //
                     // Effective rate is every ~5 frames normally, ~10 frames when VT
                     // frame skipping is active (skipDetector=true on alternate frames).
+                    //
+                    // Hysteresis: increment when sim < TEMPLATE_SIM_LOW, reset only
+                    // when sim > TEMPLATE_SIM_OK. Values in between (the dead zone)
+                    // leave the counter unchanged so marginal oscillation can't mask
+                    // real drift.
                     if (!skipDetector &&
                         reacquisition.hasEmbeddings &&
                         vtFrameCounter % TEMPLATE_CHECK_INTERVAL == 0) {
                         val curEmb = appearanceEmbedder.embedWithFallback(bitmap, rawBox)
                         if (curEmb != null) {
                             val sim = reacquisition.bestGallerySimilarity(curEmb)
-                            if (sim < TEMPLATE_SIM_THRESHOLD) {
-                                templateMismatchCount++
-                                android.util.Log.d("VisualTracker", "Template mismatch $templateMismatchCount/$TEMPLATE_MISMATCH_MAX (sim=${"%.3f".format(sim)})")
-                            } else {
-                                templateMismatchCount = 0
+                            when {
+                                sim < TEMPLATE_SIM_LOW -> {
+                                    templateMismatchCount++
+                                    android.util.Log.d("VisualTracker", "Template mismatch $templateMismatchCount/$TEMPLATE_MISMATCH_MAX (sim=${"%.3f".format(sim)})")
+                                }
+                                sim > TEMPLATE_SIM_OK -> templateMismatchCount = 0
+                                else -> { /* dead zone — hold the counter */ }
                             }
                         }
                     }
+
+                    // VT box size sanity: if the tracker's output is much larger than
+                    // what we initialized it with, VT has latched onto background
+                    // texture (classic "expands to whole screen" drift).
+                    val vtBoxArea = vtBox.width() * vtBox.height()
+                    val sizeDrift = vtLockedBoxArea > 0f &&
+                        vtBoxArea > vtLockedBoxArea * VT_BOX_AREA_MAX_RATIO
 
                     // If too many frames without detector confirmation, tracker is drifting.
                     // Adaptive: fast-moving subjects get shorter tolerance (drift is more costly).
@@ -354,13 +385,18 @@ class ObjectTracker(
                     }
                     val templateDrift = templateMismatchCount >= TEMPLATE_MISMATCH_MAX
                     val detectorDrift = vtUnconfirmedFrames > adaptiveMaxUnconfirmed
-                    if (templateDrift || detectorDrift) {
-                        val reason = if (templateDrift) "template mismatch ${templateMismatchCount}x" else "$vtUnconfirmedFrames unconfirmed frames (max=$adaptiveMaxUnconfirmed)"
+                    if (sizeDrift || templateDrift || detectorDrift) {
+                        val reason = when {
+                            sizeDrift -> "box expanded ${"%.1fx".format(vtBoxArea / vtLockedBoxArea)} (area=${"%.3f".format(vtBoxArea)})"
+                            templateDrift -> "template mismatch ${templateMismatchCount}x"
+                            else -> "$vtUnconfirmedFrames unconfirmed frames (max=$adaptiveMaxUnconfirmed)"
+                        }
                         android.util.Log.w("VisualTracker", "DRIFT detected — $reason (conf=${vtResult.confidence}, speed=${velocityEstimator.speed}), stopping")
                         visualTracker.stop()
                         vtUnconfirmedFrames = 0
                         vtFrameCounter = 0
                         templateMismatchCount = 0
+                        vtLockedBoxArea = 0f
                         // Fall through to detector path below
                     } else {
                         val lockedObj = TrackedObject(
@@ -400,6 +436,7 @@ class ObjectTracker(
                     visualTracker.stop()
                     vtUnconfirmedFrames = 0
                     templateMismatchCount = 0
+                    vtLockedBoxArea = 0f
                 }
             }
 
@@ -555,6 +592,7 @@ class ObjectTracker(
             // If re-acquired, re-initialize visual tracker
             if (wasSearching && lockedObject != null && reacquisition.framesLost == 0) {
                 visualTracker.init(bitmap, lockedObject.boundingBox)
+                vtLockedBoxArea = lockedObject.boundingBox.width() * lockedObject.boundingBox.height()
                 templateMismatchCount = 0
             }
 
