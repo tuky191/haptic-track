@@ -226,14 +226,28 @@ class SurfaceTextureFrameReader(
         // naturally drops frames when processing is slower than GL delivery
         processingThread = Thread({
             var processedCount = 0
+            var processNs = 0L
+            var lastReportMs = System.currentTimeMillis()
             Log.i(TAG, "Processing thread started")
             while (running.get()) {
                 val frame = latestFrame.getAndSet(null)
                 if (frame != null) {
+                    val start = System.nanoTime()
                     onFrame(frame)
-                    // onFrame contract: consumer calls [releaseAnalysisBitmap] when done
-                    // so the bitmap goes back into the pool instead of being recycled.
+                    processNs += System.nanoTime() - start
                     processedCount++
+
+                    // Report every 60 processed frames (~5-6s at 10fps processing).
+                    if (processedCount % TIMING_LOG_INTERVAL == 0) {
+                        val now = System.currentTimeMillis()
+                        val elapsedMs = now - lastReportMs
+                        val fps = if (elapsedMs > 0)
+                            TIMING_LOG_INTERVAL * 1000.0 / elapsedMs else 0.0
+                        Log.i(TAG, "Process frame avg: ${processNs / TIMING_LOG_INTERVAL / 1_000_000.0}ms " +
+                            "(~${"%.1f".format(fps)}fps, $processedCount total)")
+                        processNs = 0L
+                        lastReportMs = now
+                    }
                 } else {
                     Thread.sleep(2) // wait for next frame
                 }
