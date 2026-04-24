@@ -32,6 +32,14 @@ class ObjectTracker(
     // Keep last frame for computing embedding when user taps to lock
     private val lastFrameLock = Any()
     private var lastFrameBitmap: Bitmap? = null
+
+    /**
+     * Called to hand a no-longer-needed bitmap back to the frame reader's pool.
+     * When null (tests), we skip pool return — the test owns bitmap lifetime
+     * and recycles its own copies. In production, CameraViewModel wires this
+     * to `CameraManager.releaseAnalysisBitmap`.
+     */
+    var bitmapRecycler: ((Bitmap) -> Unit)? = null
     /** Device rotation when lastFrameBitmap was captured — needed to map screen-space
      *  detection boxes back to rotated-image space for embedding. */
     private var lastFrameDeviceRotation: Int = 0
@@ -232,9 +240,17 @@ class ObjectTracker(
         val frameWidth = bitmap.width
         val frameHeight = bitmap.height
 
-        // Input bitmap is owned by the caller (production: SurfaceTextureFrameReader pool;
-        // tests: the decoder's own lifecycle). We never recycle it here.
-        run {
+        // Bitmap ownership: we retain `bitmap` as lastFrameBitmap at the end of
+        // processing, swapping out the previous lastFrameBitmap which then goes
+        // back to the pool. Previously we did bitmap.copy() (~4ms) every frame
+        // just to keep a reference for lockOnObject and debug capture — that was
+        // wasteful since the input is already a stable snapshot for this frame.
+        //
+        // `releaseOnExit` tracks which bitmap to return to the pool in `finally`:
+        //   - initially the input (so exceptions still release it)
+        //   - after retention, the old lastFrameBitmap (release instead of input)
+        var releaseOnExit: Bitmap? = bitmap
+        try {
             // --- Visual tracker: primary frame-to-frame tracking ---
             // When active, it tracks the locked object by pixel correlation.
             // Cross-checked against the detector to prevent drift.
@@ -420,9 +436,10 @@ class ObjectTracker(
                         onDetectionResult?.invoke(displayObjects, lockedObj, frameWidth, frameHeight, cachedContour)
 
                         synchronized(lastFrameLock) {
-                            lastFrameBitmap?.recycle()
-                            lastFrameBitmap = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
+                            val previous = lastFrameBitmap
+                            lastFrameBitmap = bitmap
                             lastFrameDeviceRotation = deviceRotation
+                            releaseOnExit = previous  // release old, retain new
                         }
                         return
                     }
@@ -591,12 +608,14 @@ class ObjectTracker(
                 templateMismatchCount = 0
             }
 
-            // Save lastFrameBitmap before debug capture to avoid a third bitmap copy.
-            // Debug capture draws annotations directly onto a mutable copy of this frame.
+            // Retain the frame for debug capture and future lockOnObject calls.
+            // Debug capture draws annotations onto its own mutable copy of this bitmap,
+            // so concurrent access is safe.
             synchronized(lastFrameLock) {
-                lastFrameBitmap?.recycle()
-                lastFrameBitmap = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
+                val previous = lastFrameBitmap
+                lastFrameBitmap = bitmap
                 lastFrameDeviceRotation = deviceRotation
+                releaseOnExit = previous  // release old, retain new
             }
 
             // Debug frame capture on tracking events.
@@ -630,6 +649,8 @@ class ObjectTracker(
 
             lastDetections = displayObjects
             onDetectionResult?.invoke(displayObjects, lockedObject, frameWidth, frameHeight, cachedContour)
+        } finally {
+            releaseOnExit?.let { bitmapRecycler?.invoke(it) ?: it.recycle() }
         }
     }
 

@@ -311,6 +311,11 @@ class VideoReplayTest {
         tracker = ot
 
         assertTrue("Models should load within 60s", loadLatch.await(60, TimeUnit.SECONDS))
+        // Tracker retains the most recent input as lastFrameBitmap and hands the
+        // previous one back via this recycler. In production the recycler points
+        // to the pool; here it's a straight recycle() since the decoder gives us
+        // a fresh bitmap each frame.
+        ot.bitmapRecycler = { it.recycle() }
         Log.i(TAG, "Models loaded, starting replay of $name")
 
         // Collect events from the callback
@@ -333,9 +338,10 @@ class VideoReplayTest {
             totalVideoFrames = frameIndex + 1
 
             if (frameIndex == lockFrame && !locked) {
+                // processBitmap takes ownership via bitmapRecycler; pass a copy so
+                // the decoder's bitmap can still be recycled separately.
                 val forProcess = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
                 ot.processBitmap(forProcess)
-                forProcess.recycle()  // test owns bitmap lifetime; production uses a pool
                 ot.lockOnObject(trackingId = 1, boundingBox = lockBox, label = lockLabel)
                 locked = true
                 framesTracked++
@@ -348,9 +354,8 @@ class VideoReplayTest {
                 val prevLost = ot.reacquisition.framesLost
 
                 val startMs = System.currentTimeMillis()
-                ot.processBitmap(bitmap)
+                ot.processBitmap(bitmap)  // tracker owns it; recycler releases previous frame
                 val processingMs = System.currentTimeMillis() - startMs
-                bitmap.recycle()  // test owns bitmap lifetime; production uses a pool
 
                 // Check state AFTER processing to detect transitions
                 val nowLost = ot.reacquisition.framesLost
