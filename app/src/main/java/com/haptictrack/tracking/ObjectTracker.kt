@@ -56,6 +56,19 @@ class ObjectTracker(
     private val VT_ADAPTIVE_UNCONFIRMED_HIGH = 5      // ~165ms for fast subjects
     private val VT_ADAPTIVE_UNCONFIRMED_VERY_HIGH = 3  // ~100ms for very fast subjects
 
+    /**
+     * Template self-verification (issue #45, R3 from research):
+     * Every N frames during VT tracking, embed the current VT crop and compare
+     * it against the lock gallery. Low similarity means the crop no longer
+     * resembles the locked object → VT has drifted. Detector-independent,
+     * so it catches drift even when the detector can't see the target
+     * (small objects, uniform surfaces, label flicker).
+     */
+    private val TEMPLATE_CHECK_INTERVAL = 5    // embed VT crop every N frames
+    private val TEMPLATE_SIM_THRESHOLD = 0.4f  // below this = drift suspicion
+    private val TEMPLATE_MISMATCH_MAX = 3      // consecutive low-sim checks → kill (≈0.5s)
+    private var templateMismatchCount = 0
+
     /** Async embedding pipeline: compute embeddings on background thread, use results next frame. */
     private val embeddingExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "EmbeddingAsync") }
     private var pendingEmbeddings: java.util.concurrent.Future<Map<Int, EmbeddingResult>>? = null
@@ -186,6 +199,7 @@ class ObjectTracker(
         vtUnconfirmedFrames = 0
         vtConfirmedFrames = 0
         vtFrameCounter = 0
+        templateMismatchCount = 0
         velocityEstimator.reset()
         pendingEmbeddings?.cancel(true)
         pendingEmbeddings = null
@@ -306,6 +320,26 @@ class ObjectTracker(
                         }
                     }
 
+                    // --- Template self-verification (R3) ---
+                    // Primary drift signal: compare current VT crop's embedding to the
+                    // lock gallery. Detector-independent, so it catches drift on small
+                    // or uniform objects the detector struggles with. Skipped on
+                    // detector-skip frames (no bitmap cost budget).
+                    if (!skipDetector &&
+                        reacquisition.hasEmbeddings &&
+                        vtFrameCounter % TEMPLATE_CHECK_INTERVAL == 0) {
+                        val curEmb = appearanceEmbedder.embedWithFallback(bitmap, rawBox)
+                        if (curEmb != null) {
+                            val sim = reacquisition.bestGallerySimilarity(curEmb)
+                            if (sim < TEMPLATE_SIM_THRESHOLD) {
+                                templateMismatchCount++
+                                android.util.Log.d("VisualTracker", "Template mismatch $templateMismatchCount/$TEMPLATE_MISMATCH_MAX (sim=${"%.3f".format(sim)})")
+                            } else {
+                                templateMismatchCount = 0
+                            }
+                        }
+                    }
+
                     // If too many frames without detector confirmation, tracker is drifting.
                     // Adaptive: fast-moving subjects get shorter tolerance (drift is more costly).
                     val adaptiveMaxUnconfirmed = when {
@@ -313,11 +347,15 @@ class ObjectTracker(
                         velocityEstimator.isHighVelocity() -> VT_ADAPTIVE_UNCONFIRMED_HIGH
                         else -> VT_MAX_UNCONFIRMED
                     }
-                    if (vtUnconfirmedFrames > adaptiveMaxUnconfirmed) {
-                        android.util.Log.w("VisualTracker", "DRIFT detected — $vtUnconfirmedFrames unconfirmed frames (max=$adaptiveMaxUnconfirmed, speed=${velocityEstimator.speed}), stopping")
+                    val templateDrift = templateMismatchCount >= TEMPLATE_MISMATCH_MAX
+                    val detectorDrift = vtUnconfirmedFrames > adaptiveMaxUnconfirmed
+                    if (templateDrift || detectorDrift) {
+                        val reason = if (templateDrift) "template mismatch ${templateMismatchCount}x" else "$vtUnconfirmedFrames unconfirmed frames (max=$adaptiveMaxUnconfirmed)"
+                        android.util.Log.w("VisualTracker", "DRIFT detected — $reason (conf=${vtResult.confidence}, speed=${velocityEstimator.speed}), stopping")
                         visualTracker.stop()
                         vtUnconfirmedFrames = 0
                         vtFrameCounter = 0
+                        templateMismatchCount = 0
                         // Fall through to detector path below
                     } else {
                         val lockedObj = TrackedObject(
@@ -356,6 +394,7 @@ class ObjectTracker(
                     // Visual tracker lost the object — fall through to detector
                     visualTracker.stop()
                     vtUnconfirmedFrames = 0
+                    templateMismatchCount = 0
                 }
             }
 
@@ -511,6 +550,7 @@ class ObjectTracker(
             // If re-acquired, re-initialize visual tracker
             if (wasSearching && lockedObject != null && reacquisition.framesLost == 0) {
                 visualTracker.init(bitmap, lockedObject.boundingBox)
+                templateMismatchCount = 0
             }
 
             // Save lastFrameBitmap before debug capture to avoid a third bitmap copy.
