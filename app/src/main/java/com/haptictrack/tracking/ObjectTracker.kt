@@ -325,6 +325,9 @@ class ObjectTracker(
                     // lock gallery. Detector-independent, so it catches drift on small
                     // or uniform objects the detector struggles with. Skipped on
                     // detector-skip frames (no bitmap cost budget).
+                    //
+                    // Effective rate is every ~5 frames normally, ~10 frames when VT
+                    // frame skipping is active (skipDetector=true on alternate frames).
                     if (!skipDetector &&
                         reacquisition.hasEmbeddings &&
                         vtFrameCounter % TEMPLATE_CHECK_INTERVAL == 0) {
@@ -561,7 +564,10 @@ class ObjectTracker(
                 lastFrameDeviceRotation = deviceRotation
             }
 
-            // Debug frame capture on tracking events
+            // Debug frame capture on tracking events.
+            // Uses unfiltered `withEmbeddings` on purpose — debug overlays should
+            // show what the detector produced, including phantoms that the filter
+            // removed, so we can diagnose when the filter is too aggressive.
             captureDebugFrame(bitmap, withEmbeddings, lockedObject, wasSearching, prevLost)
 
             // Filter for display
