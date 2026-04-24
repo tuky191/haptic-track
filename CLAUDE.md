@@ -46,7 +46,7 @@ app/src/main/java/com/haptictrack/
 │   ├── PersonAttributeClassifier.kt         # Crossroad-0230 + BlazeFace + age-gender
 │   ├── VisualTracker.kt                     # OpenCV VitTracker wrapper
 │   ├── FrameToFrameTracker.kt               # IoU-based detection ID assignment
-│   ├── DetectionFilter.kt                   # Noise removal (confidence, size, aspect ratio)
+│   ├── DetectionFilter.kt                   # Noise removal (confidence, size, aspect ratio; applied before scoring)
 │   ├── ScenarioRecorder.kt                  # JSON capture for replay testing + serialization helpers
 │   ├── DebugFrameCapture.kt                 # Annotated PNGs + session.log on tracking events
 │   ├── ObjectSegmenter.kt                   # magic_touch segmentation for masked crops
@@ -94,16 +94,18 @@ CameraViewModel
 2. `DeviceOrientationListener` provides physical rotation → bitmap rotated to upright
 3. `VisualTracker` (VitTracker) updates the locked object's position by pixel correlation
 4. Detector runs in parallel to cross-check — if detector confirms the label at the tracker's box, tracking continues
-5. If detector doesn't confirm for 10 frames → drift detected, visual tracker stopped
+5. Every 5 frames, the current VT crop is embedded and compared against the lock gallery — primary drift signal (catches drift even when the detector can't see the target)
+6. 3 consecutive template mismatches (sim < 0.4) OR 10 frames without detector confirmation → drift detected, visual tracker stopped
 
 **Re-acquisition (object lost):**
 1. Detector runs, `FrameToFrameTracker` assigns stable IDs via IoU matching
 2. `Yolov8Detector` enriches COCO labels with OIV7 labels (every 10th search frame)
-3. `AppearanceEmbedder` computes visual fingerprints for all candidates
-4. `ReacquisitionEngine` scores candidates: position (decays over time) + size + label (20% scoring factor, -0.5 penalty for mismatch) + appearance similarity + color histogram + person attributes
-5. Strong embedding match (>0.7 cosine similarity) overrides position/size hard thresholds
-6. Best candidate above `minScoreThreshold` becomes the new lock; visual tracker re-initializes
-7. `ScenarioRecorder` captures every frame's detections and events as JSON for replay testing
+3. `AppearanceEmbedder` computes visual fingerprints for all candidates (async pipeline; synchronous fallback for the closest same-category candidate when the async cache can't bridge across frames during rotation)
+4. `DetectionFilter` runs before scoring to strip phantom full-screen detections (area > 0.5) that EfficientDet produces during motion blur
+5. `ReacquisitionEngine` scores candidates: position (decays over time) + size + label (20% scoring factor, -0.5 penalty for mismatch) + appearance similarity + color histogram + person attributes
+6. Strong embedding match (>0.7 cosine similarity) overrides position/size hard thresholds
+7. Best candidate above `minScoreThreshold` becomes the new lock; visual tracker re-initializes
+8. `ScenarioRecorder` captures every frame's detections and events as JSON for replay testing
 
 **Two-stage detection:**
 - EfficientDet-Lite2 (COCO 80) runs every frame for reliable bounding boxes
@@ -274,6 +276,9 @@ Position (50%, decays) + size (25%) + base bonus (25%). All survivors already pa
 ## Current Work (may be stale — verify with git/GitHub)
 
 **Recently merged to master:**
+- PR #54 — Unify on SurfaceTexture pipeline, remove 3-stream mode (#48)
+- PR #52 — Identity: tentative confirmation, ratio test, gallery-relative threshold, online classifier (#50)
+- PR #44 — Velocity estimation + async embeddings + SurfaceTexture recording
 - PR #42 — GPU delegate for all models, FP16 detector, adaptive frame skip, stealth mode, dependency bumps
 - PR #40 — Regression baseline scenarios with quantitative thresholds
 - PR #37 — Manual camera controls: pinch zoom, 4K recording, stealth mode, volume-down hands-free cycle
@@ -295,8 +300,15 @@ Position (50%, decays) + size (25%) + base bonus (25%). All survivors already pa
 ### Two-stage detection: EfficientDet-Lite2 + YOLOv8n-oiv7 (decided 2026-04-17)
 EfficientDet-Lite2 runs every frame for reliable bounding boxes (person at 0.80-0.88 confidence). YOLOv8n-oiv7 runs on-demand to upgrade coarse COCO labels to finer OIV7 labels (601 classes). OIV7 splits "person" across sub-classes (Boy, Girl, Man, Woman) so no single class gets high confidence indoors — that's why YOLOv8 can't be the sole detector. Enrichment is semantically guarded: COCO "person" can only become Man/Woman/Boy/Girl/Human face, never furniture.
 
-### Two-tier tracking: VisualTracker + Detector (decided 2026-04-13)
-VitTracker (OpenCV) follows the locked object by pixel correlation — no classifier needed, very stable frame-to-frame. But it drifts when the object leaves frame. The detector + embedding pipeline handles re-acquisition. The visual tracker is cross-checked against the detector every frame; 10 consecutive unconfirmed frames triggers drift detection and handoff to re-acquisition.
+### Two-tier tracking: VisualTracker + Detector (decided 2026-04-13, revised 2026-04-24)
+VitTracker (OpenCV) follows the locked object by pixel correlation — no classifier needed, very stable frame-to-frame. But it drifts when the object leaves frame. The detector + embedding pipeline handles re-acquisition.
+
+**Drift detection uses two parallel signals:**
+1. **Template self-verification (primary)**: every 5 frames during VT tracking, embed the current VT crop (raw crop fallback, ~8ms) and compare to the lock gallery via `bestGallerySimilarity()`. 3 consecutive similarities below 0.4 (~0.5s) triggers drift. Detector-independent — catches drift even when the detector can't see the target (small objects, uniform surfaces, label flicker).
+2. **Detector cross-check (secondary)**: if the detector doesn't confirm the VT position for 10 consecutive frames, also triggers drift. Kept as a safety net for cases where the template somehow keeps matching but the object has moved.
+
+### Template self-verification rationale (decided 2026-04-24)
+The old approach (detector cross-check only) had a structural flaw: "detector found something elsewhere in the frame but not at VT position" was counted as drift evidence, even when the detector simply missed our object (common for small/uniform objects like a yellow bowl). This caused false drift kills on correctly-tracking VT. Research (TLD PAMI 2012, Stark ICCV 2021, DaSiamRPN ECCV 2018) consistently treats the tracker's own self-assessment as the primary drift signal, with the detector as a peer rather than a judge. Template self-verification directly measures "does this crop still look like the locked object" — the right question.
 
 ### COCO label stored alongside enriched label (decided 2026-04-17)
 `lockedCocoLabel` is stored at lock time alongside the enriched label. Label matching accepts either: a candidate labeled "potted plant" (COCO) matches a lock of "flowerpot" (OIV7) because the COCO parent is "potted plant". Without this, enrichment-timing mismatches cause the correct object to get the -0.5 label penalty.
@@ -360,11 +372,12 @@ When VitTracker is confident (>0.6) and has 5+ confirmed frames with 0 unconfirm
 | Tag | What it logs |
 |---|---|
 | `Reacq` | LOCK, LOST, SEARCH (with candidate scores + similarity), REACQUIRE (with hop count + sim), TIMEOUT, CLEAR, GIVE_UP, OVERRIDE (when embedding bypasses geometric filters) |
-| `VisualTracker` | INIT (tracker started), LOST (confidence dropped), DRIFT (unconfirmed frames exceeded threshold) |
+| `VisualTracker` | INIT (tracker started), LOST (confidence dropped), DRIFT (template mismatch OR unconfirmed frames exceeded), Template mismatch (per-check log when sim below threshold) |
 | `FTFTracker` | NEW (fresh ID assigned), MATCH (IoU match to previous frame) |
 | `Yolov8Det` | Enriched label results, no-enrichment cases |
 | `ScenarioRec` | Recording started/stopped, frame count |
-| `AppearEmbed` | Embedding failures |
+| `AppearEmbed` | Embedding failures, gallery additions |
+| `EmbedSync` | Synchronous embedding fallback fired for a candidate that missed the async cache |
 | `TFLiteGPU` | GPU delegate activation or CPU fallback per model |
 | `DebugCapture` | Saved debug frame filenames |
 
@@ -485,9 +498,13 @@ All in constructor defaults — no settings UI yet:
 | `MAX_GALLERY_SIZE` | ReacquisitionEngine | 12 | Maximum embeddings in the reference gallery |
 | `ENRICH_IOU_THRESHOLD` | Yolov8Detector | 0.3 | Min IoU to match YOLOv8 detection to EfficientDet box |
 | `minConfidence` | DetectionFilter | 0.5 | Minimum ML confidence to show detection |
+| `maxBoxArea` | DetectionFilter | 0.5 | Reject phantom full-screen detections (applied before scoring) |
 | `minIou` | FrameToFrameTracker | 0.2 | Minimum IoU to match across frames |
 | `MIN_CONFIDENCE` | VisualTracker | 0.5 | VitTracker confidence floor |
-| `VT_MAX_UNCONFIRMED` | ObjectTracker | 10 | Frames without detector confirmation → drift |
+| `VT_MAX_UNCONFIRMED` | ObjectTracker | 10 | Frames without detector confirmation → drift (secondary signal) |
+| `TEMPLATE_CHECK_INTERVAL` | ObjectTracker | 5 | Embed VT crop every N frames for self-verification |
+| `TEMPLATE_SIM_THRESHOLD` | ObjectTracker | 0.4 | Similarity below this = drift suspicion |
+| `TEMPLATE_MISMATCH_MAX` | ObjectTracker | 3 | Consecutive low-sim checks → drift (primary signal) |
 | `targetFrameOccupancy` | ZoomController | 0.15 | Target subject size as fraction of frame |
 | `zoomSpeed` | ZoomController | 0.05 | Zoom change per frame |
 | `scoreThreshold` | ObjectTracker (MediaPipe) | 0.5 | MediaPipe detector confidence cutoff |
