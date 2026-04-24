@@ -6,9 +6,11 @@ import android.opengl.EGL14
 import android.opengl.EGLConfig
 import android.opengl.EGLContext
 import android.opengl.EGLDisplay
+import android.opengl.EGLExt
 import android.opengl.EGLSurface
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
+import android.opengl.GLES30
 import android.util.Log
 import android.util.Size
 import android.view.Surface
@@ -104,7 +106,8 @@ class SurfaceTextureFrameReader(
                 resultSurface = Surface(surfaceTexture)
                 surfaceLatch.countDown()
 
-                readBuffer = ByteBuffer.allocateDirect(outputWidth * outputHeight * 4)
+                val bufferBytes = outputWidth * outputHeight * 4
+                readBuffer = ByteBuffer.allocateDirect(bufferBytes)
                     .order(ByteOrder.nativeOrder())
 
                 // Create an FBO for offscreen rendering at output resolution
@@ -120,6 +123,21 @@ class SurfaceTextureFrameReader(
                 GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fbo[0])
                 GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0,
                     GLES20.GL_TEXTURE_2D, renderTex[0], 0)
+
+                // Two PBOs for ping-pong async readback. Each frame starts a readback
+                // into one PBO and maps the other (which the GPU already finished writing
+                // at least one frame ago, so the map is zero-wait on the CPU side).
+                // Tradeoff: adds exactly 1 frame of latency to the consumer path.
+                val pbos = IntArray(2)
+                GLES30.glGenBuffers(2, pbos, 0)
+                for (pbo in pbos) {
+                    GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, pbo)
+                    GLES30.glBufferData(GLES30.GL_PIXEL_PACK_BUFFER, bufferBytes, null, GLES30.GL_STREAM_READ)
+                }
+                GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0)
+                var pboWrite = 0  // PBO we kick the current-frame readback into
+                var pboRead = 1   // PBO whose previous-frame data we map for the CPU
+                var haveLastFrame = false  // first iteration has nothing in pboRead yet
 
                 val program = createShaderProgram()
 
@@ -152,39 +170,64 @@ class SurfaceTextureFrameReader(
 
                         drawQuad(program)
 
-                        readBuffer.rewind()
+                        // Kick off an async readback into the WRITE pbo. Returns immediately;
+                        // the actual GPU→CPU transfer overlaps with this thread's next work
+                        // (and with the camera producing the next frame).
                         val readStart = System.nanoTime()
-                        GLES20.glReadPixels(0, 0, outputWidth, outputHeight,
-                            GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, readBuffer)
+                        GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, pbos[pboWrite])
+                        GLES30.glReadPixels(0, 0, outputWidth, outputHeight,
+                            GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, 0)
                         readPxNs += System.nanoTime() - readStart
 
-                        // Fill processing bitmap from the readback buffer.
-                        val copyStart = System.nanoTime()
-                        readBuffer.rewind()
-                        val procBitmap = processingPool.acquire()
-                        procBitmap.copyPixelsFromBuffer(readBuffer)
+                        // Map the READ pbo — its readback was issued last frame, so the
+                        // driver has had a full frame to finish it. Map blocks only when
+                        // the GPU hasn't caught up yet (rare at 30fps).
+                        if (haveLastFrame) {
+                            val copyStart = System.nanoTime()
+                            GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, pbos[pboRead])
+                            val mapped = GLES30.glMapBufferRange(
+                                GLES30.GL_PIXEL_PACK_BUFFER, 0, bufferBytes,
+                                GLES30.GL_MAP_READ_BIT
+                            ) as? ByteBuffer
+                            if (mapped != null) {
+                                mapped.order(ByteOrder.nativeOrder())
 
-                        // Fill viewfinder bitmap from the same buffer — no bitmap.copy().
-                        // Compose may still hold the previous few viewfinder bitmaps via
-                        // StateFlow + RenderThread; keep a 3-entry in-flight queue and only
-                        // recycle the oldest (≥2 frames behind current) back into the ring.
-                        if (onViewfinderFrame != null) {
-                            readBuffer.rewind()
-                            val vfBitmap = viewfinderPool.acquire()
-                            vfBitmap.copyPixelsFromBuffer(readBuffer)
-                            inflightViewfinder.addLast(vfBitmap)
-                            if (inflightViewfinder.size > POOL_SIZE) {
-                                viewfinderPool.release(inflightViewfinder.removeFirst())
+                                // Fill processing bitmap from the mapped PBO.
+                                mapped.rewind()
+                                val procBitmap = processingPool.acquire()
+                                procBitmap.copyPixelsFromBuffer(mapped)
+
+                                // Fill viewfinder bitmap from the same buffer — no bitmap.copy().
+                                // Compose may still hold the previous few viewfinder bitmaps via
+                                // StateFlow + RenderThread; keep a 3-entry in-flight queue and
+                                // recycle the oldest back into the ring once it's ≥2 frames old.
+                                if (onViewfinderFrame != null) {
+                                    mapped.rewind()
+                                    val vfBitmap = viewfinderPool.acquire()
+                                    vfBitmap.copyPixelsFromBuffer(mapped)
+                                    inflightViewfinder.addLast(vfBitmap)
+                                    if (inflightViewfinder.size > POOL_SIZE) {
+                                        viewfinderPool.release(inflightViewfinder.removeFirst())
+                                    }
+                                    onViewfinderFrame.invoke(vfBitmap)
+                                }
+
+                                GLES30.glUnmapBuffer(GLES30.GL_PIXEL_PACK_BUFFER)
+                                copyNs += System.nanoTime() - copyStart
+
+                                // Hand the processing bitmap off; return any unprocessed
+                                // previous frame to the pool so the ring stays in budget.
+                                val old = latestFrame.getAndSet(procBitmap)
+                                if (old != null) processingPool.release(old)
+                            } else {
+                                Log.w(TAG, "glMapBufferRange returned null — skipping frame")
                             }
-                            onViewfinderFrame.invoke(vfBitmap)
                         }
-                        copyNs += System.nanoTime() - copyStart
+                        GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0)
 
-                        // Store latest frame for processing — return any unprocessed previous
-                        // frame to the pool so the ring stays within budget.
-                        // No manual flip needed — transform matrix handles orientation.
-                        val old = latestFrame.getAndSet(procBitmap)
-                        if (old != null) processingPool.release(old)
+                        // Ping-pong for next iteration.
+                        val tmp = pboWrite; pboWrite = pboRead; pboRead = tmp
+                        haveLastFrame = true
 
                         totalNs += System.nanoTime() - frameStart
                         glFrameCount++
@@ -203,6 +246,7 @@ class SurfaceTextureFrameReader(
                 Log.i(TAG, "GL thread produced $glFrameCount frames")
 
                 // Cleanup
+                GLES30.glDeleteBuffers(2, pbos, 0)
                 GLES20.glDeleteFramebuffers(1, fbo, 0)
                 GLES20.glDeleteTextures(1, renderTex, 0)
                 GLES20.glDeleteTextures(1, intArrayOf(textureId), 0)
@@ -311,8 +355,10 @@ class SurfaceTextureFrameReader(
         val version = IntArray(2)
         EGL14.eglInitialize(eglDisplay, version, 0, version, 1)
 
+        // GLES 3.0 is required for PBO async readback (glMapBufferRange + GL_PIXEL_PACK_BUFFER).
+        // Guaranteed available from Android 4.3 / API 18; we target minSdk=29 so no fallback needed.
         val configAttribs = intArrayOf(
-            EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+            EGL14.EGL_RENDERABLE_TYPE, EGLExt.EGL_OPENGL_ES3_BIT_KHR,
             EGL14.EGL_SURFACE_TYPE, EGL14.EGL_PBUFFER_BIT,
             EGL14.EGL_RED_SIZE, 8,
             EGL14.EGL_GREEN_SIZE, 8,
@@ -325,7 +371,7 @@ class SurfaceTextureFrameReader(
         EGL14.eglChooseConfig(eglDisplay, configAttribs, 0, configs, 0, 1, numConfigs, 0)
         check(numConfigs[0] > 0) { "No EGL config found" }
 
-        val contextAttribs = intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE)
+        val contextAttribs = intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 3, EGL14.EGL_NONE)
         eglContext = EGL14.eglCreateContext(eglDisplay, configs[0]!!, EGL14.EGL_NO_CONTEXT, contextAttribs, 0)
 
         val pbufferAttribs = intArrayOf(
