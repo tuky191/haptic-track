@@ -251,6 +251,11 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                 modifier = Modifier
                     .fillMaxSize()
                     .pointerInteropFilter { event ->
+                        // In stealth mode, swallow all touches — the volume-up key is
+                        // the only way in/out. Prevents accidental taps from locking or
+                        // exiting stealth.
+                        if (uiState.stealthMode) return@pointerInteropFilter true
+
                         scaleDetector.onTouchEvent(event)
 
                         if (scaleDetector.isInProgress) {
@@ -318,8 +323,8 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
             }
 
             // In stealth mode, show nothing — completely black screen.
-            // Volume-down is the only control (lock → record → stop+clear).
-            // Tap anywhere to exit stealth.
+            // Volume-up toggles stealth. Volume-down runs the lock → record →
+            // stop+clear cycle. Touches are swallowed by the preview handler.
             if (!uiState.stealthMode) {
                 // Bounding box / contour overlay
                 TrackingOverlay(
@@ -406,34 +411,7 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                     }
                 }
 
-                // Stealth mode toggle
-                Button(
-                    onClick = { viewModel.toggleStealthMode() },
-                    modifier = Modifier
-                        .align(Alignment.TopStart)
-                        .padding(top = if (uiState.status != TrackingStatus.IDLE) 64.dp else 112.dp, start = 16.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = Color.Black.copy(alpha = 0.5f))
-                ) {
-                    Text("STEALTH", color = Color.White, fontSize = 12.sp)
-                }
-            } else {
-                // Stealth mode: tap anywhere to exit
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .pointerInput(Unit) {
-                            awaitPointerEventScope {
-                                while (true) {
-                                    val event = awaitPointerEvent()
-                                    if (event.changes.any { it.pressed }) {
-                                        event.changes.forEach { it.consume() }
-                                        viewModel.toggleStealthMode()
-                                        break
-                                    }
-                                }
-                            }
-                        }
-                )
+                // Stealth mode is toggled by volume-up (see MainActivity) — no button.
             }
         }
     } else {
