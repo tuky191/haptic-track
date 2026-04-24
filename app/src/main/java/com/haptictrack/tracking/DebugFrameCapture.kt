@@ -10,6 +10,10 @@ import java.io.PrintWriter
 import java.time.LocalDateTime
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
+import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 
 /**
  * Saves camera frames with bounding box overlays on tracking events.
@@ -47,6 +51,23 @@ class DebugFrameCapture(context: Context) {
     var sessionDir: File? = null
         private set
     private var sessionLog: PrintWriter? = null
+
+    /**
+     * Single-thread executor that does the heavy work (bitmap copy, Canvas drawing,
+     * PNG compression, file I/O) off the tracking pipeline's processing thread.
+     *
+     * Bounded backlog: if the tracker produces events faster than we can encode
+     * (rare, but possible during frame-by-frame LOST cycles), drop the oldest
+     * pending capture — a missed diagnostic frame is acceptable, pipeline lag is not.
+     * Per-event cost on the processing thread is now just ~4ms (one bitmap.copy) +
+     * an executor submit, instead of ~50-100ms synchronous.
+     */
+    private val captureQueue = LinkedBlockingQueue<Runnable>(8)
+    private val captureExecutor = ThreadPoolExecutor(
+        1, 1, 0L, TimeUnit.MILLISECONDS, captureQueue,
+        { r -> Thread(r, "DebugCapture-IO").apply { priority = Thread.MIN_PRIORITY } },
+        ThreadPoolExecutor.DiscardOldestPolicy()
+    )
 
     // Paint objects (pre-allocated)
     private val lockedPaint = Paint().apply {
@@ -123,6 +144,12 @@ class DebugFrameCapture(context: Context) {
 
     /**
      * Capture a frame on a tracking event.
+     *
+     * Called on the tracking pipeline's processing thread. Snapshots the bitmap
+     * (one ~4ms copy) and submits the rest — Canvas drawing + two PNG encodes +
+     * file I/O — to [captureExecutor]. The original bitmap reference is not held
+     * after this function returns, so the caller can reuse it (pool semantics).
+     *
      * Saves both a raw (unannotated) frame and an annotated frame with bounding boxes.
      */
     fun capture(
@@ -135,8 +162,32 @@ class DebugFrameCapture(context: Context) {
     ) {
         val dir = sessionDir ?: baseDir ?: return
 
+        // Snapshot now so the processing thread can hand ownership of the input
+        // bitmap back to the frame reader's pool immediately.
+        val snapshot = bitmap.copy(Bitmap.Config.ARGB_8888, false) ?: return
         val timestamp = LocalTime.now().format(frameTimeFormat)
+        val detectionsCopy = detections.toList()
 
+        captureExecutor.execute {
+            try {
+                writeCapture(dir, event, timestamp, snapshot, detectionsCopy,
+                    lockedObject, lastKnownBox, extraInfo)
+            } finally {
+                snapshot.recycle()
+            }
+        }
+    }
+
+    private fun writeCapture(
+        dir: File,
+        event: DebugEvent,
+        timestamp: String,
+        bitmap: Bitmap,
+        detections: List<TrackedObject>,
+        lockedObject: TrackedObject?,
+        lastKnownBox: RectF?,
+        extraInfo: String?
+    ) {
         // Save raw frame first (before any annotations)
         val rawFilename = "${timestamp}_${event}_raw.png"
         try {
@@ -182,6 +233,13 @@ class DebugFrameCapture(context: Context) {
         } finally {
             annotated.recycle()
         }
+    }
+
+    /** Shut down the background executor; call from ObjectTracker.shutdown(). */
+    fun shutdown() {
+        captureExecutor.shutdown()
+        captureExecutor.awaitTermination(2, TimeUnit.SECONDS)
+        endSession()
     }
 
     private fun toPixelRect(normalized: RectF, w: Float, h: Float): RectF {

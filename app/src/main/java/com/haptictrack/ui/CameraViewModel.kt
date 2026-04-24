@@ -116,10 +116,18 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             }
 
             objectTracker = tracker
+            // Wire the pool-release callback so the tracker can return the previous
+            // lastFrameBitmap (and any un-retained frame) back to the pool.
+            tracker.bitmapRecycler = { bmp -> cameraManager.releaseAnalysisBitmap(bmp) }
             // Analysis frames always come from SurfaceTexture — no ImageAnalysis needed.
+            // The tracker retains each input as lastFrameBitmap and calls bitmapRecycler
+            // on the previous frame, so the caller must not release here.
             cameraManager.onAnalysisFrame = { bitmap ->
                 if (isTrackerReady) {
                     tracker.processBitmap(bitmap)
+                } else {
+                    // Before models load we'd leak the bitmap — hand it straight back.
+                    cameraManager.releaseAnalysisBitmap(bitmap)
                 }
             }
             cameraManager.onViewfinderFrame = { bitmap ->

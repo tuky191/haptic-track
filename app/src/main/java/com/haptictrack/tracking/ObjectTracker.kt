@@ -23,7 +23,6 @@ class ObjectTracker(
 ) {
 
     private val detector: ObjectDetector
-    private val labelEnricher: Yolov8Detector
     private val appearanceEmbedder: AppearanceEmbedder
     private val personClassifier: PersonAttributeClassifier
     private val faceEmbedder: FaceEmbedder
@@ -33,6 +32,14 @@ class ObjectTracker(
     // Keep last frame for computing embedding when user taps to lock
     private val lastFrameLock = Any()
     private var lastFrameBitmap: Bitmap? = null
+
+    /**
+     * Called to hand a no-longer-needed bitmap back to the frame reader's pool.
+     * When null (tests), we skip pool return — the test owns bitmap lifetime
+     * and recycles its own copies. In production, CameraViewModel wires this
+     * to `CameraManager.releaseAnalysisBitmap`.
+     */
+    var bitmapRecycler: ((Bitmap) -> Unit)? = null
     /** Device rotation when lastFrameBitmap was captured — needed to map screen-space
      *  detection boxes back to rotated-image space for embedding. */
     private var lastFrameDeviceRotation: Int = 0
@@ -131,9 +138,6 @@ class ObjectTracker(
 
         detector = ObjectDetector.createFromOptions(context, options)
 
-        onLoadingStatus?.invoke("Loading YOLOv8 (GPU)...")
-        labelEnricher = Yolov8Detector(context)
-
         onLoadingStatus?.invoke("Loading face models (GPU)...")
         faceEmbedder = FaceEmbedder(context, personClassifier.faceDetector)
         personReId = PersonReIdEmbedder(context)
@@ -157,9 +161,6 @@ class ObjectTracker(
                 return
             }
 
-            // Enrich coarse COCO label with finer OIV7 label (one-shot, ~270ms)
-            val enrichedLabel = labelEnricher.enrichLabel(bmp, boundingBox, label) ?: label
-
             val augResult = appearanceEmbedder.embedWithAugmentations(bmp, boundingBox)
             // Compute color histogram on the masked crop (single segmentation pass)
             val colorHist = if (augResult.maskedCrop != null) {
@@ -172,18 +173,18 @@ class ObjectTracker(
             val isPerson = label == "person"
             val reIdEmb = if (isPerson) personReId.embed(bmp, boundingBox) else null
             val faceEmb = if (isPerson) faceEmbedder.embedFace(bmp, boundingBox) else null
-            reacquisition.lock(trackingId, boundingBox, enrichedLabel, augResult.embeddings, colorHist, personAttrs,
+            reacquisition.lock(trackingId, boundingBox, label, augResult.embeddings, colorHist, personAttrs,
                 cocoLabel = label, reIdEmbedding = reIdEmb, faceEmbedding = faceEmb)
             visualTracker.init(bmp, boundingBox)
             vtLockedBoxArea = boundingBox.width() * boundingBox.height()
 
-            debugCapture.startSession(enrichedLabel, trackingId)
+            debugCapture.startSession(label, trackingId)
             val attrStr = personAttrs?.summary() ?: "n/a"
-            debugCapture.log("LOCK id=$trackingId label=$enrichedLabel (coco=$label) box=${boundingBox} gallery=${augResult.embeddings.size} colorHist=${colorHist != null} attrs=\"$attrStr\"")
+            debugCapture.log("LOCK id=$trackingId label=$label box=${boundingBox} gallery=${augResult.embeddings.size} colorHist=${colorHist != null} attrs=\"$attrStr\"")
 
             // Start scenario recording for replay testing
             debugCapture.sessionDir?.let { dir ->
-                scenarioRecorder.start(dir, trackingId, enrichedLabel, label,
+                scenarioRecorder.start(dir, trackingId, label, label,
                     boundingBox, augResult.embeddings, colorHist, personAttrs)
             }
 
@@ -199,7 +200,7 @@ class ObjectTracker(
                 if (negEmb != null) reacquisition.addSceneNegative(negEmb)
             }
 
-            val locked = TrackedObject(trackingId, boundingBox, enrichedLabel)
+            val locked = TrackedObject(trackingId, boundingBox, label)
             debugCapture.capture(DebugEvent.LOCK, bmp, listOf(locked), lockedObject = locked,
                 extraInfo = "id=$trackingId label=$label gallery=${augResult.embeddings.size}")
         }
@@ -239,6 +240,16 @@ class ObjectTracker(
         val frameWidth = bitmap.width
         val frameHeight = bitmap.height
 
+        // Bitmap ownership: we retain `bitmap` as lastFrameBitmap at the end of
+        // processing, swapping out the previous lastFrameBitmap which then goes
+        // back to the pool. Previously we did bitmap.copy() (~4ms) every frame
+        // just to keep a reference for lockOnObject and debug capture — that was
+        // wasteful since the input is already a stable snapshot for this frame.
+        //
+        // `releaseOnExit` tracks which bitmap to return to the pool in `finally`:
+        //   - initially the input (so exceptions still release it)
+        //   - after retention, the old lastFrameBitmap (release instead of input)
+        var releaseOnExit: Bitmap? = bitmap
         try {
             // --- Visual tracker: primary frame-to-frame tracking ---
             // When active, it tracks the locked object by pixel correlation.
@@ -425,9 +436,10 @@ class ObjectTracker(
                         onDetectionResult?.invoke(displayObjects, lockedObj, frameWidth, frameHeight, cachedContour)
 
                         synchronized(lastFrameLock) {
-                            lastFrameBitmap?.recycle()
-                            lastFrameBitmap = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
+                            val previous = lastFrameBitmap
+                            lastFrameBitmap = bitmap
                             lastFrameDeviceRotation = deviceRotation
+                            releaseOnExit = previous  // release old, retain new
                         }
                         return
                     }
@@ -596,12 +608,14 @@ class ObjectTracker(
                 templateMismatchCount = 0
             }
 
-            // Save lastFrameBitmap before debug capture to avoid a third bitmap copy.
-            // Debug capture draws annotations directly onto a mutable copy of this frame.
+            // Retain the frame for debug capture and future lockOnObject calls.
+            // Debug capture draws annotations onto its own mutable copy of this bitmap,
+            // so concurrent access is safe.
             synchronized(lastFrameLock) {
-                lastFrameBitmap?.recycle()
-                lastFrameBitmap = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
+                val previous = lastFrameBitmap
+                lastFrameBitmap = bitmap
                 lastFrameDeviceRotation = deviceRotation
+                releaseOnExit = previous  // release old, retain new
             }
 
             // Debug frame capture on tracking events.
@@ -636,9 +650,16 @@ class ObjectTracker(
             lastDetections = displayObjects
             onDetectionResult?.invoke(displayObjects, lockedObject, frameWidth, frameHeight, cachedContour)
         } finally {
-            bitmap.recycle()
+            releaseOnExit?.let { bitmapRecycler?.invoke(it) ?: it.recycle() }
         }
     }
+
+    /**
+     * Reusable buffer for the physical-upright rotation in [runDetector].
+     * Allocated once per (width,height) combination and drawn into each frame —
+     * previously we allocated a fresh bitmap every non-portrait frame (~5-10ms).
+     */
+    private var uprightBuffer: Bitmap? = null
 
     private fun runDetector(bitmap: Bitmap): List<TrackedObject> {
         // EfficientDet fails on rotated scenes — pre-rotate the bitmap to
@@ -646,7 +667,7 @@ class ObjectTracker(
         // The rest of the pipeline operates in display-image coords; we remap
         // detector output back to display-image (screen) space via unmapRotation.
         val actualRot = deviceRotationProvider?.invoke() ?: 0
-        val upright = if (actualRot == 0) bitmap else rotateBitmap(bitmap, (-actualRot).toFloat())
+        val upright = if (actualRot == 0) bitmap else rotateIntoBuffer(bitmap, -actualRot)
         val uprightW = upright.width
         val uprightH = upright.height
         val mpImage = BitmapImageBuilder(upright).build()
@@ -669,13 +690,42 @@ class ObjectTracker(
             )
         }
 
-        if (upright !== bitmap) upright.recycle()
+        // No recycle here — uprightBuffer is reused across frames.
         return detections
     }
 
-    private fun rotateBitmap(bitmap: Bitmap, degrees: Float): Bitmap {
-        val matrix = android.graphics.Matrix().apply { postRotate(degrees) }
-        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+    /**
+     * Rotate [src] by [rotDegrees] into a pooled buffer bitmap, reallocating only
+     * when the target dimensions change (i.e. rotation flipped between 90/270 and
+     * 0/180, or the input resolution changed).
+     *
+     * [rotDegrees] is in {90, 180, 270, -90, -180, -270}; we normalize to 0..359.
+     */
+    private fun rotateIntoBuffer(src: Bitmap, rotDegrees: Int): Bitmap {
+        val rot = ((rotDegrees % 360) + 360) % 360
+        val targetW = if (rot == 90 || rot == 270) src.height else src.width
+        val targetH = if (rot == 90 || rot == 270) src.width else src.height
+
+        var buffer = uprightBuffer
+        if (buffer == null || buffer.isRecycled ||
+            buffer.width != targetW || buffer.height != targetH) {
+            buffer?.recycle()
+            buffer = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
+            uprightBuffer = buffer
+        }
+
+        val canvas = android.graphics.Canvas(buffer)
+        canvas.drawColor(android.graphics.Color.BLACK, android.graphics.PorterDuff.Mode.SRC)
+        val matrix = android.graphics.Matrix().apply {
+            postRotate(rot.toFloat(), src.width / 2f, src.height / 2f)
+            // After rotation around the source center, translate so the rotated
+            // image's top-left aligns with the buffer's top-left.
+            val dx = (targetW - src.width) / 2f
+            val dy = (targetH - src.height) / 2f
+            postTranslate(dx, dy)
+        }
+        canvas.drawBitmap(src, matrix, null)
+        return buffer
     }
 
     private fun captureDebugFrame(
@@ -778,10 +828,9 @@ class ObjectTracker(
 
     fun shutdown() {
         scenarioRecorder.stop()
-        debugCapture.endSession()
+        debugCapture.shutdown()
         embeddingExecutor.shutdownNow()
         detector.close()
-        labelEnricher.close()
         faceEmbedder.close()
         personReId.close()
         personClassifier.shutdown()
@@ -791,6 +840,8 @@ class ObjectTracker(
             lastFrameBitmap?.recycle()
             lastFrameBitmap = null
         }
+        uprightBuffer?.recycle()
+        uprightBuffer = null
     }
 }
 
