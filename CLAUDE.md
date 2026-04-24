@@ -20,7 +20,7 @@ All changes follow this flow — never commit directly to master:
 ./gradlew testDebugUnitTest      # Run unit tests (~3s, 184 tests)
 adb install -r app/build/outputs/apk/debug/app-debug.apk  # Deploy to device
 
-adb logcat -d -s "Reacq" -s "VisualTracker" -s "FTFTracker" -s "Yolov8Det"  # Pull tracking logs
+adb logcat -d -s "Reacq" -s "VisualTracker" -s "FTFTracker"  # Pull tracking logs
 adb logcat -c                                                                 # Clear logcat
 adb pull /sdcard/Android/data/com.haptictrack/files/debug_frames/             # Pull debug overlays + scenario.json
 adb shell rm -f /sdcard/Android/data/com.haptictrack/files/debug_frames/*.png # Clear debug frames
@@ -41,7 +41,6 @@ app/src/main/java/com/haptictrack/
 ├── tracking/                                 # ← most of the complexity lives here
 │   ├── ObjectTracker.kt                     # Orchestrator: wires detector, VT, embedder, reacq
 │   ├── ReacquisitionEngine.kt               # Scoring logic (6 weighted signals + overrides)
-│   ├── Yolov8Detector.kt                    # YOLOv8n-oiv7 label enricher (TFLite)
 │   ├── AppearanceEmbedder.kt                # MobileNetV3 embedding + gallery augmentation
 │   ├── PersonAttributeClassifier.kt         # Crossroad-0230 + BlazeFace + age-gender
 │   ├── VisualTracker.kt                     # OpenCV VitTracker wrapper
@@ -66,7 +65,7 @@ app/src/test/resources/scenarios/            # Captured scenario JSON files for 
 
 ## Architecture
 
-MVVM with a single-activity Compose UI. Two-tier tracking: visual tracker for frame-to-frame, two-stage detection (EfficientDet-Lite2 + YOLOv8n-oiv7) for re-acquisition.
+MVVM with a single-activity Compose UI. Two-tier tracking: visual tracker for frame-to-frame, EfficientDet-Lite2 detection for re-acquisition.
 
 ```
 CameraViewModel
@@ -75,7 +74,6 @@ CameraViewModel
 ├── ObjectTracker              (orchestrates the tracking pipeline below)
 │   ├── VisualTracker          (OpenCV VitTracker: primary frame-to-frame pixel tracking)
 │   ├── MediaPipe Detector     (EfficientDet-Lite2: object detection, 80 COCO classes, every frame)
-│   ├── Yolov8Detector         (YOLOv8n-oiv7: label enrichment, 601 OIV7 classes, on-demand)
 │   ├── FrameToFrameTracker    (IoU-based ID assignment for detections)
 │   ├── AppearanceEmbedder     (MobileNetV3: visual identity fingerprint)
 │   ├── PersonAttributeClassifier (Crossroad-0230 + BlazeFace + age-gender: person attributes)
@@ -99,20 +97,12 @@ CameraViewModel
 
 **Re-acquisition (object lost):**
 1. Detector runs, `FrameToFrameTracker` assigns stable IDs via IoU matching
-2. `Yolov8Detector` enriches COCO labels with OIV7 labels (every 10th search frame)
-3. `AppearanceEmbedder` computes visual fingerprints for all candidates (async pipeline; synchronous fallback for the closest same-category candidate when the async cache can't bridge across frames during rotation)
-4. `DetectionFilter` runs before scoring to strip truly full-frame detections (area > 0.85) — tentative confirmation handles flickering phantoms structurally
-5. `ReacquisitionEngine` scores candidates: position (decays over time) + size + label (20% scoring factor, -0.5 penalty for mismatch) + appearance similarity + color histogram + person attributes
-6. Strong embedding match (>0.7 cosine similarity) overrides position/size hard thresholds
-7. Best candidate above `minScoreThreshold` becomes the new lock; visual tracker re-initializes
-8. `ScenarioRecorder` captures every frame's detections and events as JSON for replay testing
-
-**Two-stage detection:**
-- EfficientDet-Lite2 (COCO 80) runs every frame for reliable bounding boxes
-- YOLOv8n-oiv7 (OIV7 601) runs on-demand for label enrichment:
-  - Once at lock time (~270ms, one-shot)
-  - Every 10th search frame during re-acquisition
-  - Semantically guarded: COCO "person" can only become Man/Woman/Boy/Girl/Human face
+2. `AppearanceEmbedder` computes visual fingerprints for all candidates (async pipeline; synchronous fallback for the closest same-category candidate when the async cache can't bridge across frames during rotation)
+3. `DetectionFilter` runs before scoring to strip truly full-frame detections (area > 0.85) — tentative confirmation handles flickering phantoms structurally
+4. `ReacquisitionEngine` gates candidates on person/not-person binary category, then ranks on embedding similarity + color histogram + position + size + person attributes
+5. Strong embedding match (>0.7 cosine similarity) overrides position/size hard thresholds
+6. Best candidate above `minScoreThreshold` becomes the new lock; visual tracker re-initializes
+7. `ScenarioRecorder` captures every frame's detections and events as JSON for replay testing
 
 **Recording (4K mode):**
 1. Recording toggles VideoCapture on/off — no rebind or mode switching needed
@@ -297,8 +287,8 @@ Position (50%, decays) + size (25%) + base bonus (25%). All survivors already pa
 
 ## Key Design Decisions
 
-### Two-stage detection: EfficientDet-Lite2 + YOLOv8n-oiv7 (decided 2026-04-17)
-EfficientDet-Lite2 runs every frame for reliable bounding boxes (person at 0.80-0.88 confidence). YOLOv8n-oiv7 runs on-demand to upgrade coarse COCO labels to finer OIV7 labels (601 classes). OIV7 splits "person" across sub-classes (Boy, Girl, Man, Woman) so no single class gets high confidence indoors — that's why YOLOv8 can't be the sole detector. Enrichment is semantically guarded: COCO "person" can only become Man/Woman/Boy/Girl/Human face, never furniture.
+### Single-stage detection: EfficientDet-Lite2 (decided 2026-04-17, simplified 2026-04-24)
+EfficientDet-Lite2 (COCO 80) runs every frame for reliable bounding boxes. YOLOv8n-oiv7 label enrichment was removed once the re-acquisition gate became binary person/not-person — the finer OIV7 label no longer influenced any gate or score, only the UI display text. Removing saved ~270ms at lock time, ~1-2s at app startup, 6.8MB APK size, and one GPU interpreter. `PersonAttributeClassifier` handles person-specific attributes (gender, clothing, age) where OIV7 labels would have been too coarse anyway.
 
 ### Two-tier tracking: VisualTracker + Detector (decided 2026-04-13, revised 2026-04-24)
 VitTracker (OpenCV) follows the locked object by pixel correlation — no classifier needed, very stable frame-to-frame. But it drifts when the object leaves frame. The detector + embedding pipeline handles re-acquisition.
@@ -309,10 +299,6 @@ VitTracker (OpenCV) follows the locked object by pixel correlation — no classi
 
 ### Template self-verification rationale (decided 2026-04-24)
 The old approach (detector cross-check only) had a structural flaw: "detector found something elsewhere in the frame but not at VT position" was counted as drift evidence, even when the detector simply missed our object (common for small/uniform objects like a yellow bowl). This caused false drift kills on correctly-tracking VT. Research (TLD PAMI 2012, Stark ICCV 2021, DaSiamRPN ECCV 2018) consistently treats the tracker's own self-assessment as the primary drift signal, with the detector as a peer rather than a judge. Template self-verification directly measures "does this crop still look like the locked object" — the right question.
-
-### COCO label stored alongside enriched label (decided 2026-04-17)
-`lockedCocoLabel` is stored at lock time alongside the enriched label. Label matching accepts either: a candidate labeled "potted plant" (COCO) matches a lock of "flowerpot" (OIV7) because the COCO parent is "potted plant". Without this, enrichment-timing mismatches cause the correct object to get the -0.5 label penalty.
-
 
 ### Cascade scoring: label as gate, not weight (decided 2026-04-17)
 Replaced the 6-signal weighted average with DeepSORT-style cascade gates. Wrong-label candidates are hard-rejected at the label gate (no amount of color/position can rescue them). Only a strong embedding (>0.7) overrides the label gate, handling genuine label flicker. Survivors are ranked with embedding as the primary signal (50%+), not a balanced weight across all signals. This eliminates the chair→person cross-category leakage that plagued the weighted average.
@@ -374,14 +360,13 @@ When VitTracker is confident (>0.6) and has 5+ confirmed frames with 0 unconfirm
 | `Reacq` | LOCK, LOST, SEARCH (with candidate scores + similarity), REACQUIRE (with hop count + sim), TIMEOUT, CLEAR, GIVE_UP, OVERRIDE (when embedding bypasses geometric filters) |
 | `VisualTracker` | INIT (tracker started), LOST (confidence dropped), DRIFT (template mismatch OR unconfirmed frames exceeded), Template mismatch (per-check log when sim below threshold) |
 | `FTFTracker` | NEW (fresh ID assigned), MATCH (IoU match to previous frame) |
-| `Yolov8Det` | Enriched label results, no-enrichment cases |
 | `ScenarioRec` | Recording started/stopped, frame count |
 | `AppearEmbed` | Embedding failures, gallery additions |
 | `EmbedSync` | Synchronous embedding fallback fired for a candidate that missed the async cache |
 | `TFLiteGPU` | GPU delegate activation or CPU fallback per model |
 | `DebugCapture` | Saved debug frame filenames |
 
-Filter: `adb logcat -s "Reacq" -s "VisualTracker" -s "FTFTracker" -s "Yolov8Det"`
+Filter: `adb logcat -s "Reacq" -s "VisualTracker" -s "FTFTracker"`
 
 ### Debug frame capture
 
@@ -447,8 +432,8 @@ Top-level functions used across multiple classes — avoids duplication:
 
 | Function | Used by |
 |---|---|
-| `computeIou(a, b)` | `Yolov8Detector`, `FrameToFrameTracker` (delegates), `ObjectTracker` |
-| `loadTfliteModel(context, asset)` | `Yolov8Detector`, `PersonAttributeClassifier` |
+| `computeIou(a, b)` | `FrameToFrameTracker` (delegates), `ObjectTracker` |
+| `loadTfliteModel(context, asset)` | `PersonAttributeClassifier` |
 | `cosineSimilarity(a, b)` | `ReacquisitionEngine`, `AppearanceEmbedder` |
 | `bestGallerySimilarity(candidate, gallery)` | `ReacquisitionEngine` |
 | `computeColorHistogram(bitmap, box)` | `ObjectTracker` |
@@ -460,7 +445,6 @@ Top-level functions used across multiple classes — avoids duplication:
 | Model | File | Size | Precision | Delegate | Purpose |
 |---|---|---|---|---|---|
 | EfficientDet-Lite2 | `efficientdet-lite2-fp16.tflite` | 11.6MB | FP16 | GPU (MediaPipe) | Primary detector (80 COCO classes, every frame) |
-| YOLOv8n-oiv7 | `yolov8n_oiv7.tflite` | 6.8MB | FP32 | GPU (fallback CPU) | Label enricher (601 OIV7 classes, on-demand) |
 | MobileNetV3 Large | `mobilenet_v3_large_embedder.tflite` | 10MB | FP32 | GPU (MediaPipe) | Visual embedding (1280-dim) |
 | VitTracker | `vitTracker.onnx` | 0.7MB | FP32 | CPU (OpenCV DNN) | Visual frame-to-frame tracker |
 | magic_touch | `magic_touch.tflite` | 5.9MB | FP32 | GPU (MediaPipe) | Segmentation for masked crops |
@@ -469,8 +453,7 @@ Top-level functions used across multiple classes — avoids duplication:
 | age-gender-retail-0013 | `age_gender_retail_0013.tflite` | 4.1MB | FP32 | GPU (fallback CPU) | Face-based gender + age |
 | OSNet x1.0 | `osnet_x1_0_market.tflite` | 4.2MB | FP32 | GPU (fallback CPU) | Person re-ID embedding (512-dim) |
 | MobileFaceNet | `mobilefacenet.tflite` | 5.0MB | FP32 | GPU (fallback CPU) | Face embedding (192-dim) |
-| OIV7 labels | `oiv7_labels.txt` | 10KB | — | — | 601 class names for YOLOv8 |
-| **Total** | | **~47MB** | | |
+| **Total** | | **~40MB** | | |
 
 ## Dependencies
 
@@ -479,7 +462,7 @@ Top-level functions used across multiple classes — avoids duplication:
 | CameraX | 1.6.0 | — | Camera control + recording |
 | MediaPipe Tasks Vision | 0.10.33 | ~15MB | Object detection + image embedding |
 | OpenCV | 4.13.0 | ~10MB (arm64) | VitTracker visual tracking |
-| TensorFlow Lite | 2.17.0 | — | YOLOv8 + PersonAttributeClassifier inference |
+| TensorFlow Lite | 2.17.0 | — | PersonAttributeClassifier / face / re-ID inference |
 | TensorFlow Lite GPU | 2.17.0 | — | GPU delegate for FP32/FP16 TFLite models |
 | Jetpack Compose BOM | 2026.03.01 | — | UI framework |
 | Accompanist Permissions | 0.37.3 | — | Runtime permission handling |
@@ -496,7 +479,6 @@ All in constructor defaults — no settings UI yet:
 | `minScoreThreshold` | ReacquisitionEngine | 0.45 | Minimum score to accept a candidate |
 | `APPEARANCE_OVERRIDE_THRESHOLD` | ReacquisitionEngine | 0.7 | Embedding similarity to bypass geometric filters + smart hop threshold |
 | `MAX_GALLERY_SIZE` | ReacquisitionEngine | 12 | Maximum embeddings in the reference gallery |
-| `ENRICH_IOU_THRESHOLD` | Yolov8Detector | 0.3 | Min IoU to match YOLOv8 detection to EfficientDet box |
 | `minConfidence` | DetectionFilter | 0.5 | Minimum ML confidence to show detection |
 | `maxBoxArea` | DetectionFilter | 0.85 | Reject full-frame detections only; tentative confirmation catches flickering phantoms |
 | `minIou` | FrameToFrameTracker | 0.2 | Minimum IoU to match across frames |
@@ -516,7 +498,6 @@ All in constructor defaults — no settings UI yet:
 ### Built (functional)
 - [x] Tap-to-lock object selection (smallest-box-wins)
 - [x] Two-tier tracking: visual tracker + detector re-acquisition
-- [x] Two-stage detection: EfficientDet-Lite2 + YOLOv8n-oiv7 label enrichment
 - [x] Visual embedding for identity-aware re-acquisition
 - [x] Person identity: face embedding + body re-ID for person-vs-person discrimination
 - [x] Person attribute classification (gender, clothing, accessories, age)
@@ -553,7 +534,7 @@ All in constructor defaults — no settings UI yet:
 - Wrong-label candidates with strong embedding (>0.7) still pass the label gate — this handles genuine label flicker but could theoretically allow cross-category matches if the embedder is confused. In practice, sim>0.7 across categories is rare.
 - Visual tracker (VitTracker) dies quickly on small/transparent objects (bottles, glasses) — confidence drops below 0.25 within 2-3s, forcing unnecessary re-acquisition cycles.
 - Multiple visually similar objects of the same label (several bottles in a bathroom) are hard to distinguish — embedding similarity alone isn't enough.
-- EfficientDet-Lite2 labels flicker across frames (bowl↔potted plant↔toilet). Mitigated by soft label scoring + embedding identity + YOLOv8 enrichment.
+- EfficientDet-Lite2 labels flicker across frames (bowl↔potted plant↔toilet). Mitigated by the binary person/not-person gate + embedding identity — specific labels don't drive matching anyway.
 - Cross-angle re-acquisition weakened when the object looks very different from lock angle. Gallery augmentation + accumulated embeddings help but don't eliminate.
 - OpenCV adds ~10MB to APK (arm64).
 

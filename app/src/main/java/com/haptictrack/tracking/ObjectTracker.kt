@@ -23,7 +23,6 @@ class ObjectTracker(
 ) {
 
     private val detector: ObjectDetector
-    private val labelEnricher: Yolov8Detector
     private val appearanceEmbedder: AppearanceEmbedder
     private val personClassifier: PersonAttributeClassifier
     private val faceEmbedder: FaceEmbedder
@@ -131,9 +130,6 @@ class ObjectTracker(
 
         detector = ObjectDetector.createFromOptions(context, options)
 
-        onLoadingStatus?.invoke("Loading YOLOv8 (GPU)...")
-        labelEnricher = Yolov8Detector(context)
-
         onLoadingStatus?.invoke("Loading face models (GPU)...")
         faceEmbedder = FaceEmbedder(context, personClassifier.faceDetector)
         personReId = PersonReIdEmbedder(context)
@@ -157,9 +153,6 @@ class ObjectTracker(
                 return
             }
 
-            // Enrich coarse COCO label with finer OIV7 label (one-shot, ~270ms)
-            val enrichedLabel = labelEnricher.enrichLabel(bmp, boundingBox, label) ?: label
-
             val augResult = appearanceEmbedder.embedWithAugmentations(bmp, boundingBox)
             // Compute color histogram on the masked crop (single segmentation pass)
             val colorHist = if (augResult.maskedCrop != null) {
@@ -172,18 +165,18 @@ class ObjectTracker(
             val isPerson = label == "person"
             val reIdEmb = if (isPerson) personReId.embed(bmp, boundingBox) else null
             val faceEmb = if (isPerson) faceEmbedder.embedFace(bmp, boundingBox) else null
-            reacquisition.lock(trackingId, boundingBox, enrichedLabel, augResult.embeddings, colorHist, personAttrs,
+            reacquisition.lock(trackingId, boundingBox, label, augResult.embeddings, colorHist, personAttrs,
                 cocoLabel = label, reIdEmbedding = reIdEmb, faceEmbedding = faceEmb)
             visualTracker.init(bmp, boundingBox)
             vtLockedBoxArea = boundingBox.width() * boundingBox.height()
 
-            debugCapture.startSession(enrichedLabel, trackingId)
+            debugCapture.startSession(label, trackingId)
             val attrStr = personAttrs?.summary() ?: "n/a"
-            debugCapture.log("LOCK id=$trackingId label=$enrichedLabel (coco=$label) box=${boundingBox} gallery=${augResult.embeddings.size} colorHist=${colorHist != null} attrs=\"$attrStr\"")
+            debugCapture.log("LOCK id=$trackingId label=$label box=${boundingBox} gallery=${augResult.embeddings.size} colorHist=${colorHist != null} attrs=\"$attrStr\"")
 
             // Start scenario recording for replay testing
             debugCapture.sessionDir?.let { dir ->
-                scenarioRecorder.start(dir, trackingId, enrichedLabel, label,
+                scenarioRecorder.start(dir, trackingId, label, label,
                     boundingBox, augResult.embeddings, colorHist, personAttrs)
             }
 
@@ -199,7 +192,7 @@ class ObjectTracker(
                 if (negEmb != null) reacquisition.addSceneNegative(negEmb)
             }
 
-            val locked = TrackedObject(trackingId, boundingBox, enrichedLabel)
+            val locked = TrackedObject(trackingId, boundingBox, label)
             debugCapture.capture(DebugEvent.LOCK, bmp, listOf(locked), lockedObject = locked,
                 extraInfo = "id=$trackingId label=$label gallery=${augResult.embeddings.size}")
         }
@@ -781,7 +774,6 @@ class ObjectTracker(
         debugCapture.endSession()
         embeddingExecutor.shutdownNow()
         detector.close()
-        labelEnricher.close()
         faceEmbedder.close()
         personReId.close()
         personClassifier.shutdown()

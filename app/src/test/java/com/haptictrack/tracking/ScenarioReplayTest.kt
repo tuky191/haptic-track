@@ -199,7 +199,9 @@ class ScenarioReplayTest {
     // --- Regression baseline scenarios ---
 
     companion object {
-        /** Labels that are valid for a person-locked scenario (COCO + OIV7 variants). */
+        /** Labels valid for a person-locked scenario. Includes OIV7 variants
+         *  (boy/girl/man/woman/human face) for backwards compatibility with
+         *  scenarios captured before YOLOv8 label enrichment was removed. */
         val PERSON_LABELS = setOf("person", "boy", "girl", "man", "woman", "human face")
     }
 
