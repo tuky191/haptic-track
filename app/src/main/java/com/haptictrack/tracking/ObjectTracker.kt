@@ -56,6 +56,19 @@ class ObjectTracker(
     private val VT_ADAPTIVE_UNCONFIRMED_HIGH = 5      // ~165ms for fast subjects
     private val VT_ADAPTIVE_UNCONFIRMED_VERY_HIGH = 3  // ~100ms for very fast subjects
 
+    /**
+     * Template self-verification (issue #45, R3 from research):
+     * Every N frames during VT tracking, embed the current VT crop and compare
+     * it against the lock gallery. Low similarity means the crop no longer
+     * resembles the locked object → VT has drifted. Detector-independent,
+     * so it catches drift even when the detector can't see the target
+     * (small objects, uniform surfaces, label flicker).
+     */
+    private val TEMPLATE_CHECK_INTERVAL = 5    // embed VT crop every N frames
+    private val TEMPLATE_SIM_THRESHOLD = 0.4f  // below this = drift suspicion
+    private val TEMPLATE_MISMATCH_MAX = 3      // consecutive low-sim checks → kill (≈0.5s)
+    private var templateMismatchCount = 0
+
     /** Async embedding pipeline: compute embeddings on background thread, use results next frame. */
     private val embeddingExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "EmbeddingAsync") }
     private var pendingEmbeddings: java.util.concurrent.Future<Map<Int, EmbeddingResult>>? = null
@@ -186,6 +199,7 @@ class ObjectTracker(
         vtUnconfirmedFrames = 0
         vtConfirmedFrames = 0
         vtFrameCounter = 0
+        templateMismatchCount = 0
         velocityEstimator.reset()
         pendingEmbeddings?.cancel(true)
         pendingEmbeddings = null
@@ -306,6 +320,29 @@ class ObjectTracker(
                         }
                     }
 
+                    // --- Template self-verification (R3) ---
+                    // Primary drift signal: compare current VT crop's embedding to the
+                    // lock gallery. Detector-independent, so it catches drift on small
+                    // or uniform objects the detector struggles with. Skipped on
+                    // detector-skip frames (no bitmap cost budget).
+                    //
+                    // Effective rate is every ~5 frames normally, ~10 frames when VT
+                    // frame skipping is active (skipDetector=true on alternate frames).
+                    if (!skipDetector &&
+                        reacquisition.hasEmbeddings &&
+                        vtFrameCounter % TEMPLATE_CHECK_INTERVAL == 0) {
+                        val curEmb = appearanceEmbedder.embedWithFallback(bitmap, rawBox)
+                        if (curEmb != null) {
+                            val sim = reacquisition.bestGallerySimilarity(curEmb)
+                            if (sim < TEMPLATE_SIM_THRESHOLD) {
+                                templateMismatchCount++
+                                android.util.Log.d("VisualTracker", "Template mismatch $templateMismatchCount/$TEMPLATE_MISMATCH_MAX (sim=${"%.3f".format(sim)})")
+                            } else {
+                                templateMismatchCount = 0
+                            }
+                        }
+                    }
+
                     // If too many frames without detector confirmation, tracker is drifting.
                     // Adaptive: fast-moving subjects get shorter tolerance (drift is more costly).
                     val adaptiveMaxUnconfirmed = when {
@@ -313,11 +350,15 @@ class ObjectTracker(
                         velocityEstimator.isHighVelocity() -> VT_ADAPTIVE_UNCONFIRMED_HIGH
                         else -> VT_MAX_UNCONFIRMED
                     }
-                    if (vtUnconfirmedFrames > adaptiveMaxUnconfirmed) {
-                        android.util.Log.w("VisualTracker", "DRIFT detected — $vtUnconfirmedFrames unconfirmed frames (max=$adaptiveMaxUnconfirmed, speed=${velocityEstimator.speed}), stopping")
+                    val templateDrift = templateMismatchCount >= TEMPLATE_MISMATCH_MAX
+                    val detectorDrift = vtUnconfirmedFrames > adaptiveMaxUnconfirmed
+                    if (templateDrift || detectorDrift) {
+                        val reason = if (templateDrift) "template mismatch ${templateMismatchCount}x" else "$vtUnconfirmedFrames unconfirmed frames (max=$adaptiveMaxUnconfirmed)"
+                        android.util.Log.w("VisualTracker", "DRIFT detected — $reason (conf=${vtResult.confidence}, speed=${velocityEstimator.speed}), stopping")
                         visualTracker.stop()
                         vtUnconfirmedFrames = 0
                         vtFrameCounter = 0
+                        templateMismatchCount = 0
                         // Fall through to detector path below
                     } else {
                         val lockedObj = TrackedObject(
@@ -356,6 +397,7 @@ class ObjectTracker(
                     // Visual tracker lost the object — fall through to detector
                     visualTracker.stop()
                     vtUnconfirmedFrames = 0
+                    templateMismatchCount = 0
                 }
             }
 
@@ -436,7 +478,46 @@ class ObjectTracker(
                     })
                 }
 
-                merged
+                // --- Synchronous embedding fallback for candidates that missed the cache ---
+                // During rotation, IoU between consecutive frames drops below 0.3 so the
+                // async cache can't merge. Without embeddings, the ReacquisitionEngine's
+                // identity gate hard-rejects these candidates, causing multi-second gaps.
+                // Fix: compute embedding synchronously for the single best same-category
+                // candidate that has no embedding. One-time ~23ms cost per new candidate.
+                val withSyncFallback = if (reacquisition.hasEmbeddings) {
+                    val refBox = reacquisition.lastKnownBox
+                    val lockedIsPerson = reacquisition.lockedIsPerson
+                    // Find same-category candidates missing embeddings
+                    val needsSync = merged.filter { obj ->
+                        obj.embedding == null && obj.id >= 0 &&
+                            ((obj.label == "person") == lockedIsPerson)
+                    }
+                    if (needsSync.isNotEmpty() && refBox != null) {
+                        // Pick the closest one by center distance to last known position
+                        val best = needsSync.minByOrNull { obj ->
+                            val dx = obj.boundingBox.centerX() - refBox.centerX()
+                            val dy = obj.boundingBox.centerY() - refBox.centerY()
+                            dx * dx + dy * dy
+                        }!!
+                        // Compute embedding synchronously (raw crop fallback, ~8-23ms)
+                        val embResult = appearanceEmbedder.embedAndCrop(bitmap, best.boundingBox, fallback = true)
+                        val hist = if (embResult.maskedCrop != null) {
+                            val fullBox = RectF(0f, 0f, 1f, 1f)
+                            computeColorHistogram(embResult.maskedCrop, fullBox).also { embResult.maskedCrop.recycle() }
+                        } else computeColorHistogram(bitmap, best.boundingBox)
+                        if (embResult.embedding != null) {
+                            android.util.Log.d("EmbedSync", "Sync embedding for id=${best.id} label=${best.label}")
+                            merged.map { obj ->
+                                if (obj.id == best.id) obj.copy(
+                                    embedding = embResult.embedding,
+                                    colorHistogram = hist
+                                ) else obj
+                            }
+                        } else merged
+                    } else merged
+                } else merged
+
+                withSyncFallback
             } else {
                 pendingEmbeddings = null // clear when not searching
                 withLabels
@@ -446,11 +527,15 @@ class ObjectTracker(
             val wasSearching = reacquisition.isSearching
             val prevLost = reacquisition.framesLost
 
+            // Filter before scoring — removes phantom full-screen detections
+            // (e.g. "airplane" at [0,0,1,0.7]) that appear during rotation/motion blur.
+            val filtered = filter.filter(withEmbeddings)
+
             // Record frame for scenario replay (before processFrame consumes it)
-            scenarioRecorder.recordFrame(withEmbeddings)
+            scenarioRecorder.recordFrame(filtered)
 
             // Re-acquisition
-            val lockedObject = reacquisition.processFrame(withEmbeddings)
+            val lockedObject = reacquisition.processFrame(filtered)
 
             // Record events for scenario replay
             val nowLost = reacquisition.framesLost
@@ -468,6 +553,7 @@ class ObjectTracker(
             // If re-acquired, re-initialize visual tracker
             if (wasSearching && lockedObject != null && reacquisition.framesLost == 0) {
                 visualTracker.init(bitmap, lockedObject.boundingBox)
+                templateMismatchCount = 0
             }
 
             // Save lastFrameBitmap before debug capture to avoid a third bitmap copy.
@@ -478,11 +564,15 @@ class ObjectTracker(
                 lastFrameDeviceRotation = deviceRotation
             }
 
-            // Debug frame capture on tracking events
+            // Debug frame capture on tracking events.
+            // Uses unfiltered `withEmbeddings` on purpose — debug overlays should
+            // show what the detector produced, including phantoms that the filter
+            // removed, so we can diagnose when the filter is too aggressive.
             captureDebugFrame(bitmap, withEmbeddings, lockedObject, wasSearching, prevLost)
 
             // Filter for display
-            val displayObjects = filter.filter(withEmbeddings)
+            // Already filtered before processFrame — reuse for display
+            val displayObjects = filtered
 
             // Update contour on re-acquire or periodically (gated — disabled until UI uses it)
             if (contourEnabled) {
