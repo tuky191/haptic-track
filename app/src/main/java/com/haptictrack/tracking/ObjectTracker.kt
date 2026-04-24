@@ -109,6 +109,23 @@ class ObjectTracker(
         val cachedBox: RectF? = null
     )
 
+    /**
+     * Sync-fallback dedup cache. During search the sync fallback was firing on the
+     * same candidate ID every frame (~12 rejects/sec = ~280ms/sec of sync embed),
+     * because async results had moved out of IoU>0.3 range or hadn't arrived in time.
+     * We remember the last sync result per ID and reuse it while the box is still
+     * close to where we embedded it. Cleared on every lock/reacq transition.
+     */
+    private data class SyncEmbedEntry(
+        val embedding: FloatArray,
+        val colorHistogram: FloatArray?,
+        val cachedBox: RectF,
+        val framesLost: Int
+    )
+    private val recentSyncEmbeds = mutableMapOf<Int, SyncEmbedEntry>()
+    private val SYNC_EMBED_CACHE_FRAMES = 30  // ~1-2s at typical search fps; IoU is the real staleness guard
+    private val SYNC_EMBED_CACHE_IOU = 0.5f  // box must overlap this much with cached box
+
     /** Callback: (displayObjects, lockedObject, imageWidth, imageHeight, contour) */
     var onDetectionResult: ((List<TrackedObject>, TrackedObject?, Int, Int, List<PointF>) -> Unit)? = null
 
@@ -224,6 +241,7 @@ class ObjectTracker(
         velocityEstimator.reset()
         pendingEmbeddings?.cancel(true)
         pendingEmbeddings = null
+        recentSyncEmbeds.clear()
         cachedContour = emptyList()
         contourFrameCount = 0
     }
@@ -496,23 +514,33 @@ class ObjectTracker(
                 } catch (e: java.util.concurrent.TimeoutException) { emptyMap() }
                 catch (e: Exception) { emptyMap() }
 
-                // Merge cached embeddings into current detections by greedy IoU match.
-                // Each cached entry can only match one detection (prevents duplicates
-                // when overlapping boxes all match the same cached result).
+                // Merge cached embeddings into current detections. Prefer ID match
+                // (FTFTracker preserves IDs across frames for the same physical object —
+                // trust it), fall back to greedy IoU match for re-IDed detections.
+                // Prefer-by-ID avoids throwing away async work when fast motion pushes
+                // box-to-box IoU below 0.3 between consecutive frames.
                 val cachedEntries = cachedResults.entries.toList()
                 val usedCacheKeys = mutableSetOf<Int>()
                 val merged = withLabels.map { obj ->
-                    val bestMatch = cachedEntries
-                        .filter { (id, result) -> result.cachedBox != null && id !in usedCacheKeys }
-                        .maxByOrNull { (_, result) ->
+                    val byId = if (obj.id >= 0) cachedResults[obj.id] else null
+                    val cached: EmbeddingResult? = if (byId != null) {
+                        usedCacheKeys.add(obj.id)
+                        byId
+                    } else {
+                        val bestMatch = cachedEntries
+                            .filter { (id, result) -> result.cachedBox != null && id !in usedCacheKeys }
+                            .maxByOrNull { (_, result) ->
+                                computeIou(obj.boundingBox, result.cachedBox!!)
+                            }
+                        val iou = bestMatch?.let { (_, result) ->
                             computeIou(obj.boundingBox, result.cachedBox!!)
-                        }
-                    val iou = bestMatch?.let { (_, result) ->
-                        computeIou(obj.boundingBox, result.cachedBox!!)
-                    } ?: 0f
-                    if (bestMatch != null && iou > 0.3f) {
-                        usedCacheKeys.add(bestMatch.key)
-                        val cached = bestMatch.value
+                        } ?: 0f
+                        if (bestMatch != null && iou > 0.3f) {
+                            usedCacheKeys.add(bestMatch.key)
+                            bestMatch.value
+                        } else null
+                    }
+                    if (cached != null) {
                         obj.copy(
                             embedding = cached.embedding,
                             colorHistogram = cached.colorHistogram,
@@ -545,6 +573,11 @@ class ObjectTracker(
                 // identity gate hard-rejects these candidates, causing multi-second gaps.
                 // Fix: compute embedding synchronously for the single best same-category
                 // candidate that has no embedding. One-time ~23ms cost per new candidate.
+                //
+                // Dedup: a short-retention cache (recentSyncEmbeds) avoids re-embedding the
+                // same ID on consecutive frames — the same bad candidate used to cost ~23ms
+                // every frame because its sim never crossed the override threshold and
+                // the engine rejected it, leaving it "needsSync" again next frame.
                 val withSyncFallback = if (reacquisition.hasEmbeddings) {
                     val refBox = reacquisition.lastKnownBox
                     val lockedIsPerson = reacquisition.lockedIsPerson
@@ -560,17 +593,44 @@ class ObjectTracker(
                             val dy = obj.boundingBox.centerY() - refBox.centerY()
                             dx * dx + dy * dy
                         }!!
-                        // Compute embedding synchronously (raw crop fallback, ~8-23ms)
-                        val embResult = appearanceEmbedder.embedAndCrop(bitmap, best.boundingBox, fallback = true)
-                        val hist = if (embResult.maskedCrop != null) {
-                            val fullBox = RectF(0f, 0f, 1f, 1f)
-                            computeColorHistogram(embResult.maskedCrop, fullBox).also { embResult.maskedCrop.recycle() }
-                        } else computeColorHistogram(bitmap, best.boundingBox)
-                        if (embResult.embedding != null) {
-                            android.util.Log.d("EmbedSync", "Sync embedding for id=${best.id} label=${best.label}")
+
+                        // Dedup: reuse a recent sync result if this ID was embedded in
+                        // the last SYNC_EMBED_CACHE_FRAMES frames and its box hasn't moved.
+                        // Prune stale entries first so the map doesn't grow unbounded across
+                        // long searches where FTFTracker keeps minting new IDs.
+                        val currFramesLost = reacquisition.framesLost
+                        recentSyncEmbeds.entries.removeAll { (_, entry) ->
+                            currFramesLost - entry.framesLost >= SYNC_EMBED_CACHE_FRAMES
+                        }
+                        val cached = recentSyncEmbeds[best.id]
+                        val reusable = cached != null &&
+                            computeIou(best.boundingBox, cached.cachedBox) > SYNC_EMBED_CACHE_IOU
+
+                        val (embedding, hist) = if (reusable) {
+                            cached!!.embedding to cached.colorHistogram
+                        } else {
+                            // Compute embedding synchronously (raw crop fallback, ~8-23ms)
+                            val embResult = appearanceEmbedder.embedAndCrop(bitmap, best.boundingBox, fallback = true)
+                            val computedHist = if (embResult.maskedCrop != null) {
+                                val fullBox = RectF(0f, 0f, 1f, 1f)
+                                computeColorHistogram(embResult.maskedCrop, fullBox).also { embResult.maskedCrop.recycle() }
+                            } else computeColorHistogram(bitmap, best.boundingBox)
+                            if (embResult.embedding != null) {
+                                android.util.Log.d("EmbedSync", "Sync embedding for id=${best.id} label=${best.label}")
+                                recentSyncEmbeds[best.id] = SyncEmbedEntry(
+                                    embedding = embResult.embedding,
+                                    colorHistogram = computedHist,
+                                    cachedBox = RectF(best.boundingBox),
+                                    framesLost = currFramesLost
+                                )
+                            }
+                            embResult.embedding to computedHist
+                        }
+
+                        if (embedding != null) {
                             merged.map { obj ->
                                 if (obj.id == best.id) obj.copy(
-                                    embedding = embResult.embedding,
+                                    embedding = embedding,
                                     colorHistogram = hist
                                 ) else obj
                             }
@@ -581,6 +641,7 @@ class ObjectTracker(
                 withSyncFallback
             } else {
                 pendingEmbeddings = null // clear when not searching
+                recentSyncEmbeds.clear()
                 withLabels
             }
 
