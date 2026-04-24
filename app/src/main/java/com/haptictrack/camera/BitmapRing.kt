@@ -19,6 +19,7 @@ class BitmapRing(
     private val width: Int,
     private val height: Int
 ) {
+    private val maxSize = size
     private val free = ArrayDeque<Bitmap>(size)
 
     init {
@@ -32,13 +33,22 @@ class BitmapRing(
         free.removeFirstOrNull()
     } ?: Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
 
-    /** Return a bitmap to the pool. Drops it if the pool is already full. */
+    /** Return a bitmap to the pool. Recycles it if the pool is already at [maxSize]
+     *  — enforces the documented cap so overflow bitmaps created under back-pressure
+     *  (e.g. while lockOnObject holds the processing thread for ~200ms) don't grow
+     *  the deque permanently. */
     fun release(bitmap: Bitmap) {
         if (bitmap.isRecycled || bitmap.width != width || bitmap.height != height) {
             if (!bitmap.isRecycled) bitmap.recycle()
             return
         }
-        synchronized(free) { free.addLast(bitmap) }
+        synchronized(free) {
+            if (free.size < maxSize) {
+                free.addLast(bitmap)
+            } else {
+                bitmap.recycle()
+            }
+        }
     }
 
     /** Recycle every pooled bitmap. Call during teardown. */

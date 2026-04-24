@@ -233,7 +233,15 @@ class SurfaceTextureFrameReader(
                 val frame = latestFrame.getAndSet(null)
                 if (frame != null) {
                     val start = System.nanoTime()
-                    onFrame(frame)
+                    // Catch any exception from onFrame (tracker.processBitmap, pool
+                    // release, etc.) so one bad frame can't silently kill this loop
+                    // and freeze tracking. The tracker's own try/finally handles
+                    // bitmap ownership on exception; we just need to keep going.
+                    try {
+                        onFrame(frame)
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "Processing thread: onFrame threw, continuing", t)
+                    }
                     processNs += System.nanoTime() - start
                     processedCount++
 
