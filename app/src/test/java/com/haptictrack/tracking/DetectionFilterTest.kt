@@ -74,11 +74,19 @@ class DetectionFilterTest {
     }
 
     @Test
-    fun `rejects box covering most of frame`() {
-        // 0.9 * 0.9 = 0.81 area, above maxBoxArea of 0.7
+    fun `rejects box covering entire frame`() {
+        // 0.98 * 0.98 = 0.96 area, above maxBoxArea of 0.85
         val obj = obj(label = "Food", confidence = 0.8f,
-            left = 0.05f, top = 0.05f, right = 0.95f, bottom = 0.95f)
+            left = 0.01f, top = 0.01f, right = 0.99f, bottom = 0.99f)
         assertFalse(filter.isValid(obj))
+    }
+
+    @Test
+    fun `accepts large close-up subject`() {
+        // 0.92 * 0.71 = 0.65 area — legit close-up person
+        val obj = obj(label = "person", confidence = 0.8f,
+            left = 0.08f, top = 0.29f, right = 1.0f, bottom = 1.0f)
+        assertTrue(filter.isValid(obj))
     }
 
     @Test

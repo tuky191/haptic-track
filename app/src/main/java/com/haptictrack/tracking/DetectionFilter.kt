@@ -9,8 +9,12 @@ class DetectionFilter(
     val minConfidence: Float = 0.5f,
     /** Minimum bounding box area (normalized, 0..1). Rejects tiny slivers. */
     val minBoxArea: Float = 0.005f,
-    /** Maximum bounding box area (normalized, 0..1). Rejects "whole frame" detections. */
-    val maxBoxArea: Float = 0.5f,
+    /** Maximum bounding box area (normalized, 0..1). Rejects "whole frame" detections.
+     *  Only catches the absurd full-frame case — tentative confirmation (3 consecutive
+     *  same-ID IoU>0.3 matches) is the structural defense against flickering phantoms.
+     *  Set to 0.85 so legitimate close-up subjects (a person filling the frame) aren't
+     *  filtered; 0.5 was found to reject legit large subjects and break reacquisition. */
+    val maxBoxArea: Float = 0.85f,
     /** Minimum aspect ratio (width/height). Rejects extremely thin boxes. */
     val minAspectRatio: Float = 0.2f,
     /** Maximum aspect ratio (width/height). Rejects extremely wide boxes. */
