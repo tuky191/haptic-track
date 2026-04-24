@@ -265,7 +265,7 @@ class ObjectTracker(
                     val tracked = if (skipDetector) {
                         emptyList()
                     } else {
-                        val detections = runDetector(bitmap, frameWidth, frameHeight, deviceRotation)
+                        val detections = runDetector(bitmap)
                         frameTracker.assignIds(detections)
                     }
 
@@ -441,7 +441,7 @@ class ObjectTracker(
             }
 
             // --- Detector path: detection + re-acquisition ---
-            val detections = runDetector(bitmap, frameWidth, frameHeight, deviceRotation)
+            val detections = runDetector(bitmap)
             // Use velocity-shifted matching when tracking a fast-moving subject.
             // Shifts previous frame's boxes by velocity before IoU matching,
             // preventing ID churn from large displacements between frames.
@@ -640,12 +640,11 @@ class ObjectTracker(
         }
     }
 
-    private fun runDetector(bitmap: Bitmap, frameWidth: Int, frameHeight: Int, deviceRot: Int): List<TrackedObject> {
+    private fun runDetector(bitmap: Bitmap): List<TrackedObject> {
         // EfficientDet fails on rotated scenes — pre-rotate the bitmap to
         // physical-upright before inference when the phone is not in portrait.
-        // We read the physical device rotation from the provider (since the
-        // pipeline around us operates in display-image coords with deviceRot=0)
-        // and remap detector output back to display-image (screen) space.
+        // The rest of the pipeline operates in display-image coords; we remap
+        // detector output back to display-image (screen) space via unmapRotation.
         val actualRot = deviceRotationProvider?.invoke() ?: 0
         val upright = if (actualRot == 0) bitmap else rotateBitmap(bitmap, (-actualRot).toFloat())
         val uprightW = upright.width
@@ -660,7 +659,6 @@ class ObjectTracker(
             val normRight = box.right / uprightW.toFloat()
             val normBottom = box.bottom / uprightH.toFloat()
 
-            // actualRot used here (not the deviceRot parameter, which is 0)
             val screenBox = unmapRotation(normLeft, normTop, normRight, normBottom, actualRot)
 
             TrackedObject(
