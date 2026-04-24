@@ -654,13 +654,20 @@ class ObjectTracker(
         }
     }
 
+    /**
+     * Reusable buffer for the physical-upright rotation in [runDetector].
+     * Allocated once per (width,height) combination and drawn into each frame —
+     * previously we allocated a fresh bitmap every non-portrait frame (~5-10ms).
+     */
+    private var uprightBuffer: Bitmap? = null
+
     private fun runDetector(bitmap: Bitmap): List<TrackedObject> {
         // EfficientDet fails on rotated scenes — pre-rotate the bitmap to
         // physical-upright before inference when the phone is not in portrait.
         // The rest of the pipeline operates in display-image coords; we remap
         // detector output back to display-image (screen) space via unmapRotation.
         val actualRot = deviceRotationProvider?.invoke() ?: 0
-        val upright = if (actualRot == 0) bitmap else rotateBitmap(bitmap, (-actualRot).toFloat())
+        val upright = if (actualRot == 0) bitmap else rotateIntoBuffer(bitmap, -actualRot)
         val uprightW = upright.width
         val uprightH = upright.height
         val mpImage = BitmapImageBuilder(upright).build()
@@ -683,13 +690,42 @@ class ObjectTracker(
             )
         }
 
-        if (upright !== bitmap) upright.recycle()
+        // No recycle here — uprightBuffer is reused across frames.
         return detections
     }
 
-    private fun rotateBitmap(bitmap: Bitmap, degrees: Float): Bitmap {
-        val matrix = android.graphics.Matrix().apply { postRotate(degrees) }
-        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+    /**
+     * Rotate [src] by [rotDegrees] into a pooled buffer bitmap, reallocating only
+     * when the target dimensions change (i.e. rotation flipped between 90/270 and
+     * 0/180, or the input resolution changed).
+     *
+     * [rotDegrees] is in {90, 180, 270, -90, -180, -270}; we normalize to 0..359.
+     */
+    private fun rotateIntoBuffer(src: Bitmap, rotDegrees: Int): Bitmap {
+        val rot = ((rotDegrees % 360) + 360) % 360
+        val targetW = if (rot == 90 || rot == 270) src.height else src.width
+        val targetH = if (rot == 90 || rot == 270) src.width else src.height
+
+        var buffer = uprightBuffer
+        if (buffer == null || buffer.isRecycled ||
+            buffer.width != targetW || buffer.height != targetH) {
+            buffer?.recycle()
+            buffer = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
+            uprightBuffer = buffer
+        }
+
+        val canvas = android.graphics.Canvas(buffer)
+        canvas.drawColor(android.graphics.Color.BLACK, android.graphics.PorterDuff.Mode.SRC)
+        val matrix = android.graphics.Matrix().apply {
+            postRotate(rot.toFloat(), src.width / 2f, src.height / 2f)
+            // After rotation around the source center, translate so the rotated
+            // image's top-left aligns with the buffer's top-left.
+            val dx = (targetW - src.width) / 2f
+            val dy = (targetH - src.height) / 2f
+            postTranslate(dx, dy)
+        }
+        canvas.drawBitmap(src, matrix, null)
+        return buffer
     }
 
     private fun captureDebugFrame(
@@ -792,7 +828,7 @@ class ObjectTracker(
 
     fun shutdown() {
         scenarioRecorder.stop()
-        debugCapture.endSession()
+        debugCapture.shutdown()
         embeddingExecutor.shutdownNow()
         detector.close()
         faceEmbedder.close()
@@ -804,6 +840,8 @@ class ObjectTracker(
             lastFrameBitmap?.recycle()
             lastFrameBitmap = null
         }
+        uprightBuffer?.recycle()
+        uprightBuffer = null
     }
 }
 
