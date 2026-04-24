@@ -101,7 +101,7 @@ CameraViewModel
 1. Detector runs, `FrameToFrameTracker` assigns stable IDs via IoU matching
 2. `Yolov8Detector` enriches COCO labels with OIV7 labels (every 10th search frame)
 3. `AppearanceEmbedder` computes visual fingerprints for all candidates (async pipeline; synchronous fallback for the closest same-category candidate when the async cache can't bridge across frames during rotation)
-4. `DetectionFilter` runs before scoring to strip phantom full-screen detections (area > 0.5) that EfficientDet produces during motion blur
+4. `DetectionFilter` runs before scoring to strip truly full-frame detections (area > 0.85) — tentative confirmation handles flickering phantoms structurally
 5. `ReacquisitionEngine` scores candidates: position (decays over time) + size + label (20% scoring factor, -0.5 penalty for mismatch) + appearance similarity + color histogram + person attributes
 6. Strong embedding match (>0.7 cosine similarity) overrides position/size hard thresholds
 7. Best candidate above `minScoreThreshold` becomes the new lock; visual tracker re-initializes
@@ -498,7 +498,7 @@ All in constructor defaults — no settings UI yet:
 | `MAX_GALLERY_SIZE` | ReacquisitionEngine | 12 | Maximum embeddings in the reference gallery |
 | `ENRICH_IOU_THRESHOLD` | Yolov8Detector | 0.3 | Min IoU to match YOLOv8 detection to EfficientDet box |
 | `minConfidence` | DetectionFilter | 0.5 | Minimum ML confidence to show detection |
-| `maxBoxArea` | DetectionFilter | 0.5 | Reject phantom full-screen detections (applied before scoring) |
+| `maxBoxArea` | DetectionFilter | 0.85 | Reject full-frame detections only; tentative confirmation catches flickering phantoms |
 | `minIou` | FrameToFrameTracker | 0.2 | Minimum IoU to match across frames |
 | `MIN_CONFIDENCE` | VisualTracker | 0.5 | VitTracker confidence floor |
 | `VT_MAX_UNCONFIRMED` | ObjectTracker | 10 | Frames without detector confirmation → drift (secondary signal) |
