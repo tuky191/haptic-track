@@ -80,9 +80,6 @@ class SurfaceTextureFrameReader(
     private var eglSurface: EGLSurface = EGL14.EGL_NO_SURFACE
     private var textureId: Int = 0
 
-    // Pre-allocated readback buffer
-    private lateinit var readBuffer: ByteBuffer
-
     /**
      * Start the GL thread and create the Surface.
      * Returns a [Surface] that should be provided to CameraX Preview via [Preview.SurfaceProvider].
@@ -107,8 +104,6 @@ class SurfaceTextureFrameReader(
                 surfaceLatch.countDown()
 
                 val bufferBytes = outputWidth * outputHeight * 4
-                readBuffer = ByteBuffer.allocateDirect(bufferBytes)
-                    .order(ByteOrder.nativeOrder())
 
                 // Create an FBO for offscreen rendering at output resolution
                 val fbo = IntArray(1)
