@@ -208,9 +208,11 @@ class ObjectTracker(
     }
 
     /**
-     * Process a display-oriented bitmap from PreviewView.getBitmap().
-     * Unlike the ImageProxy path, the bitmap is already in screen orientation —
-     * no rotation is applied, and detector coordinates are used as-is (deviceRot=0).
+     * Process a display-oriented bitmap from the SurfaceTexture GL pipeline.
+     * The bitmap pixels are in display (phone-top) orientation. The detector
+     * reads [deviceRotationProvider] internally and rotates the bitmap to
+     * physical-upright before inference; VT and the rest of the pipeline
+     * continue operating in display-image coordinates.
      */
     fun processBitmap(bitmap: Bitmap) {
         processBitmapInternal(bitmap, deviceRotation = 0)
@@ -601,17 +603,27 @@ class ObjectTracker(
     }
 
     private fun runDetector(bitmap: Bitmap, frameWidth: Int, frameHeight: Int, deviceRot: Int): List<TrackedObject> {
-        val mpImage = BitmapImageBuilder(bitmap).build()
+        // EfficientDet fails on rotated scenes — pre-rotate the bitmap to
+        // physical-upright before inference when the phone is not in portrait.
+        // We read the physical device rotation from the provider (since the
+        // pipeline around us operates in display-image coords with deviceRot=0)
+        // and remap detector output back to display-image (screen) space.
+        val actualRot = deviceRotationProvider?.invoke() ?: 0
+        val upright = if (actualRot == 0) bitmap else rotateBitmap(bitmap, (-actualRot).toFloat())
+        val uprightW = upright.width
+        val uprightH = upright.height
+        val mpImage = BitmapImageBuilder(upright).build()
         val result: ObjectDetectorResult = detector.detect(mpImage)
 
-        return result.detections().map { detection ->
+        val detections = result.detections().map { detection ->
             val box = detection.boundingBox()
-            val normLeft = box.left / frameWidth.toFloat()
-            val normTop = box.top / frameHeight.toFloat()
-            val normRight = box.right / frameWidth.toFloat()
-            val normBottom = box.bottom / frameHeight.toFloat()
+            val normLeft = box.left / uprightW.toFloat()
+            val normTop = box.top / uprightH.toFloat()
+            val normRight = box.right / uprightW.toFloat()
+            val normBottom = box.bottom / uprightH.toFloat()
 
-            val screenBox = unmapRotation(normLeft, normTop, normRight, normBottom, deviceRot)
+            // actualRot used here (not the deviceRot parameter, which is 0)
+            val screenBox = unmapRotation(normLeft, normTop, normRight, normBottom, actualRot)
 
             TrackedObject(
                 id = -1,
@@ -620,6 +632,14 @@ class ObjectTracker(
                 confidence = detection.categories().firstOrNull()?.score() ?: 0f
             )
         }
+
+        if (upright !== bitmap) upright.recycle()
+        return detections
+    }
+
+    private fun rotateBitmap(bitmap: Bitmap, degrees: Float): Bitmap {
+        val matrix = android.graphics.Matrix().apply { postRotate(degrees) }
+        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
     }
 
     private fun captureDebugFrame(
