@@ -473,9 +473,12 @@ class ReacquisitionEngine(
         // asks "can the embedder tell these apart?" not "do other signals differ?"
         // Two candidates with similar embedding but different color/position are still
         // ambiguous from an identity standpoint — other signals are noisy tiebreakers.
+        // Uses the SAME embedding signal that drove the gate (OSNet for person-person,
+        // MobileNetV3 elsewhere). Otherwise ambiguity-by-MobileNetV3 could falsely
+        // reject pairs that OSNet clearly distinguishes (#67 review).
         if (sortedScored.size >= 2 && hasEmbeddings) {
-            val bestSim = if (best.first.embedding != null) bestGallerySimilarity(best.first.embedding!!) else 0f
-            val secondSim = if (sortedScored[1].first.embedding != null) bestGallerySimilarity(sortedScored[1].first.embedding!!) else 0f
+            val bestSim = effectiveAppearanceSim(best.first)
+            val secondSim = effectiveAppearanceSim(sortedScored[1].first)
             if (bestSim > 0f && secondSim > 0f) {
                 val ratio = secondSim / bestSim
                 if (ratio > RATIO_TEST_THRESHOLD) {
@@ -724,6 +727,24 @@ class ReacquisitionEngine(
     /** Best cosine similarity between a candidate and any embedding in the gallery. */
     internal fun bestGallerySimilarity(candidateEmbedding: FloatArray): Float {
         return bestGallerySimilarity(candidateEmbedding, _embeddingGallery)
+    }
+
+    /**
+     * Effective appearance similarity used by the gate, scoring, and ratio test.
+     * Matches the OSNet-vs-MobileNetV3 split in [scoreCandidate]: person-person
+     * comparisons (both sides have OSNet) use OSNet cosine; everything else
+     * uses MobileNetV3 against the gallery.
+     */
+    private fun effectiveAppearanceSim(candidate: TrackedObject): Float {
+        val candidateIsPerson = candidate.label == "person"
+        val hasReId = lockedIsPerson && candidateIsPerson &&
+            lockedReIdEmbedding != null && candidate.reIdEmbedding != null
+        return when {
+            hasReId -> cosineSimilarity(lockedReIdEmbedding!!, candidate.reIdEmbedding!!).coerceIn(0f, 1f)
+            hasEmbeddings && candidate.embedding != null ->
+                bestGallerySimilarity(candidate.embedding!!).coerceIn(0f, 1f)
+            else -> 0f
+        }
     }
 
     /** Log to both logcat and session file. */
