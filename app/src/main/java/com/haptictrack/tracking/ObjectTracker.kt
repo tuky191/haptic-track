@@ -126,6 +126,34 @@ class ObjectTracker(
     private val SYNC_EMBED_CACHE_FRAMES = 30  // ~1-2s at typical search fps; IoU is the real staleness guard
     private val SYNC_EMBED_CACHE_IOU = 0.5f  // box must overlap this much with cached box
 
+    /**
+     * Off-thread lock-on. The full lock burst (5 augmented embeddings + segmenter
+     * + person classifier + re-id + face + scene negatives) is ~150-250ms of GPU
+     * work that used to run on the processing thread under lastFrameLock, blocking
+     * frame processing for the full duration. Now we snapshot a bitmap, release
+     * the lock immediately, and run the ML on a dedicated thread; the processing
+     * thread picks the result up at the next frame boundary.
+     */
+    private val lockExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "LockOnObject") }
+    private var pendingLockFuture: java.util.concurrent.Future<*>? = null
+    private val pendingLockResult = java.util.concurrent.atomic.AtomicReference<LockResult?>()
+
+    /** Result of off-thread lock ML; applied on the processing thread. */
+    private data class LockResult(
+        val trackingId: Int,
+        val boundingBox: RectF,
+        val label: String?,
+        val gallery: List<FloatArray>,
+        val colorHist: FloatArray?,
+        val personAttrs: PersonAttributes?,
+        val reIdEmb: FloatArray?,
+        val faceEmb: FloatArray?,
+        val sceneNegatives: List<FloatArray>,
+        val deviceRotation: Int,
+        /** Snapshot bitmap; ownership transfers to whoever applies/cancels this result. */
+        val snapshotBmp: Bitmap
+    )
+
     /** Callback: (displayObjects, lockedObject, imageWidth, imageHeight, contour) */
     var onDetectionResult: ((List<TrackedObject>, TrackedObject?, Int, Int, List<PointF>) -> Unit)? = null
 
@@ -175,54 +203,101 @@ class ObjectTracker(
      * the visual embedding for identity-aware re-acquisition.
      */
     fun lockOnObject(trackingId: Int, boundingBox: RectF, label: String?) {
+        // Snapshot the latest frame + detections atomically, then release the
+        // lastFrameLock immediately so the processing thread can keep producing
+        // frames during the lock burst.
+        val snapshotBmp: Bitmap
+        val snapshotDevRot: Int
+        val snapshotDetections: List<TrackedObject>
         synchronized(lastFrameLock) {
-            val bmp = lastFrameBitmap ?: run {
+            val src = lastFrameBitmap ?: run {
                 reacquisition.lock(trackingId, boundingBox, label, emptyList())
                 return
             }
+            snapshotBmp = src.copy(src.config ?: Bitmap.Config.ARGB_8888, false)
+            snapshotDevRot = lastFrameDeviceRotation
+            snapshotDetections = lastDetections.toList()
+        }
 
-            val augResult = appearanceEmbedder.embedWithAugmentations(bmp, boundingBox)
-            // Compute color histogram on the masked crop (single segmentation pass)
-            val colorHist = if (augResult.maskedCrop != null) {
-                val fullBox = RectF(0f, 0f, 1f, 1f) // crop is already the object
-                computeColorHistogram(augResult.maskedCrop, fullBox).also { augResult.maskedCrop.recycle() }
-            } else computeColorHistogram(bmp, boundingBox)
-            // Classify person attributes at lock time (use original COCO label for "person" check)
-            val personAttrs = personClassifier.classify(bmp, boundingBox, label)
-            // Person re-ID + face embeddings (only for person labels)
-            val isPerson = label == "person"
-            val reIdEmb = if (isPerson) personReId.embed(bmp, boundingBox) else null
-            val faceEmb = if (isPerson) faceEmbedder.embedFace(bmp, boundingBox) else null
-            reacquisition.lock(trackingId, boundingBox, label, augResult.embeddings, colorHist, personAttrs,
-                cocoLabel = label, reIdEmbedding = reIdEmb, faceEmbedding = faceEmb)
-            visualTracker.init(bmp, boundingBox)
-            vtLockedBoxArea = boundingBox.width() * boundingBox.height()
+        // Cancel any in-flight prior lock and discard its result if not yet applied.
+        pendingLockFuture?.cancel(true)
+        pendingLockResult.getAndSet(null)?.snapshotBmp?.recycle()
 
-            debugCapture.startSession(label, trackingId)
-            val attrStr = personAttrs?.summary() ?: "n/a"
-            debugCapture.log("LOCK id=$trackingId label=$label box=${boundingBox} gallery=${augResult.embeddings.size} colorHist=${colorHist != null} attrs=\"$attrStr\"")
+        pendingLockFuture = lockExecutor.submit {
+            try {
+                val augResult = appearanceEmbedder.embedWithAugmentations(snapshotBmp, boundingBox)
+                val colorHist = if (augResult.maskedCrop != null) {
+                    val fullBox = RectF(0f, 0f, 1f, 1f)
+                    computeColorHistogram(augResult.maskedCrop, fullBox).also { augResult.maskedCrop.recycle() }
+                } else computeColorHistogram(snapshotBmp, boundingBox)
+                val personAttrs = personClassifier.classify(snapshotBmp, boundingBox, label)
+                val isPerson = label == "person"
+                val reIdEmb = if (isPerson) personReId.embed(snapshotBmp, boundingBox) else null
+                val faceEmb = if (isPerson) faceEmbedder.embedFace(snapshotBmp, boundingBox) else null
 
-            // Start scenario recording for replay testing
+                // Scene negatives: embed every other detection visible at lock time.
+                // boundingBox is screen-space; remap to rotated-image space to crop.
+                val sceneNegs = mutableListOf<FloatArray>()
+                for (det in snapshotDetections) {
+                    if (det.id == trackingId) continue
+                    val rotBox = mapToRotated(det.boundingBox.left, det.boundingBox.top,
+                        det.boundingBox.right, det.boundingBox.bottom, snapshotDevRot)
+                    val negEmb = appearanceEmbedder.embed(snapshotBmp, rotBox)
+                    if (negEmb != null) sceneNegs.add(negEmb)
+                }
+
+                val result = LockResult(
+                    trackingId = trackingId,
+                    boundingBox = boundingBox,
+                    label = label,
+                    gallery = augResult.embeddings,
+                    colorHist = colorHist,
+                    personAttrs = personAttrs,
+                    reIdEmb = reIdEmb,
+                    faceEmb = faceEmb,
+                    sceneNegatives = sceneNegs,
+                    deviceRotation = snapshotDevRot,
+                    snapshotBmp = snapshotBmp
+                )
+                // Hand off; if a previous result is still pending, recycle its bitmap.
+                pendingLockResult.getAndSet(result)?.snapshotBmp?.recycle()
+            } catch (t: Throwable) {
+                android.util.Log.e("ObjectTracker", "Lock ML failed: ${t.message}", t)
+                snapshotBmp.recycle()
+            }
+        }
+    }
+
+    /**
+     * Apply a completed off-thread lock result on the processing thread. Called at
+     * the start of [processBitmapInternal] so all state mutation happens on the
+     * single thread that reads it. Recycles the snapshot bitmap once consumed.
+     */
+    private fun applyPendingLockIfAny() {
+        val result = pendingLockResult.getAndSet(null) ?: return
+        try {
+            reacquisition.lock(result.trackingId, result.boundingBox, result.label,
+                result.gallery, result.colorHist, result.personAttrs,
+                cocoLabel = result.label, reIdEmbedding = result.reIdEmb, faceEmbedding = result.faceEmb)
+            visualTracker.init(result.snapshotBmp, result.boundingBox)
+            vtLockedBoxArea = result.boundingBox.width() * result.boundingBox.height()
+
+            for (neg in result.sceneNegatives) reacquisition.addSceneNegative(neg)
+
+            debugCapture.startSession(result.label, result.trackingId)
+            val attrStr = result.personAttrs?.summary() ?: "n/a"
+            debugCapture.log("LOCK id=${result.trackingId} label=${result.label} box=${result.boundingBox} gallery=${result.gallery.size} colorHist=${result.colorHist != null} attrs=\"$attrStr\"")
+
             debugCapture.sessionDir?.let { dir ->
-                scenarioRecorder.start(dir, trackingId, label, label,
-                    boundingBox, augResult.embeddings, colorHist, personAttrs)
+                scenarioRecorder.start(dir, result.trackingId, result.label, result.label,
+                    result.boundingBox, result.gallery, result.colorHist, result.personAttrs)
             }
 
-            // Collect scene negatives from other objects visible at lock time.
-            // lastDetections has screen-space boxes but bmp is the rotated bitmap,
-            // so convert back to rotated-image space before cropping.
-            val lockDevRot = lastFrameDeviceRotation
-            for (det in lastDetections) {
-                if (det.id == trackingId) continue
-                val rotBox = mapToRotated(det.boundingBox.left, det.boundingBox.top,
-                    det.boundingBox.right, det.boundingBox.bottom, lockDevRot)
-                val negEmb = appearanceEmbedder.embed(bmp, rotBox)
-                if (negEmb != null) reacquisition.addSceneNegative(negEmb)
-            }
-
-            val locked = TrackedObject(trackingId, boundingBox, label)
-            debugCapture.capture(DebugEvent.LOCK, bmp, listOf(locked), lockedObject = locked,
-                extraInfo = "id=$trackingId label=$label gallery=${augResult.embeddings.size}")
+            val locked = TrackedObject(result.trackingId, result.boundingBox, result.label)
+            debugCapture.capture(DebugEvent.LOCK, result.snapshotBmp, listOf(locked), lockedObject = locked,
+                extraInfo = "id=${result.trackingId} label=${result.label} gallery=${result.gallery.size}")
+        } finally {
+            result.snapshotBmp.recycle()
         }
     }
 
@@ -241,6 +316,9 @@ class ObjectTracker(
         velocityEstimator.reset()
         pendingEmbeddings?.cancel(true)
         pendingEmbeddings = null
+        pendingLockFuture?.cancel(true)
+        pendingLockFuture = null
+        pendingLockResult.getAndSet(null)?.snapshotBmp?.recycle()
         recentSyncEmbeds.clear()
         cachedContour = emptyList()
         contourFrameCount = 0
@@ -258,6 +336,9 @@ class ObjectTracker(
     }
 
     private fun processBitmapInternal(bitmap: Bitmap, deviceRotation: Int) {
+        // Apply any off-thread lock that completed since the last frame.
+        applyPendingLockIfAny()
+
         val frameWidth = bitmap.width
         val frameHeight = bitmap.height
 
@@ -901,6 +982,8 @@ class ObjectTracker(
         scenarioRecorder.stop()
         debugCapture.shutdown()
         embeddingExecutor.shutdownNow()
+        lockExecutor.shutdownNow()
+        pendingLockResult.getAndSet(null)?.snapshotBmp?.recycle()
         detector.close()
         faceEmbedder.close()
         personReId.close()
