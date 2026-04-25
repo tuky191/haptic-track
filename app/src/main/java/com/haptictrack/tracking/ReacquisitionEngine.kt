@@ -755,6 +755,20 @@ class ReacquisitionEngine(
     }
 
     /**
+     * Best cosine similarity against the **lock-time** portion of the gallery only
+     * (the first `LOCK_AUGMENTATION_COUNT` entries — original + rotations + flip).
+     * Used by template self-verification (#80): if drift detection used the full
+     * gallery, accumulated-during-tracking entries can include drifted VT crops,
+     * which then match the (also drifted) VT crop perfectly and mask drift.
+     * The lock-time portion is fixed and trustworthy.
+     */
+    internal fun bestLockGallerySimilarity(candidateEmbedding: FloatArray): Float {
+        if (_embeddingGallery.isEmpty()) return 0f
+        val lockEntries = _embeddingGallery.take(LOCK_AUGMENTATION_COUNT)
+        return bestGallerySimilarity(candidateEmbedding, lockEntries)
+    }
+
+    /**
      * Effective appearance similarity used by the gate, scoring, and ratio test.
      * Matches the OSNet-vs-MobileNetV3 split in [scoreCandidate]: person-person
      * comparisons (both sides have OSNet) use OSNet cosine; everything else
