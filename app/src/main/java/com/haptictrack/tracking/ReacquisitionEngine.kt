@@ -71,6 +71,18 @@ class ReacquisitionEngine(
         /** Maximum negative examples to store. */
         const val MAX_NEGATIVE_EXAMPLES = 10
         /**
+         * Max frozen negatives used for OnlineClassifier cold-start at lock time.
+         * The full frozen-negatives asset (~1500) is used for adaptive-floor
+         * statistics (mean+0.5σ benefits from larger sample). For classifier
+         * training we deliberately subsample — a 5-positive vs 1500-negative
+         * imbalance (300:1) lets the gradient be dominated by negatives, and
+         * with `gradB / n` normalization the positive class gets undertrained.
+         * 100 negatives keeps the imbalance to 20:1, which the existing L2
+         * regularization handles. Also bounds train time at lock to ~10ms.
+         * Reviewer flag #3 on PR #79.
+         */
+        const val CLASSIFIER_COLD_START_NEGATIVES = 100
+        /**
          * Tentative bypass decision table:
          * | Condition                          | Bypass tentative? | Rationale                    |
          * |------------------------------------|-------------------|------------------------------|
@@ -295,11 +307,20 @@ class ReacquisitionEngine(
         // Cold-start the OnlineClassifier with frozen negatives so it has a
         // decision boundary from frame 1 of search, not after waiting for
         // ≥3 confirmed scene negatives during VT tracking.
+        // Subsample to CLASSIFIER_COLD_START_NEGATIVES to bound class imbalance
+        // (5 pos : 1500 neg → 5 pos : 100 neg). Deterministic shuffle seeded
+        // by trackingId so the same lock always picks the same subset (test
+        // reproducibility). The full frozen pool is still used for the adaptive
+        // floor — only classifier training is bounded.
         if (frozenNegativesMobileNet.isNotEmpty() && _embeddingGallery.size >= 3) {
-            _classifier.train(_embeddingGallery, frozenNegativesMobileNet)
+            val negSample = if (frozenNegativesMobileNet.size > CLASSIFIER_COLD_START_NEGATIVES) {
+                frozenNegativesMobileNet.shuffled(java.util.Random(trackingId.toLong()))
+                    .take(CLASSIFIER_COLD_START_NEGATIVES)
+            } else frozenNegativesMobileNet
+            _classifier.train(_embeddingGallery, negSample)
             if (_classifier.isTrained) {
                 _lastTrainPositives = _embeddingGallery.size
-                _lastTrainNegatives = frozenNegativesMobileNet.size
+                _lastTrainNegatives = negSample.size
             }
         }
 
