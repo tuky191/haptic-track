@@ -1,0 +1,121 @@
+115018_967 SESSION START: id=84 label=person time=20260425_115018
+115018_970 LOCK id=84 label=person box=RectF(0.0, 0.16060962, 0.9796875, 0.99413836) gallery=5 colorHist=true attrs="man, short sleeves, shorts/skirt, long hair, orange/blue"
+115019_341 FRAME LOCK: 115018_971_LOCK.png + 115018_971_LOCK_raw.png (1 detections) id=84 label=person gallery=5
+115028_090 [Reacq] LOST id=84 (lockedLabel="person") — starting search. 0 candidates in frame
+115028_091 [Reacq] SEARCH frame=1 posConf=0.967 posThresh=0.292 gallery=12 candidates=0
+115028_091 LOST lockedLabel=person 0 candidates
+115028_468 [Reacq] SEARCH frame=11 posConf=0.633 posThresh=0.708 gallery=12 candidates=0
+115028_469 SEARCH frame=11 candidates=0 sameLabelMatch=false
+115028_475 FRAME LOST: 115028_091_LOST.png + 115028_091_LOST_raw.png (0 detections) label=person
+115028_862 [Reacq] SEARCH frame=21 posConf=0.300 posThresh=1.125 gallery=12 candidates=0
+115028_862 SEARCH frame=21 candidates=0 sameLabelMatch=false
+115028_894 FRAME SEARCH: 115028_429_SEARCH.png + 115028_429_SEARCH_raw.png (0 detections) frame=10 match=[none]
+115029_099 [Reacq]   rejected id=104 label="potted plant" sim=n/a (hard threshold)
+115029_186 [Reacq]   rejected id=104 label="potted plant" sim=n/a (hard threshold)
+115029_224 [Reacq]   rejected id=104 label="potted plant" sim=0.034 (hard threshold)
+115029_263 FRAME SEARCH: 115028_824_SEARCH.png + 115028_824_SEARCH_raw.png (0 detections) frame=20 match=[none]
+115029_306 [Reacq]   rejected id=104 label="potted plant" sim=0.046 (hard threshold)
+115029_389 [Reacq] SEARCH frame=31 posConf=0.000 posThresh=1.500 gallery=12 candidates=1
+115029_389 [Reacq]   candidate id=104 label="potted plant" conf=0.554 sim=0.070 box=[0.05,0.66,0.47,1.00]
+115029_390 [Reacq]   rejected id=104 label="potted plant" sim=0.070 (hard threshold)
+115029_390 SEARCH frame=31 candidates=1 sameLabelMatch=false
+115029_470 [Reacq]   rejected id=104 label="person" sim=0.052 (hard threshold)
+115029_470 [Reacq]   rejected id=105 label="potted plant" sim=n/a (hard threshold)
+115029_676 FRAME SEARCH: 115029_308_SEARCH.png + 115029_308_SEARCH_raw.png (1 detections) frame=30 match=[none]
+115029_703 [Reacq]   scored id=104 label="person" score=0.387 sim=0.154 color=0.393 reId=0.785 face=0.187 margin=-0.213 cls=0.033 (min=0.450)
+115029_774 [Reacq]   scored id=104 label="person" score=0.417 sim=0.151 color=0.583 attrs=0.714 reId=0.807 face=0.147 margin=-0.006 cls=0.032 (min=0.450)
+115029_864 [Reacq]   scored id=104 label="person" score=0.387 sim=0.154 color=0.393 reId=0.785 face=0.187 margin=-0.213 cls=0.033 (min=0.450)
+115029_943 [Reacq]   scored id=104 label="person" score=0.427 sim=0.177 color=0.437 attrs=0.725 reId=0.725 face=0.236 margin=-0.247 cls=0.033 (min=0.450)
+115030_016 FRAME SEARCH: 115029_471_SEARCH.png + 115029_471_SEARCH_raw.png (2 detections) frame=32 match=[#104 58%]
+115030_176 [Reacq]   scored id=104 label="person" score=0.599 sim=0.794 color=0.657 reId=0.864 face=0.456 margin=0.621 cls=0.027 (min=0.450)
+115030_176 [Reacq] REACQUIRE id=104 label="person" after 37 frames (lockedLabel="person") sim=0.794 reId=0.864 face=0.456 box=[0.01,0.33,0.96,1.00]
+115030_197 REACQUIRE id=104 label=person after 36 frames box=RectF(0.0078125, 0.32942554, 0.9578125, 0.996483)
+115030_342 FRAME SEARCH: 115029_704_SEARCH.png + 115029_704_SEARCH_raw.png (1 detections) frame=33 match=[#104 73%]
+115030_737 FRAME SEARCH: 115029_777_SEARCH.png + 115029_777_SEARCH_raw.png (1 detections) frame=34 match=[#104 62%]
+115031_088 FRAME SEARCH: 115029_867_SEARCH.png + 115029_867_SEARCH_raw.png (1 detections) frame=35 match=[#104 73%]
+115031_439 FRAME SEARCH: 115029_944_SEARCH.png + 115029_944_SEARCH_raw.png (1 detections) frame=36 match=[#104 88%]
+115031_850 FRAME REACQUIRE: 115030_199_REACQUIRE.png + 115030_199_REACQUIRE_raw.png (1 detections) after 36 frames, id=104 label=person
+115034_322 [Reacq] LOST id=104 (lockedLabel="person") — starting search. 1 candidates in frame
+115034_322 [Reacq] SEARCH frame=1 posConf=0.967 posThresh=0.292 gallery=12 candidates=1
+115034_322 [Reacq]   candidate id=109 label="potted plant" conf=0.520 box=[0.67,0.01,1.00,0.99]
+115034_322 [Reacq]   rejected id=109 label="potted plant" sim=n/a (hard threshold)
+115034_322 LOST lockedLabel=person 1 candidates
+115034_359 [Reacq]   rejected id=109 label="potted plant" sim=n/a (hard threshold)
+115034_446 [Reacq]   rejected id=109 label="potted plant" sim=n/a (hard threshold)
+115034_634 [Reacq]   rejected id=110 label="refrigerator" sim=n/a (hard threshold)
+115034_722 [Reacq]   rejected id=110 label="refrigerator" sim=n/a (hard threshold)
+115034_732 FRAME LOST: 115034_323_LOST.png + 115034_323_LOST_raw.png (1 detections) label=person
+115034_807 [Reacq] SEARCH frame=11 posConf=0.633 posThresh=0.708 gallery=12 candidates=0
+115034_807 SEARCH frame=11 candidates=0 sameLabelMatch=false
+115034_889 [Reacq]   rejected id=111 label="bowl" sim=n/a (hard threshold)
+115034_967 [Reacq]   rejected id=111 label="bowl" sim=0.219 (hard threshold)
+115035_180 FRAME SEARCH: 115034_766_SEARCH.png + 115034_766_SEARCH_raw.png (0 detections) frame=10 match=[none]
+115035_196 [Reacq]   rejected id=112 label="airplane" sim=n/a (hard threshold)
+115035_322 [Reacq] SEARCH frame=21 posConf=0.300 posThresh=1.125 gallery=12 candidates=0
+115035_322 SEARCH frame=21 candidates=0 sameLabelMatch=false
+115035_619 [Reacq]   OVERRIDE size: ratio=7.381 > thresh=5.467, but sim=0.881
+115035_619 [Reacq]   scored id=113 label="person" score=0.811 sim=0.098 color=0.725 reId=0.881 margin=-0.152 cls=0.033 (min=0.450)
+115035_628 FRAME SEARCH: 115035_284_SEARCH.png + 115035_284_SEARCH_raw.png (0 detections) frame=20 match=[none]
+115035_711 [Reacq]   scored id=113 label="person" score=0.840 sim=0.098 color=0.725 attrs=0.898 reId=0.881 margin=-0.152 cls=0.033 (min=0.450)
+115035_912 [Reacq]   scored id=113 label="person" score=0.605 sim=0.737 color=0.658 reId=0.822 face=0.486 margin=0.650 cls=0.030 (min=0.450)
+115035_912 [Reacq] REACQUIRE id=113 label="person" after 28 frames (lockedLabel="person") sim=0.737 reId=0.822 face=0.486 box=[0.00,0.36,0.69,1.00]
+115035_931 REACQUIRE id=113 label=person after 27 frames box=RectF(0.0, 0.35638922, 0.6921875, 0.99765533)
+115035_950 FRAME SEARCH: 115035_621_SEARCH.png + 115035_621_SEARCH_raw.png (1 detections) frame=26 match=[#113 62%]
+115036_355 FRAME SEARCH: 115035_713_SEARCH.png + 115035_713_SEARCH_raw.png (1 detections) frame=27 match=[#113 84%]
+115036_719 FRAME REACQUIRE: 115035_931_REACQUIRE.png + 115035_931_REACQUIRE_raw.png (1 detections) after 27 frames, id=113 label=person
+115038_183 [Reacq] LOST id=113 (lockedLabel="person") — starting search. 1 candidates in frame
+115038_183 [Reacq] SEARCH frame=1 posConf=0.967 posThresh=0.292 gallery=12 candidates=1
+115038_184 [Reacq]   candidate id=116 label="potted plant" conf=0.533 box=[0.29,0.56,0.92,1.00]
+115038_184 [Reacq]   rejected id=116 label="potted plant" sim=n/a (hard threshold)
+115038_184 LOST lockedLabel=person 1 candidates
+115038_235 [Reacq]   rejected id=116 label="potted plant" sim=n/a (hard threshold)
+115038_318 [Reacq]   rejected id=116 label="potted plant" sim=n/a (hard threshold)
+115038_531 FRAME LOST: 115038_185_LOST.png + 115038_185_LOST_raw.png (1 detections) label=person
+115038_554 [Reacq]   rejected id=117 label="potted plant" sim=n/a (hard threshold)
+115038_697 [Reacq] SEARCH frame=11 posConf=0.633 posThresh=0.708 gallery=12 candidates=0
+115038_697 SEARCH frame=11 candidates=0 sameLabelMatch=false
+115039_034 FRAME SEARCH: 115038_660_SEARCH.png + 115038_660_SEARCH_raw.png (0 detections) frame=10 match=[none]
+115039_063 [Reacq] SEARCH frame=21 posConf=0.300 posThresh=1.125 gallery=12 candidates=0
+115039_064 SEARCH frame=21 candidates=0 sameLabelMatch=false
+115039_216 [Reacq]   rejected id=118 label="potted plant" sim=n/a (hard threshold)
+115039_410 FRAME SEARCH: 115039_024_SEARCH.png + 115039_024_SEARCH_raw.png (0 detections) frame=20 match=[none]
+115039_496 [Reacq]   scored id=119 label="person" score=0.484 sim=0.626 color=0.455 reId=0.845 face=0.305 margin=0.135 cls=0.032 (min=0.450)
+115039_575 [Reacq]   scored id=119 label="person" score=0.506 sim=0.626 color=0.455 attrs=0.750 reId=0.845 face=0.305 margin=0.135 cls=0.032 (min=0.450)
+115039_664 [Reacq]   scored id=119 label="person" score=0.483 sim=0.626 color=0.455 reId=0.845 face=0.305 margin=0.135 cls=0.032 (min=0.450)
+115039_664 [Reacq] CONFIRMED: id=119 label="person" sim=0.626 after 3 frames
+115039_664 [Reacq] REACQUIRE id=119 label="person" after 29 frames (lockedLabel="person") sim=0.626 reId=0.845 face=0.305 box=[0.00,0.37,0.95,1.00]
+115039_692 REACQUIRE id=119 label=person after 28 frames box=RectF(0.003125, 0.3669402, 0.946875, 1.0)
+115039_895 FRAME SEARCH: 115039_498_SEARCH.png + 115039_498_SEARCH_raw.png (1 detections) frame=27 match=[#119 73%]
+115040_264 FRAME SEARCH: 115039_576_SEARCH.png + 115039_576_SEARCH_raw.png (1 detections) frame=28 match=[#119 87%]
+115040_698 FRAME REACQUIRE: 115039_693_REACQUIRE.png + 115039_693_REACQUIRE_raw.png (1 detections) after 28 frames, id=119 label=person
+115046_843 [Reacq] LOST id=119 (lockedLabel="person") — starting search. 1 candidates in frame
+115046_843 [Reacq] SEARCH frame=1 posConf=0.967 posThresh=0.292 gallery=12 candidates=1
+115046_843 [Reacq]   candidate id=127 label="bowl" conf=0.599 box=[0.79,0.77,1.00,1.00]
+115046_844 [Reacq]   rejected id=127 label="bowl" sim=n/a (hard threshold)
+115046_844 LOST lockedLabel=person 1 candidates
+115046_886 [Reacq]   rejected id=127 label="bowl" sim=n/a (hard threshold)
+115046_970 [Reacq]   rejected id=127 label="bowl" sim=n/a (hard threshold)
+115047_271 FRAME LOST: 115046_844_LOST.png + 115046_844_LOST_raw.png (1 detections) label=person
+115047_278 [Reacq] SEARCH frame=11 posConf=0.633 posThresh=0.708 gallery=12 candidates=0
+115047_278 SEARCH frame=11 candidates=0 sameLabelMatch=false
+115047_402 [Reacq]   rejected id=128 label="bowl" sim=n/a (hard threshold)
+115047_516 [Reacq]   rejected id=129 label="toothbrush" sim=n/a (hard threshold)
+115047_656 FRAME SEARCH: 115047_241_SEARCH.png + 115047_241_SEARCH_raw.png (0 detections) frame=10 match=[none]
+115047_749 [Reacq] SEARCH frame=21 posConf=0.300 posThresh=1.125 gallery=12 candidates=0
+115047_750 SEARCH frame=21 candidates=0 sameLabelMatch=false
+115048_123 FRAME SEARCH: 115047_711_SEARCH.png + 115047_711_SEARCH_raw.png (0 detections) frame=20 match=[none]
+115048_147 [Reacq] SEARCH frame=31 posConf=0.000 posThresh=1.500 gallery=12 candidates=0
+115048_147 SEARCH frame=31 candidates=0 sameLabelMatch=false
+115048_371 [Reacq]   rejected id=130 label="person" sim=0.102 (hard threshold)
+115048_530 FRAME SEARCH: 115048_105_SEARCH.png + 115048_105_SEARCH_raw.png (0 detections) frame=30 match=[none]
+115048_575 [Reacq]   scored id=130 label="person" score=0.323 sim=0.420 color=0.500 reId=0.617 face=0.147 margin=0.435 cls=0.028 (min=0.450)
+115048_752 [Reacq]   rejected id=130 label="person" sim=0.102 (hard threshold)
+115048_752 [Reacq]   scored id=131 label="person" score=0.601 sim=0.519 color=0.376 reId=0.632 margin=0.509 cls=0.031 (min=0.450)
+115048_835 [Reacq]   scored id=131 label="person" score=0.600 sim=0.519 color=0.376 reId=0.632 margin=0.509 cls=0.031 (min=0.450)
+115048_888 FRAME SEARCH: 115048_372_SEARCH.png + 115048_372_SEARCH_raw.png (1 detections) frame=34 match=[#130 66%]
+115048_919 [Reacq]   scored id=131 label="person" score=0.599 sim=0.519 color=0.376 reId=0.632 margin=0.509 cls=0.031 (min=0.450)
+115048_919 [Reacq] CONFIRMED: id=131 label="person" sim=0.519 after 3 frames
+115048_919 [Reacq] REACQUIRE id=131 label="person" after 38 frames (lockedLabel="person") sim=0.519 reId=0.632 box=[0.07,0.41,0.98,1.00]
+115048_939 REACQUIRE id=131 label=person after 37 frames box=RectF(0.0734375, 0.41148886, 0.984375, 0.99531066)
+115049_069 CLEAR by user
+115049_069 SESSION END
