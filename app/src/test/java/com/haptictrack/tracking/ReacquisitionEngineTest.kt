@@ -1482,6 +1482,70 @@ class ReacquisitionEngineTest {
         assertFalse("Classifier should be cleared after new lock", engine.classifierTrained)
     }
 
+    // --- Frozen-negatives / adaptive floor (#68) ---
+
+    @Test
+    fun `adaptive floor cold-starts classifier from frame 1 with frozen negatives`() {
+        // Without frozen negatives the classifier needs ≥3 positives + ≥3 confirmed
+        // scene negatives (collected only during VT tracking) before training.
+        // With frozen negatives it should be trained immediately at lock().
+        val gallery = (0..4).map { floatArrayOf(1f, 0f, it * 0.01f, 0f) }
+        val frozen = (0..9).map { i -> floatArrayOf(0f, 1f, i * 0.01f, 0f) }
+
+        val engineWithFrozen = ReacquisitionEngine(frozenNegativesMobileNet = frozen)
+        engineWithFrozen.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", gallery)
+        assertTrue("Classifier should be trained at lock time when frozen negatives are loaded",
+            engineWithFrozen.classifierTrained)
+
+        // Default engine (no frozen) should NOT have a trained classifier yet.
+        val engineDefault = ReacquisitionEngine()
+        engineDefault.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", gallery)
+        assertFalse("Classifier should NOT be trained without frozen negatives + scene negatives",
+            engineDefault.classifierTrained)
+    }
+
+    @Test
+    fun `adaptive floor rejects below-noise candidates and accepts above-noise ones`() {
+        // Lock gallery aligned with [1,0,0,0]. Frozen negatives all near [0,1,0,0]
+        // — the floor learns "scene-like stuff scores ~0 against this gallery."
+        val gallery = (0..4).map { floatArrayOf(1f, 0.05f * it, 0f, 0f) }
+        val frozen = (0..49).map { i -> floatArrayOf(0.02f * i, 1f, 0f, 0f) }
+
+        val engine = ReacquisitionEngine(frozenNegativesMobileNet = frozen)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", gallery)
+        engine.processFrame(emptyList()) // enter search
+
+        // Candidate that looks like the negatives (near [0,1,0,0]): below floor → reject.
+        val belowNoise = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "cup", embedding = floatArrayOf(0.05f, 1f, 0f, 0f))
+        // Candidate that clearly looks like the gallery: well above floor → score.
+        val aboveNoise = obj(id = 66, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "cup", embedding = floatArrayOf(0.95f, 0.1f, 0f, 0f))
+
+        assertNull("Noise-like candidate should be rejected by adaptive floor",
+            engine.scoreCandidate(belowNoise, engine.lastKnownBox!!))
+        assertNotNull("Gallery-like candidate should clear the adaptive floor",
+            engine.scoreCandidate(aboveNoise, engine.lastKnownBox!!))
+    }
+
+    @Test
+    fun `adaptive floor not active when no frozen negatives provided`() {
+        // Default engine (no frozen) falls back to static MIN_EMBEDDING_SIMILARITY
+        // / gallery-relative behavior — existing tests verify this path. Here we
+        // just confirm a low-sim candidate isn't auto-rejected by an undefined floor.
+        val gallery = listOf(floatArrayOf(1f, 0f, 0f, 0f))
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", gallery)
+        engine.processFrame(emptyList())
+
+        val midSim = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "cup", embedding = floatArrayOf(0.6f, 0.4f, 0f, 0f))
+        // Without frozen negatives, fallback floor for a small gallery (galleryMature=false)
+        // is min(_minGallerySim * 0.75, 0.5) clamped above 0.3. Since gallery has 1 entry,
+        // _minGallerySim defaults to 1.0 → adaptive floor 0.5. Candidate sim ~0.83 → passes.
+        assertNotNull("Reasonable-sim candidate should pass without frozen-negatives floor",
+            engine.scoreCandidate(midSim, engine.lastKnownBox!!))
+    }
+
     /** Feed the same detections for N frames to satisfy tentative confirmation. */
     private fun processFramesUntilReacquire(
         detections: List<TrackedObject>,

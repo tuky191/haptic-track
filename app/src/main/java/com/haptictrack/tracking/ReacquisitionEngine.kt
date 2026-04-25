@@ -23,7 +23,16 @@ class ReacquisitionEngine(
     val minScoreThreshold: Float = 0.45f,
     val positionDecayFrames: Int = 30,
     /** Optional session logger — writes to both logcat and session log file. */
-    var sessionLogger: ((String) -> Unit)? = null
+    var sessionLogger: ((String) -> Unit)? = null,
+    /**
+     * Pre-computed background-scene MobileNetV3 embeddings used at lock time
+     * to (a) cold-start the [OnlineClassifier] and (b) derive a per-lock
+     * adaptive embedding floor. Empty list = use static floors (#67 PR1).
+     * Loaded by [FrozenNegatives] from `assets/frozen_negatives_mnv3.bin`.
+     */
+    private val frozenNegativesMobileNet: List<FloatArray> = emptyList(),
+    /** Pre-computed background OSNet embeddings; same role for the person-reId path. */
+    private val frozenNegativesOsnet: List<FloatArray> = emptyList()
 ) {
 
     companion object {
@@ -62,6 +71,18 @@ class ReacquisitionEngine(
         /** Maximum negative examples to store. */
         const val MAX_NEGATIVE_EXAMPLES = 10
         /**
+         * Max frozen negatives used for OnlineClassifier cold-start at lock time.
+         * The full frozen-negatives asset (~1500) is used for adaptive-floor
+         * statistics (mean+0.5σ benefits from larger sample). For classifier
+         * training we deliberately subsample — a 5-positive vs 1500-negative
+         * imbalance (300:1) lets the gradient be dominated by negatives, and
+         * with `gradB / n` normalization the positive class gets undertrained.
+         * 100 negatives keeps the imbalance to 20:1, which the existing L2
+         * regularization handles. Also bounds train time at lock to ~10ms.
+         * Reviewer flag #3 on PR #79.
+         */
+        const val CLASSIFIER_COLD_START_NEGATIVES = 100
+        /**
          * Tentative bypass decision table:
          * | Condition                          | Bypass tentative? | Rationale                    |
          * |------------------------------------|-------------------|------------------------------|
@@ -78,6 +99,24 @@ class ReacquisitionEngine(
         const val TENTATIVE_IOU_THRESHOLD = 0.3f
         /** Lowe's ratio test: reject when secondBestSim / bestSim exceeds this (SIFT-style). */
         const val RATIO_TEST_THRESHOLD = 0.85f
+
+        /** MobileNetV3-Large embedding dimension for frozen-negatives asset validation. */
+        const val MOBILENET_EMBED_DIM = 1280
+        /** OSNet x1.0 embedding dimension for frozen-negatives asset validation. */
+        const val OSNET_EMBED_DIM = 512
+
+        /**
+         * Production factory that loads the bundled frozen-negatives assets.
+         * Tests should use the default constructor (no negatives → static floors).
+         */
+        fun create(context: android.content.Context): ReacquisitionEngine {
+            val mnv3 = FrozenNegatives.load(context, "frozen_negatives_mnv3.bin", MOBILENET_EMBED_DIM)
+            val osnet = FrozenNegatives.load(context, "frozen_negatives_osnet.bin", OSNET_EMBED_DIM)
+            return ReacquisitionEngine(
+                frozenNegativesMobileNet = mnv3,
+                frozenNegativesOsnet = osnet
+            )
+        }
     }
 
     var lockedId: Int? = null
@@ -112,6 +151,15 @@ class ReacquisitionEngine(
     /** Minimum pairwise sim within gallery — drives adaptive embedding floor. */
     private var _minGallerySim: Float = 1f
     private fun recomputeMinGallerySim() { _minGallerySim = minPairwiseSimilarity(_embeddingGallery) }
+
+    /**
+     * Per-lock adaptive embedding floors derived from the gallery → frozen-negatives
+     * similarity distribution at lock time. Replaces the static [MIN_EMBEDDING_SIMILARITY]
+     * and [PERSON_REID_FLOOR] when frozen negatives are loaded. Null when no asset is
+     * available — the engine then falls back to the static floors.
+     */
+    private var _adaptiveMobileNetFloor: Float? = null
+    private var _adaptiveOsnetFloor: Float? = null
 
     /** Online classifier trained from gallery (positives) + scene negatives. */
     private val _classifier = OnlineClassifier()
@@ -242,8 +290,46 @@ class ReacquisitionEngine(
         framesLost = 0
         tentativeBox = null
         tentativeCount = 0
+
+        // Derive per-lock adaptive floors from the gallery → frozen-negatives
+        // similarity distribution. Floor sits at "mean + 0.5σ" of false-match
+        // similarities — i.e. just above the typical random-scene noise level
+        // for THIS lock's gallery. Clamped to a sane band.
+        _adaptiveMobileNetFloor = if (frozenNegativesMobileNet.isNotEmpty() && _embeddingGallery.isNotEmpty()) {
+            computeAdaptiveFloor(_embeddingGallery, frozenNegativesMobileNet)
+                .coerceIn(0.20f, 0.55f)
+        } else null
+        _adaptiveOsnetFloor = if (frozenNegativesOsnet.isNotEmpty() && lockedReIdEmbedding != null) {
+            computeAdaptiveFloor(listOf(lockedReIdEmbedding!!), frozenNegativesOsnet)
+                .coerceIn(0.30f, 0.60f)
+        } else null
+
+        // Cold-start the OnlineClassifier with frozen negatives so it has a
+        // decision boundary from frame 1 of search, not after waiting for
+        // ≥3 confirmed scene negatives during VT tracking.
+        // Subsample to CLASSIFIER_COLD_START_NEGATIVES to bound class imbalance
+        // (5 pos : 1500 neg → 5 pos : 100 neg). Deterministic shuffle seeded
+        // by trackingId so the same lock always picks the same subset (test
+        // reproducibility). The full frozen pool is still used for the adaptive
+        // floor — only classifier training is bounded.
+        if (frozenNegativesMobileNet.isNotEmpty() && _embeddingGallery.size >= 3) {
+            val negSample = if (frozenNegativesMobileNet.size > CLASSIFIER_COLD_START_NEGATIVES) {
+                frozenNegativesMobileNet.shuffled(java.util.Random(trackingId.toLong()))
+                    .take(CLASSIFIER_COLD_START_NEGATIVES)
+            } else frozenNegativesMobileNet
+            _classifier.train(_embeddingGallery, negSample)
+            if (_classifier.isTrained) {
+                _lastTrainPositives = _embeddingGallery.size
+                _lastTrainNegatives = negSample.size
+            }
+        }
+
         val attrStr = personAttrs?.summary() ?: "n/a"
-        dualLog(Log.INFO, "LOCK id=$trackingId label=\"$label\" box=${fmtBox(boundingBox)} size=${fmtF(lastKnownSize)} gallery=${embeddingGallery.size} colorHist=${colorHist != null} attrs=\"$attrStr\"")
+        val floorStr = buildString {
+            _adaptiveMobileNetFloor?.let { append(" mnv3Floor=${fmtF(it)}") }
+            _adaptiveOsnetFloor?.let { append(" osnetFloor=${fmtF(it)}") }
+        }
+        dualLog(Log.INFO, "LOCK id=$trackingId label=\"$label\" box=${fmtBox(boundingBox)} size=${fmtF(lastKnownSize)} gallery=${embeddingGallery.size} colorHist=${colorHist != null} attrs=\"$attrStr\"$floorStr")
     }
 
     /** Add a face embedding progressively (e.g. when face first appears during tracking). */
@@ -278,6 +364,8 @@ class ReacquisitionEngine(
         _embeddingGallery.clear()
         _embeddingCentroid = null
         _minGallerySim = 1f
+        _adaptiveMobileNetFloor = null
+        _adaptiveOsnetFloor = null
         _negativeExamples.clear()
         _negativeCentroid = null
         _classifier.clear()
@@ -547,14 +635,16 @@ class ReacquisitionEngine(
         val galleryMature = _embeddingGallery.size >= 8
 
         // --- GATE: Embedding floor ---
-        // For OSNet-gated persons: static floor tuned for Market-1501-style cosine
-        // distribution (typical same-person >= 0.5, different-person <= 0.4).
-        // For MobileNetV3-gated everything else: adaptive floor relative to gallery.
+        // Prefer the per-lock adaptive floor derived from gallery → frozen-negatives
+        // distribution at lock time (#68). Falls back to static floors when no
+        // frozen-negatives asset is loaded.
         val embeddingFloor = if (hasReId) {
-            PERSON_REID_FLOOR
+            _adaptiveOsnetFloor ?: PERSON_REID_FLOOR
         } else {
-            val adaptiveFloor = (_minGallerySim * 0.75f).coerceIn(0.3f, 0.5f)
-            if (galleryMature) maxOf(adaptiveFloor, 0.4f) else adaptiveFloor
+            _adaptiveMobileNetFloor ?: run {
+                val adaptiveFloor = (_minGallerySim * 0.75f).coerceIn(0.3f, 0.5f)
+                if (galleryMature) maxOf(adaptiveFloor, 0.4f) else adaptiveFloor
+            }
         }
         // Don't poison the negative pool with rejections during search — when
         // the floor is misconfigured (failure case), the locked person gets
@@ -766,6 +856,27 @@ class ReacquisitionEngine(
         if (_embeddingGallery.isEmpty()) return 0f
         val lockEntries = _embeddingGallery.take(LOCK_AUGMENTATION_COUNT)
         return bestGallerySimilarity(candidateEmbedding, lockEntries)
+    }
+
+    /**
+     * Adaptive floor: for each negative, find its closest match in the positive
+     * gallery (same operation the gate runs on real candidates). Return
+     * `mean + 0.5σ` of that distribution — the floor that typical random-scene
+     * stuff would clear by chance. Anything above this is meaningfully more
+     * similar than scene noise.
+     */
+    private fun computeAdaptiveFloor(positives: List<FloatArray>, negatives: List<FloatArray>): Float {
+        if (positives.isEmpty() || negatives.isEmpty()) return Float.NaN
+        val sims = FloatArray(negatives.size) { i ->
+            bestGallerySimilarity(negatives[i], positives)
+        }
+        var sum = 0f
+        for (s in sims) sum += s
+        val mean = sum / sims.size
+        var sqSum = 0f
+        for (s in sims) sqSum += (s - mean) * (s - mean)
+        val std = kotlin.math.sqrt(sqSum / sims.size)
+        return mean + 0.5f * std
     }
 
     /**
