@@ -13,7 +13,7 @@ import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetectorResult
 class ObjectTracker(
     context: Context,
     private val onLoadingStatus: ((String) -> Unit)? = null,
-    val reacquisition: ReacquisitionEngine = ReacquisitionEngine(),
+    val reacquisition: ReacquisitionEngine = ReacquisitionEngine.create(context),
     val filter: DetectionFilter = DetectionFilter(),
     private val frameTracker: FrameToFrameTracker = FrameToFrameTracker(),
     val debugCapture: DebugFrameCapture = DebugFrameCapture(context),
