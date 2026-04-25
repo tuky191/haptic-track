@@ -74,14 +74,18 @@ class ObjectTracker(
      * so it catches drift even when the detector can't see the target
      * (small objects, uniform surfaces, label flicker).
      *
-     * Asymmetric thresholds (hysteresis): increment the counter when sim falls
-     * below TEMPLATE_SIM_LOW, reset only when sim rises above TEMPLATE_SIM_OK.
-     * This prevents oscillation around a single threshold from masking drift.
+     * Hysteresis: increment when sim < TEMPLATE_SIM_LOW, decrement (not reset)
+     * when sim > TEMPLATE_SIM_OK. The decrement-instead-of-reset semantics
+     * (#80 fix) means a single high-sim flicker doesn't undo two prior bad
+     * frames. Counter still trips at TEMPLATE_MISMATCH_MAX consecutive-ish
+     * low frames, but is robust to occasional flukes — exactly the case
+     * where the camera pans to uniform backdrop and sim flickers between
+     * 0.3 and 0.5.
      */
     private val TEMPLATE_CHECK_INTERVAL = 5    // embed VT crop every N frames
     private val TEMPLATE_SIM_LOW = 0.4f        // below this = drift suspicion (increment)
-    private val TEMPLATE_SIM_OK = 0.5f         // above this = safe (reset counter)
-    private val TEMPLATE_MISMATCH_MAX = 3      // consecutive low-sim checks → kill (≈0.5s)
+    private val TEMPLATE_SIM_OK = 0.5f         // above this = safe (decrement, floored at 0)
+    private val TEMPLATE_MISMATCH_MAX = 3      // mismatches → kill (≈0.5s)
     private var templateMismatchCount = 0
 
     /**
@@ -470,22 +474,33 @@ class ObjectTracker(
                     // Effective rate is every ~5 frames normally, ~10 frames when VT
                     // frame skipping is active (skipDetector=true on alternate frames).
                     //
-                    // Hysteresis: increment when sim < TEMPLATE_SIM_LOW, reset only
-                    // when sim > TEMPLATE_SIM_OK. Values in between (the dead zone)
-                    // leave the counter unchanged so marginal oscillation can't mask
-                    // real drift.
+                    // Hysteresis: increment when sim < TEMPLATE_SIM_LOW, decrement
+                    // (floored at 0) when sim > TEMPLATE_SIM_OK. Values in between
+                    // (the dead zone) leave the counter unchanged. Decrement instead
+                    // of full reset means a single high-sim flicker doesn't erase
+                    // two prior bad frames — fixes the slow-drift case in #80 where
+                    // panning to a uniform backdrop produced 0.3 / 0.5 / 0.3 / 0.5
+                    // patterns that kept the counter pinned at 1/3.
                     if (!skipDetector &&
                         reacquisition.hasEmbeddings &&
                         vtFrameCounter % TEMPLATE_CHECK_INTERVAL == 0) {
                         val curEmb = appearanceEmbedder.embedWithFallback(bitmap, rawBox)
                         if (curEmb != null) {
-                            val sim = reacquisition.bestGallerySimilarity(curEmb)
+                            // Use lock-time gallery only — accumulated entries
+                            // can include drifted VT crops that mask the drift
+                            // signal at sim=1.0. (#80)
+                            val sim = reacquisition.bestLockGallerySimilarity(curEmb)
                             when {
                                 sim < TEMPLATE_SIM_LOW -> {
                                     templateMismatchCount++
                                     android.util.Log.d("VisualTracker", "Template mismatch $templateMismatchCount/$TEMPLATE_MISMATCH_MAX (sim=${"%.3f".format(sim)})")
                                 }
-                                sim > TEMPLATE_SIM_OK -> templateMismatchCount = 0
+                                sim > TEMPLATE_SIM_OK -> {
+                                    if (templateMismatchCount > 0) {
+                                        templateMismatchCount--
+                                        android.util.Log.d("VisualTracker", "Template recovery $templateMismatchCount/$TEMPLATE_MISMATCH_MAX (sim=${"%.3f".format(sim)})")
+                                    }
+                                }
                                 else -> { /* dead zone — hold the counter */ }
                             }
                         }
