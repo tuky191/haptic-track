@@ -316,7 +316,14 @@ class SurfaceTextureFrameReader(
         glThread?.join(2000)
         glThread = null
         latestFrame.getAndSet(null)?.let { processingPool.release(it) }
-        inflightViewfinder.forEach { viewfinderPool.release(it) }
+        // Drop inflight references but DO NOT recycle them — the most recent
+        // inflight bitmap is what Compose is currently painting. Recycling it
+        // crashes the Compose draw thread with "Canvas: trying to use a recycled
+        // bitmap" (observed on camera switch where stop() runs before Compose
+        // can swap to a new bitmap). GC reclaims them once Compose drops its
+        // last reference.
+        // The pool's free deque is safe — those bitmaps were rotated out of
+        // inflight ≥2 frames ago so Compose has long since released them.
         inflightViewfinder.clear()
         processingPool.releaseAll()
         viewfinderPool.releaseAll()
