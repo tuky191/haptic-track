@@ -1125,7 +1125,7 @@ class ReacquisitionEngineTest {
     // --- Face and re-ID scoring tiers ---
 
     @Test
-    fun `face tier scores matching face higher than mismatching`() {
+    fun `face tier rejects clearly-mismatching face via face gate (#83)`() {
         val emb = floatArrayOf(0.5f, 0.5f)
         val faceEmb = floatArrayOf(0.9f, 0.3f, 0.1f)
         val reIdEmb = floatArrayOf(0.5f, 0.5f, 0.5f, 0.5f)
@@ -1139,13 +1139,16 @@ class ReacquisitionEngineTest {
             faceEmbedding = floatArrayOf(0.88f, 0.32f, 0.12f)) // high face sim
         val wrongFace = obj(id = 11, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
             label = "person", embedding = emb, reIdEmbedding = reIdEmb,
-            faceEmbedding = floatArrayOf(0.1f, 0.1f, 0.9f)) // low face sim
+            faceEmbedding = floatArrayOf(0.1f, 0.1f, 0.9f)) // low face sim — different face
 
-        val matchScore = engine.scoreCandidate(matchFace, engine.lastKnownBox!!)!!
-        val wrongScore = engine.scoreCandidate(wrongFace, engine.lastKnownBox!!)!!
+        val matchScore = engine.scoreCandidate(matchFace, engine.lastKnownBox!!)
+        val wrongScore = engine.scoreCandidate(wrongFace, engine.lastKnownBox!!)
 
-        assertTrue("Matching face ($matchScore) should beat mismatching ($wrongScore)",
-            matchScore > wrongScore)
+        // Pre-#83: face was a scoring weight, both scored, ranking favored match.
+        // Post-#83: face is a GATE — clearly mismatching face (cosine ~0.10) below
+        // FACE_FLOOR (0.40) is hard-rejected. Body re-ID match doesn't rescue it.
+        assertNotNull("Matching face should pass the face gate", matchScore)
+        assertNull("Clearly-mismatching face should be gate-rejected", wrongScore)
     }
 
     @Test
@@ -1175,7 +1178,7 @@ class ReacquisitionEngineTest {
     }
 
     @Test
-    fun `face tier takes precedence over reId tier`() {
+    fun `face gate vetoes good body when face mismatches (#83)`() {
         val emb = floatArrayOf(0.5f, 0.5f)
         val reIdEmb = floatArrayOf(0.5f, 0.5f, 0.5f, 0.5f)
         val faceEmb = floatArrayOf(0.9f, 0.3f, 0.1f)
@@ -1184,22 +1187,25 @@ class ReacquisitionEngineTest {
             reIdEmbedding = reIdEmb, faceEmbedding = faceEmb)
         engine.processFrame(emptyList())
 
-        // Good face, bad re-ID
+        // Good face, bad re-ID — but bad re-ID is now also a gate, so this fails OSNet.
+        // To test face precedence, both face AND re-ID should pass for goodFace.
         val goodFace = obj(id = 10, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
             label = "person", embedding = emb,
-            reIdEmbedding = floatArrayOf(0.1f, 0.1f, 0.1f, 0.9f), // bad re-ID
+            reIdEmbedding = floatArrayOf(0.48f, 0.52f, 0.48f, 0.52f), // re-ID passes (~0.99)
             faceEmbedding = floatArrayOf(0.88f, 0.32f, 0.12f)) // good face
-        // Bad face, good re-ID
+        // Good re-ID, bad face — face gate must veto despite passing OSNet
         val goodBody = obj(id = 11, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
             label = "person", embedding = emb,
-            reIdEmbedding = floatArrayOf(0.48f, 0.52f, 0.48f, 0.52f), // good re-ID
-            faceEmbedding = floatArrayOf(0.1f, 0.1f, 0.9f)) // bad face
+            reIdEmbedding = floatArrayOf(0.48f, 0.52f, 0.48f, 0.52f), // good re-ID (~0.99)
+            faceEmbedding = floatArrayOf(0.1f, 0.1f, 0.9f)) // bad face (cosine ~0.10)
 
-        val faceScore = engine.scoreCandidate(goodFace, engine.lastKnownBox!!)!!
-        val bodyScore = engine.scoreCandidate(goodBody, engine.lastKnownBox!!)!!
+        val faceScore = engine.scoreCandidate(goodFace, engine.lastKnownBox!!)
+        val bodyScore = engine.scoreCandidate(goodBody, engine.lastKnownBox!!)
 
-        assertTrue("Good face ($faceScore) should beat good body ($bodyScore) — face takes precedence",
-            faceScore > bodyScore)
+        // Pre-#83: face was scoring-only, good-body would still score below good-face but pass.
+        // Post-#83: face is a gate — bad face vetoes despite good body re-ID match.
+        assertNotNull("Good face + good body should pass both gates", faceScore)
+        assertNull("Bad face vetoes good body via face gate", bodyScore)
     }
 
     @Test
