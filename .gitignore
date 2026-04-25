@@ -22,3 +22,5 @@ tools/test_fixtures/*/frames/
 
 # Pulled device data (large, session-specific)
 pulled_frames/
+docs/issues/*/slow_7s_case/
+docs/issues/*/fast_3s_case/
