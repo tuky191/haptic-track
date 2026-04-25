@@ -49,6 +49,14 @@ class ReacquisitionEngine(
          *  different-person sim in [0.2, 0.4]. 0.45 sits in the gap. Tuned from a live
          *  capture where same-person reId hit 0.836 while MobileNetV3 sim was 0.558. */
         const val PERSON_REID_FLOOR = 0.45f
+        /** Face embedding (MobileFaceNet, ArcFace-style) cosine floor for person identity.
+         *  Same-person face sim typically >= 0.5; different-person face sim typically
+         *  <= 0.3. 0.4 sits in the gap. When both lock and candidate have face
+         *  embeddings, face VETOES OSNet — even a high reId sim gets rejected if face
+         *  says different. Catches the case where OSNet's whole-body sim sits in
+         *  the wrong-person 0.55-0.70 band but face cleanly separates identity.
+         *  Filed as #83. */
+        const val FACE_FLOOR = 0.40f
         /** Maximum embeddings to keep in gallery. */
         const val MAX_GALLERY_SIZE = 12
         /** Maximum negative examples to store. */
@@ -556,6 +564,23 @@ class ReacquisitionEngine(
         // with its 0.85 filter handles that).
         if (gateActive && appearanceScore < embeddingFloor) {
             return null
+        }
+
+        // --- GATE: Face identity (#83) ---
+        // When both lock and candidate have face embeddings (person-person only),
+        // face vetoes OSNet. MobileFaceNet has cleaner same/different-person
+        // separation than OSNet's whole-body re-ID — a face sim < FACE_FLOOR is
+        // strong evidence of a different person, regardless of body match.
+        // Doesn't affect candidates without face data (rejection path goes
+        // through OSNet alone in those cases).
+        val hasFaceGate = lockedIsPerson && candidateIsPerson &&
+            lockedFaceEmbedding != null && candidate.faceEmbedding != null
+        if (hasFaceGate) {
+            val faceSim = cosineSimilarity(lockedFaceEmbedding!!, candidate.faceEmbedding!!).coerceIn(0f, 1f)
+            if (faceSim < FACE_FLOOR) {
+                dualLog(Log.DEBUG, "  FACE_GATE_REJECT: faceSim=${fmtF(faceSim)} < ${fmtF(FACE_FLOOR)} (reIdSim=${fmtF(reIdScore)})")
+                return null
+            }
         }
 
         // Tiered override: geometric gates use a lower threshold (0.55) because
