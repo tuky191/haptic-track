@@ -348,8 +348,8 @@ Three-stage cycle on volume-down: idle → lock on center object, tracking → s
 ### GPU delegate for all models (decided 2026-04-18, updated 2026-04-19)
 All 9 ML models run on GPU. EfficientDet-Lite2 switched from INT8 (CPU) to FP16 (GPU) — downloaded from MediaPipe model zoo, same structure (448x448, 90 classes), fewer spurious detections. TFLite models use `createGpuInterpreter()` which returns `GpuInterpreter` (interpreter + delegate pair) with `Throwable` catch for CPU fallback. MediaPipe models use `Delegate.GPU` via `BaseOptions.setDelegate()`. InteractiveSegmenter GPU has a crop size limit — Adreno 740 returns empty masks above ~100K pixels, so large crops are downscaled to ~300x300 before segmenting (MAX_SEGMENT_PIXELS = 90000).
 
-### Adaptive frame skipping during visual tracking (decided 2026-04-18)
-When VitTracker is confident (>0.6) and has 5+ confirmed frames with 0 unconfirmed, skip the EfficientDet detector every other frame. VT alone runs at ~5ms vs ~35ms for detector. Still runs detector every 2nd frame for drift detection. Saves ~50% detector compute while locked. Resets on drift, lock clear, or VT stop.
+### Adaptive frame skipping during visual tracking (decided 2026-04-18, widened 2026-04-24)
+Two-tier skip interval. **Base regime** (confidence >0.6, confirmed ≥5, 0 unconfirmed): run detector every 2nd frame (~50% skipped). **Stable regime** (confidence >0.7, confirmed ≥10): run detector every 3rd frame (~67% skipped). VT alone runs at ~5ms vs ~35ms for detector. Template self-verification (#45, every 5 frames) is the primary drift signal now, so the detector cadence can be a slower safety net once VT has been stable for a while. Resets on drift, lock clear, or VT stop.
 
 ## Logging
 
@@ -490,8 +490,11 @@ All in constructor defaults — no settings UI yet:
 | `targetFrameOccupancy` | ZoomController | 0.15 | Target subject size as fraction of frame |
 | `zoomSpeed` | ZoomController | 0.05 | Zoom change per frame |
 | `scoreThreshold` | ObjectTracker (MediaPipe) | 0.5 | MediaPipe detector confidence cutoff |
-| `VT_SKIP_INTERVAL` | ObjectTracker | 2 | Run detector every Nth frame when VT is skipping |
+| `VT_SKIP_INTERVAL_BASE` | ObjectTracker | 2 | Default skip interval (50% detector frames) |
+| `VT_SKIP_INTERVAL_STABLE` | ObjectTracker | 3 | Widened interval when VT is long-stable (33% detector frames) |
 | `VT_SKIP_MIN_CONFIRMED` | ObjectTracker | 5 | Min VT confirmations before frame skipping kicks in |
+| `VT_SKIP_STABLE_CONFIRMED` | ObjectTracker | 10 | Confirmations required to switch to the stable skip interval |
+| `VT_SKIP_STABLE_CONFIDENCE` | ObjectTracker | 0.7 | VT confidence required to switch to the stable skip interval |
 
 ## What's Built vs. What's Not
 
