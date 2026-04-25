@@ -44,6 +44,11 @@ class ReacquisitionEngine(
          *  If the primary embedder says the candidate is a different object (sim < this),
          *  no amount of re-ID, attributes, or color can rescue it. */
         const val MIN_EMBEDDING_SIMILARITY = 0.15f
+        /** Floor for OSNet (person re-ID) cosine similarity when gating person candidates.
+         *  OSNet on Market-1501 produces same-person sim typically in [0.5, 0.85] and
+         *  different-person sim in [0.2, 0.4]. 0.45 sits in the gap. Tuned from a live
+         *  capture where same-person reId hit 0.836 while MobileNetV3 sim was 0.558. */
+        const val PERSON_REID_FLOOR = 0.45f
         /** Maximum embeddings to keep in gallery. */
         const val MAX_GALLERY_SIZE = 12
         /** Maximum negative examples to store. */
@@ -500,38 +505,65 @@ class ReacquisitionEngine(
         val candBox = candidate.boundingBox
 
         // --- Appearance signal (computed early for override checks) ---
+        // For person candidates with OSNet on both sides, gate on OSNet (a real
+        // re-ID model) instead of MobileNetV3 (a generic ImageNet classifier
+        // that's blind to person-instance identity). MobileNetV3 still drives
+        // the ranking signals for non-person candidates and for persons that
+        // didn't get OSNet computed.
+        val candidateIsPerson = candidate.label == "person"
+        val hasReId = lockedIsPerson && candidateIsPerson &&
+            lockedReIdEmbedding != null && candidate.reIdEmbedding != null
+        val reIdScore = if (hasReId) {
+            cosineSimilarity(lockedReIdEmbedding!!, candidate.reIdEmbedding!!).coerceIn(0f, 1f)
+        } else 0f
+
         val hasAppearance = hasEmbeddings && candidate.embedding != null
-        val appearanceScore = if (hasAppearance) {
+        val mobileNetScore = if (hasAppearance) {
             bestGallerySimilarity(candidate.embedding!!).coerceIn(0f, 1f)
         } else 0f
+
+        val appearanceScore = if (hasReId) reIdScore else mobileNetScore
+        val gateActive = hasReId || hasAppearance
+
         // --- GATE: Require embedding when gallery exists ---
         // If we have reference embeddings but the candidate has none (async not ready),
         // reject it — accepting without identity verification causes wrong-object locks.
-        // Always require embeddings. The async pipeline delivers within 2-3 frames.
-        // Accepting without embeddings leads to wrong-category reacquisitions
-        // (e.g. laptop accepted when tracking chair, scored on position alone).
-        if (hasEmbeddings && candidate.embedding == null) {
+        // Exception: if hasReId, OSNet alone is sufficient for the gate (the
+        // candidate has been identified by a real re-ID model).
+        if (hasEmbeddings && candidate.embedding == null && !hasReId) {
             return null
         }
         val galleryMature = _embeddingGallery.size >= 8
 
-        // --- GATE: Embedding floor (gallery-relative) ---
-        // Instead of a fixed floor, adapt to how consistent the gallery is.
-        // A tight gallery (min pair sim=0.8) demands higher similarity from candidates.
-        // A diverse gallery (min pair sim=0.4) is more lenient.
-        // Floor = minGallerySim * 0.75, clamped to [0.3, 0.5].
-        val adaptiveFloor = (_minGallerySim * 0.75f).coerceIn(0.3f, 0.5f)
-        val embeddingFloor = if (galleryMature) maxOf(adaptiveFloor, 0.4f) else adaptiveFloor
-        if (hasAppearance && appearanceScore < embeddingFloor) {
-            addNegativeExample(candidate.embedding!!)
+        // --- GATE: Embedding floor ---
+        // For OSNet-gated persons: static floor tuned for Market-1501-style cosine
+        // distribution (typical same-person >= 0.5, different-person <= 0.4).
+        // For MobileNetV3-gated everything else: adaptive floor relative to gallery.
+        val embeddingFloor = if (hasReId) {
+            PERSON_REID_FLOOR
+        } else {
+            val adaptiveFloor = (_minGallerySim * 0.75f).coerceIn(0.3f, 0.5f)
+            if (galleryMature) maxOf(adaptiveFloor, 0.4f) else adaptiveFloor
+        }
+        // Don't poison the negative pool with rejections during search — when
+        // the floor is misconfigured (failure case), the locked person gets
+        // repeatedly rejected and added as a negative, training the prototype
+        // margin/classifier to actively reject the right answer next time.
+        // Negatives are still collected during confirmed VT tracking (addSceneNegative
+        // with its 0.85 filter handles that).
+        if (gateActive && appearanceScore < embeddingFloor) {
             return null
         }
 
         // Tiered override: geometric gates use a lower threshold (0.55) because
         // position rejection is about camera movement, not identity confusion.
         // Label gate uses a higher threshold (0.7) to protect against cross-category leakage.
-        val geometricOverride = hasAppearance && appearanceScore > GEOMETRIC_OVERRIDE_THRESHOLD
-        val labelOverride = hasAppearance && appearanceScore > APPEARANCE_OVERRIDE_THRESHOLD
+        // Use whichever embedding actually drove the gate (OSNet for person-person,
+        // MobileNetV3 otherwise) — OSNet's same-person sim often clears 0.55 even
+        // when MobileNetV3 doesn't, so this lets a strong re-ID match bypass
+        // position/size hard filters during fast camera movement.
+        val geometricOverride = gateActive && appearanceScore > GEOMETRIC_OVERRIDE_THRESHOLD
+        val labelOverride = gateActive && appearanceScore > APPEARANCE_OVERRIDE_THRESHOLD
 
         // --- GATE A: Position hard filter (with time decay) ---
         // Use velocity-predicted position when available. If the subject was moving
@@ -576,10 +608,8 @@ class ReacquisitionEngine(
         // Binary gate: a locked person only accepts person candidates, and vice versa.
         // Specific labels don't matter — embedding handles identity within each bucket.
         // This eliminates label flicker problems (bowl/potted plant, deer/sheep/dog).
-        val candidateIsPerson = candidate.label == "person"
+        // (candidateIsPerson computed earlier; reused here.)
         if (lockedIsPerson != candidateIsPerson && !labelOverride) {
-            // Store as negative example — helps sharpen identity boundary
-            if (hasAppearance) addNegativeExample(candidate.embedding!!)
             return null  // REJECT: person/non-person mismatch
         }
         if (lockedIsPerson != candidateIsPerson && labelOverride) {
@@ -606,11 +636,8 @@ class ReacquisitionEngine(
             cosineSimilarity(lockedFaceEmbedding!!, candidate.faceEmbedding!!).coerceIn(0f, 1f)
         } else 0f
 
-        // Re-ID embedding: strong person identity signal (when available)
-        val hasReId = lockedReIdEmbedding != null && candidate.reIdEmbedding != null
-        val reIdScore = if (hasReId) {
-            cosineSimilarity(lockedReIdEmbedding!!, candidate.reIdEmbedding!!).coerceIn(0f, 1f)
-        } else 0f
+        // Re-ID score (hasReId / reIdScore) computed earlier for the OSNet gate;
+        // reused here as the dominant ranking signal for person candidates.
 
         // No label bonus — person/not-person gate handles category, embedding handles identity
 

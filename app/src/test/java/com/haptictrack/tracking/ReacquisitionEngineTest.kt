@@ -1149,7 +1149,7 @@ class ReacquisitionEngineTest {
     }
 
     @Test
-    fun `reId tier scores matching body higher than mismatching`() {
+    fun `reId tier rejects clearly-mismatching person via OSNet gate (#67)`() {
         val emb = floatArrayOf(0.5f, 0.5f)
         val reIdEmb = floatArrayOf(0.9f, 0.3f, 0.1f, 0.2f)
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
@@ -1164,11 +1164,14 @@ class ReacquisitionEngineTest {
             label = "person", embedding = emb,
             reIdEmbedding = floatArrayOf(0.1f, 0.1f, 0.9f, 0.1f)) // low re-ID sim
 
-        val matchScore = engine.scoreCandidate(matchBody, engine.lastKnownBox!!)!!
-        val wrongScore = engine.scoreCandidate(wrongBody, engine.lastKnownBox!!)!!
+        val matchScore = engine.scoreCandidate(matchBody, engine.lastKnownBox!!)
+        val wrongScore = engine.scoreCandidate(wrongBody, engine.lastKnownBox!!)
 
-        assertTrue("Matching re-ID ($matchScore) should beat mismatching ($wrongScore)",
-            matchScore > wrongScore)
+        // Pre-#67: both scored, ranking favored the match.
+        // Post-#67: OSNet sim is the gate for persons. Clearly-mismatching reId
+        // (cosine ~0.27) is below PERSON_REID_FLOOR (0.45) → hard reject.
+        assertNotNull("Matching re-ID should pass the OSNet gate", matchScore)
+        assertNull("Clearly-mismatching re-ID should be gate-rejected", wrongScore)
     }
 
     @Test
