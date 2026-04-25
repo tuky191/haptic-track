@@ -439,6 +439,52 @@ class ScenarioReplayTest {
             result.trackingRate >= 5)
     }
 
+    // two_people_indoor: locked on person near full-frame in a two-person indoor scene.
+    // 220 frames, 16 frames with ≥2 persons visible. Live capture (id=10) had 3
+    // LOST/REACQUIRE cycles with one slow reacquire taking 54 frames at sim=0.558
+    // while OSNet reported reId=0.836 — exactly the failure mode #67 (Identity PR1)
+    // is designed to fix: gate on OSNet for persons instead of MobileNetV3.
+    //
+    // Today these tests document current behavior so PR1 has a regression baseline.
+    // Post-PR1 expectation: same reacquires happen ≥1s faster on average.
+
+    @Test
+    fun `two people indoor - reacquires only as person`() {
+        val scenario = loadScenario("two_people_indoor.json")
+        val result = replay(scenario)
+
+        val wrong = result.wrongCategoryReacqs(PERSON_LABELS)
+        assertTrue("Should never reacquire non-person (got: ${wrong.map { "${it.label}@F${it.frame}" }})",
+            wrong.isEmpty())
+    }
+
+    @Test
+    fun `two people indoor - reacquires multiple times`() {
+        val scenario = loadScenario("two_people_indoor.json")
+        val result = replay(scenario)
+
+        // Live capture had 3 reacquires across 220 frames. Replay typically
+        // underestimates due to async embedding artifacts.
+        assertTrue("Should reacquire at least once (live: 3), got ${result.reacquisitions}",
+            result.reacquisitions >= 1)
+        assertFalse("Should not timeout", result.timedOut)
+    }
+
+    @Test
+    fun `two people indoor - tracking rate baseline`() {
+        val scenario = loadScenario("two_people_indoor.json")
+        val result = replay(scenario)
+
+        // Replay rate (~6%) is much lower than live tracking (~50% — 3 reacquires
+        // covered most of the 220 frames) because most candidates lack embeddings
+        // in the captured JSON (async pipeline artifacts). This guard only catches
+        // total breakage. Post-#67 (OSNet gating) the replay rate should rise
+        // because OSNet embeddings ARE captured for top candidates and would
+        // gate-pass even when MobileNetV3 sim is below floor.
+        assertTrue("Tracking rate should be >= 5% (regression guard), got ${result.trackingRate}%",
+            result.trackingRate >= 5)
+    }
+
     // --- Helpers for building synthetic scenarios ---
 
     data class SyntheticDetection(
