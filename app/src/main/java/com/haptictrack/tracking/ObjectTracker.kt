@@ -119,6 +119,8 @@ class ObjectTracker(
     private data class SyncEmbedEntry(
         val embedding: FloatArray,
         val colorHistogram: FloatArray?,
+        val reIdEmbedding: FloatArray? = null,
+        val faceEmbedding: FloatArray? = null,
         val cachedBox: RectF,
         val framesLost: Int
     )
@@ -687,8 +689,8 @@ class ObjectTracker(
                         val reusable = cached != null &&
                             computeIou(best.boundingBox, cached.cachedBox) > SYNC_EMBED_CACHE_IOU
 
-                        val (embedding, hist) = if (reusable) {
-                            cached!!.embedding to cached.colorHistogram
+                        val syncEntry: SyncEmbedEntry? = if (reusable) {
+                            cached
                         } else {
                             // Compute embedding synchronously (raw crop fallback, ~8-23ms)
                             val embResult = appearanceEmbedder.embedAndCrop(bitmap, best.boundingBox, fallback = true)
@@ -697,22 +699,35 @@ class ObjectTracker(
                                 computeColorHistogram(embResult.maskedCrop, fullBox).also { embResult.maskedCrop.recycle() }
                             } else computeColorHistogram(bitmap, best.boundingBox)
                             if (embResult.embedding != null) {
-                                android.util.Log.d("EmbedSync", "Sync embedding for id=${best.id} label=${best.label}")
-                                recentSyncEmbeds[best.id] = SyncEmbedEntry(
+                                // Person candidates also need OSNet (and face when locked
+                                // has a face) so the new OSNet-gated path (#67) can fire
+                                // on freshly-embedded candidates without waiting for async.
+                                val isPersonCandidate = lockedIsPerson && best.label == "person"
+                                val reIdEmb = if (isPersonCandidate) personReId.embed(bitmap, best.boundingBox) else null
+                                val faceEmb = if (isPersonCandidate && reacquisition.lockedFaceEmbedding != null) {
+                                    faceEmbedder.embedFace(bitmap, best.boundingBox)
+                                } else null
+                                android.util.Log.d("EmbedSync", "Sync embedding for id=${best.id} label=${best.label} reId=${reIdEmb != null} face=${faceEmb != null}")
+                                val entry = SyncEmbedEntry(
                                     embedding = embResult.embedding,
                                     colorHistogram = computedHist,
+                                    reIdEmbedding = reIdEmb,
+                                    faceEmbedding = faceEmb,
                                     cachedBox = RectF(best.boundingBox),
                                     framesLost = currFramesLost
                                 )
-                            }
-                            embResult.embedding to computedHist
+                                recentSyncEmbeds[best.id] = entry
+                                entry
+                            } else null
                         }
 
-                        if (embedding != null) {
+                        if (syncEntry != null) {
                             merged.map { obj ->
                                 if (obj.id == best.id) obj.copy(
-                                    embedding = embedding,
-                                    colorHistogram = hist
+                                    embedding = syncEntry.embedding,
+                                    colorHistogram = syncEntry.colorHistogram,
+                                    reIdEmbedding = syncEntry.reIdEmbedding ?: obj.reIdEmbedding,
+                                    faceEmbedding = syncEntry.faceEmbedding ?: obj.faceEmbedding
                                 ) else obj
                             }
                         } else merged
@@ -955,17 +970,15 @@ class ObjectTracker(
             } else computeColorHistogram(bitmap, obj.boundingBox)
             results[obj.id] = EmbeddingResult(embedding = embResult.embedding, colorHistogram = hist, cachedBox = RectF(obj.boundingBox))
         }
-        // Second pass: classify top-2 person candidates
-        val personCandidates = detections
+        // Second pass: classify all person candidates. Previously this was filtered
+        // to top-2 by MobileNetV3 sim, which silently dropped the right person from
+        // OSNet computation when MobileNetV3 ranked the wrong candidate higher
+        // (#67). With the OSNet gate, every person candidate needs its OSNet
+        // embedding so the engine can decide on identity.
+        val personIds = detections
             .filter { it.label == "person" && results[it.id]?.embedding != null }
-            .sortedByDescending {
-                val emb = results[it.id]?.embedding
-                if (emb != null) reacquisition.bestGallerySimilarity(emb) else 0f
-            }
-            .take(2)
             .map { it.id }
-            .toSet()
-        for (id in personCandidates) {
+        for (id in personIds) {
             val obj = detections.find { it.id == id } ?: continue
             val attrs = personClassifier.classify(bitmap, obj.boundingBox, obj.label)
             val reIdEmb = personReId.embed(bitmap, obj.boundingBox)
