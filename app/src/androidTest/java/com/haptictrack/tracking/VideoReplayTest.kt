@@ -7,8 +7,10 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.json.JSONObject
 import org.junit.After
+import org.junit.AfterClass
 import org.junit.Assert.*
 import org.junit.Before
+import org.junit.BeforeClass
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
@@ -44,9 +46,37 @@ class VideoReplayTest {
         private const val TAG = "VideoReplayTest"
         private const val TEST_VIDEO_SUBDIR = "test_videos"
         val PERSON_LABELS = setOf("person", "boy", "girl", "man", "woman", "human face")
+
+        /**
+         * Single ObjectTracker shared across all tests in this class. Loading the
+         * 9 ML models takes ~10-15s per fresh instance; with ~12 tests in this
+         * suite that is 2-3 minutes of pure load overhead per run. State is reset
+         * via [ObjectTracker.clearLock] in @Before so tests remain isolated.
+         */
+        private var sharedTracker: ObjectTracker? = null
+
+        @BeforeClass
+        @JvmStatic
+        fun loadModelsOnce() {
+            val context = ApplicationProvider.getApplicationContext<android.app.Application>()
+            val latch = CountDownLatch(1)
+            val ot = ObjectTracker(context, onLoadingStatus = { status ->
+                Log.i(TAG, "Loading: $status")
+                if (status == "Ready") latch.countDown()
+            })
+            assertTrue("Models should load within 60s", latch.await(60, TimeUnit.SECONDS))
+            sharedTracker = ot
+            Log.i(TAG, "Shared tracker ready — model load amortized across tests")
+        }
+
+        @AfterClass
+        @JvmStatic
+        fun shutdownTracker() {
+            sharedTracker?.shutdown()
+            sharedTracker = null
+        }
     }
 
-    private var tracker: ObjectTracker? = null
     private lateinit var testVideoDir: File
 
     @Before
@@ -56,13 +86,17 @@ class VideoReplayTest {
         assertTrue("Test video directory must exist: $testVideoDir — " +
             "push videos with: adb push test_videos/ /sdcard/Android/data/com.haptictrack/files/test_videos/",
             testVideoDir.exists())
+        // Reset per-test state on the shared tracker so each replay starts clean.
+        sharedTracker?.clearLock()
     }
 
     @After
     fun teardown() {
-        tracker?.shutdown()
-        tracker = null
+        // Don't shutdown — @AfterClass handles that. Just clear lock so the next
+        // test starts from a known state even if this one threw.
+        sharedTracker?.clearLock()
     }
+
 
     // --- Test cases ---
 
@@ -301,22 +335,14 @@ class VideoReplayTest {
         val fps = spec.optInt("fps", 30)
         val frameDurationMs = 1000L / fps
 
-        // Initialize ObjectTracker with real models
-        val context = ApplicationProvider.getApplicationContext<android.app.Application>()
-        val loadLatch = CountDownLatch(1)
-        val ot = ObjectTracker(context, onLoadingStatus = { status ->
-            Log.i(TAG, "Loading: $status")
-            if (status == "Ready") loadLatch.countDown()
-        })
-        tracker = ot
+        val ot = sharedTracker ?: error("sharedTracker not initialized — @BeforeClass failed?")
+        Log.i(TAG, "Starting replay of $name")
 
-        assertTrue("Models should load within 60s", loadLatch.await(60, TimeUnit.SECONDS))
-        // Tracker retains the most recent input as lastFrameBitmap and hands the
-        // previous one back via this recycler. In production the recycler points
-        // to the pool; here it's a straight recycle() since the decoder gives us
-        // a fresh bitmap each frame.
-        ot.bitmapRecycler = { it.recycle() }
-        Log.i(TAG, "Models loaded, starting replay of $name")
+        val decoder = VideoGLDecoder(videoFile)
+        // Bitmaps come from the GL pipeline's pool. ObjectTracker retains the
+        // most recent input as lastFrameBitmap and hands the previous one back
+        // via the recycler — route it back to the pool so it can be reused.
+        ot.bitmapRecycler = decoder.bitmapRecycler()
 
         // Collect events from the callback
         val events = mutableListOf<ReplayEvent>()
@@ -327,56 +353,62 @@ class VideoReplayTest {
         // Track state transitions by sampling BEFORE and AFTER each processBitmap call.
         // The callback approach misses transitions that happen within a single processFrame
         // (e.g. LOST→REACQUIRE in the same call when the object disappears and reappears).
-        ot.onDetectionResult = { _, lockedObject, _, _, _ ->
+        ot.onDetectionResult = { _, _, _, _, _ ->
             if (locked && ot.reacquisition.framesLost == 0) framesTracked++
         }
 
         var totalVideoFrames = 0
 
-        val decoder = VideoFrameDecoder(videoFile)
-        decoder.decodeAll(targetWidth = analysisWidth) { frameIndex, bitmap ->
-            totalVideoFrames = frameIndex + 1
+        try {
+            decoder.decodeAll(targetWidth = analysisWidth) { frameIndex, bitmap ->
+                totalVideoFrames = frameIndex + 1
 
-            if (frameIndex == lockFrame && !locked) {
-                // processBitmap takes ownership via bitmapRecycler; pass a copy so
-                // the decoder's bitmap can still be recycled separately.
-                val forProcess = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
-                ot.processBitmap(forProcess)
-                ot.lockOnObject(trackingId = 1, boundingBox = lockBox, label = lockLabel)
-                locked = true
-                framesTracked++
-                Log.i(TAG, "Locked on $lockLabel at frame $frameIndex box=$lockBox")
-                bitmap.recycle()
-                return@decodeAll 0
-            } else if (locked) {
-                // Snapshot state BEFORE processing
-                val wasSearching = ot.reacquisition.isSearching
-                val prevLost = ot.reacquisition.framesLost
+                if (frameIndex == lockFrame && !locked) {
+                    // processBitmap takes ownership via bitmapRecycler. lockOnObject
+                    // snapshots lastFrameBitmap internally before applying ML, so the
+                    // bitmap stays alive long enough for the lock burst.
+                    ot.processBitmap(bitmap)
+                    ot.lockOnObject(trackingId = 1, boundingBox = lockBox, label = lockLabel)
+                    locked = true
+                    framesTracked++
+                    Log.i(TAG, "Locked on $lockLabel at frame $frameIndex box=$lockBox")
+                    return@decodeAll 0
+                } else if (locked) {
+                    // Snapshot state BEFORE processing
+                    val wasSearching = ot.reacquisition.isSearching
+                    val prevLost = ot.reacquisition.framesLost
 
-                val startMs = System.currentTimeMillis()
-                ot.processBitmap(bitmap)  // tracker owns it; recycler releases previous frame
-                val processingMs = System.currentTimeMillis() - startMs
+                    val startMs = System.currentTimeMillis()
+                    ot.processBitmap(bitmap)  // tracker owns it; recycler releases previous frame
+                    val processingMs = System.currentTimeMillis() - startMs
 
-                // Check state AFTER processing to detect transitions
-                val nowLost = ot.reacquisition.framesLost
-                val lockedObj = if (nowLost == 0 && prevLost > 0) ot.reacquisition.lockedId else null
-                when {
-                    wasSearching && lockedObj != null && nowLost == 0 ->
-                        events.add(ReplayEvent(framesProcessed, "REACQUIRE",
-                            lockedObj, ot.reacquisition.lastKnownLabel))
-                    nowLost == 1 && prevLost == 0 ->
-                        events.add(ReplayEvent(framesProcessed, "LOST"))
-                    ot.reacquisition.hasTimedOut && prevLost <= ot.reacquisition.maxFramesLost ->
-                        events.add(ReplayEvent(framesProcessed, "TIMEOUT"))
+                    // Check state AFTER processing to detect transitions
+                    val nowLost = ot.reacquisition.framesLost
+                    val lockedObj = if (nowLost == 0 && prevLost > 0) ot.reacquisition.lockedId else null
+                    when {
+                        wasSearching && lockedObj != null && nowLost == 0 ->
+                            events.add(ReplayEvent(framesProcessed, "REACQUIRE",
+                                lockedObj, ot.reacquisition.lastKnownLabel))
+                        nowLost == 1 && prevLost == 0 ->
+                            events.add(ReplayEvent(framesProcessed, "LOST"))
+                        ot.reacquisition.hasTimedOut && prevLost <= ot.reacquisition.maxFramesLost ->
+                            events.add(ReplayEvent(framesProcessed, "TIMEOUT"))
+                    }
+
+                    framesProcessed++
+                    val framesToSkip = ((processingMs / frameDurationMs).toInt() - 1).coerceAtLeast(0)
+                    return@decodeAll framesToSkip
                 }
-
-                framesProcessed++
-                val framesToSkip = ((processingMs / frameDurationMs).toInt() - 1).coerceAtLeast(0)
-                return@decodeAll framesToSkip
+                // Frame before lockFrame — release back to pool so STFrameReader can reuse it.
+                ot.bitmapRecycler?.invoke(bitmap)
+                return@decodeAll 0
             }
-            return@decodeAll 0
+        } finally {
+            decoder.release()
+            // Clear callbacks so subsequent tests don't see stale state.
+            ot.bitmapRecycler = null
+            ot.onDetectionResult = null
         }
-        decoder.release()
 
         val framesDropped = totalVideoFrames - framesProcessed - 1
         val result = ReplayResult(events, framesTracked, framesProcessed)
