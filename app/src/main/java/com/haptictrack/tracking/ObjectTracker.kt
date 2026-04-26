@@ -447,12 +447,19 @@ class ObjectTracker(
                         // Collect scene negatives every 5 confirmed frames.
                         // tracked has screen-space boxes but bitmap is rotated,
                         // so convert back to rotated-image space before cropping.
-                        // Also build paired face+body memory for non-lock persons
-                        // (#83 phase 2) — at gate time the engine compares candidates
-                        // against this memory asymmetrically (face match ⇒ veto,
-                        // body match exceeding lock match ⇒ veto when face missing).
+                        // Scene negatives + paired face+body memory (#83 phase 2).
+                        // Both run on this 5-confirmed-frame cadence. We tried
+                        // slowing scene-pair collection to every 15 frames in
+                        // response to the perf review (face+body inference is
+                        // ~16-20ms per non-lock person), but on real boy_indoor
+                        // footage that cut accumulation to zero pairs across the
+                        // full clip — short multi-person lock windows didn't see
+                        // the wife enough at %15 to learn her. The mechanism
+                        // needs the data more than the hot path needs the ms;
+                        // keeping %5 and noting async batching as a follow-up
+                        // optimization once we can measure real device fps cost.
                         if (vtConfirmedFrames % 5 == 0) {
-                            val isPersonLock = reacquisition.lockedIsPerson
+                            val collectScenePair = reacquisition.lockedIsPerson
                             for (det in tracked) {
                                 if (det.id == reacquisition.lockedId) continue
                                 val rotBox = mapToRotated(det.boundingBox.left, det.boundingBox.top,
@@ -460,9 +467,7 @@ class ObjectTracker(
                                 val negEmb = appearanceEmbedder.embed(bitmap, rotBox)
                                 if (negEmb != null) reacquisition.addSceneNegative(negEmb)
 
-                                // For person-vs-person: link face+body if both present.
-                                // Same time-aligned pair makes the asymmetric veto sound.
-                                if (isPersonLock && det.label == "person") {
+                                if (collectScenePair && det.label == "person") {
                                     val faceEmb = faceEmbedder.embedFace(bitmap, rotBox)
                                     val bodyEmb = personReId.embed(bitmap, rotBox)
                                     if (faceEmb != null && bodyEmb != null) {

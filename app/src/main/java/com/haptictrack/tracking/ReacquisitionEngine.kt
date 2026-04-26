@@ -78,6 +78,13 @@ class ReacquisitionEngine(
          *  AND lock-face match below → veto. Same band as FACE_FLOOR but for
          *  the OTHER side of the comparison. */
         const val SCENE_FACE_MATCH_FLOOR = 0.40f
+        /** Margin by which the scene-face match must beat the lock-face match
+         *  before the face veto fires. Without a margin a candidate whose face
+         *  scores 0.42 against the scene memory and 0.41 against the lock would
+         *  be rejected — that's measurement noise, not a real identity signal.
+         *  0.05f is roughly the stddev of MobileFaceNet scores on near-duplicate
+         *  crops in our captures. */
+        const val SCENE_FACE_VETO_MARGIN = 0.05f
         /** Margin by which a candidate's body must match a stored scene-other
          *  better than it matches the lock for the body-only veto path to fire.
          *  Without a margin we'd reject any candidate that's slightly closer to
@@ -251,20 +258,23 @@ class ReacquisitionEngine(
     fun addScenePersonPair(face: FloatArray, body: FloatArray) {
         // Reject if this pair is too close to the lock — it's probably the lock
         // itself from a duplicate detection, and we'd later reject the lock.
-        val gallerySim = if (_embeddingGallery.isNotEmpty()) {
-            bestGallerySimilarity(body, _embeddingGallery)
-        } else 0f
-        val faceMatchesLock = lockedFaceEmbedding?.let {
-            cosineSimilarity(it, face) >= 0.6f
-        } ?: false
-        if (gallerySim >= 0.85f || faceMatchesLock) {
+        //
+        // Compare body to the lock's OSNet body embedding (same dim space).
+        // Earlier this used bestGallerySimilarity against _embeddingGallery,
+        // which holds MobileNetV3 (1280-dim) embeddings — cosineSimilarity
+        // between OSNet (512-dim) and MNV3 falls through the size check and
+        // returns 0, so the body half of this filter was silently dead.
+        val bodySim = lockedReIdEmbedding?.let { cosineSimilarity(it, body) } ?: 0f
+        val faceSim = lockedFaceEmbedding?.let { cosineSimilarity(it, face) } ?: 0f
+        if (bodySim >= 0.85f || faceSim >= 0.6f) {
+            Log.d(TAG, "Scene pair rejected: bodySim=${"%.3f".format(bodySim)} faceSim=${"%.3f".format(faceSim)} (looks like lock)")
             return
         }
         if (_sceneFacePairs.size >= MAX_SCENE_FACE_PAIRS) {
             _sceneFacePairs.removeAt(0)
         }
         _sceneFacePairs.add(ScenePersonPair(face.copyOf(), body.copyOf()))
-        Log.d(TAG, "Scene person pair added (bodySim=${"%.3f".format(gallerySim)}) — total=${_sceneFacePairs.size}")
+        Log.d(TAG, "Scene pair added: bodySim=${"%.3f".format(bodySim)} faceSim=${"%.3f".format(faceSim)} — total=${_sceneFacePairs.size}")
     }
 
     /**
@@ -779,8 +789,9 @@ class ReacquisitionEngine(
             // (a) Face path
             if (hasFaceGate) {
                 val sceneFaceMatch = bestSceneFaceMatch(candidate.faceEmbedding!!)
-                if (sceneFaceMatch >= SCENE_FACE_MATCH_FLOOR && sceneFaceMatch > lockFaceSim) {
-                    dualLog(Log.DEBUG, "  SCENE_FACE_VETO: sceneFace=${fmtF(sceneFaceMatch)} > lockFace=${fmtF(lockFaceSim)} (reIdSim=${fmtF(reIdScore)})")
+                if (sceneFaceMatch >= SCENE_FACE_MATCH_FLOOR &&
+                    sceneFaceMatch > lockFaceSim + SCENE_FACE_VETO_MARGIN) {
+                    dualLog(Log.DEBUG, "  SCENE_FACE_VETO: sceneFace=${fmtF(sceneFaceMatch)} > lockFace=${fmtF(lockFaceSim)}+${fmtF(SCENE_FACE_VETO_MARGIN)} (reIdSim=${fmtF(reIdScore)})")
                     return null
                 }
             }
