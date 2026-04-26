@@ -226,6 +226,12 @@ class VideoReplayTest {
         assertTrue("Should never reacquire non-chair (got: ${wrong.map { "${it.label}@F${it.frame}" }})",
             wrong.isEmpty())
 
+        // GT identity check intentionally not wired here. YOLOv8 doesn't reliably
+        // detect this small white chair through camera motion (only ~14% of frames
+        // got a confident detection). Most reacquires fall in GT-null frames so
+        // the assertion would silently no-op. Revisit if we get a better tracker
+        // for static-furniture scenes.
+
         Log.i(TAG, "chair_living_room: trackingRate=${result.trackingRate}% " +
             "reacqs=${result.reacquisitions} losses=${result.losses} " +
             "totalFrames=${result.totalFrames}")
@@ -252,6 +258,13 @@ class VideoReplayTest {
         val result = replayVideo("flowerpot_wrong_reacq")
 
         assertFalse("Should not timeout", result.timedOut)
+
+        // GT identity check intentionally not wired here. YOLOv8 only confidently
+        // detects this static potted plant in ~7% of frames — empirically all 9
+        // reacquires from the first run fell in GT-null frames, so the assertion
+        // would silently skip every event. The "wrong plant" case this test was
+        // designed for would benefit from a static-object tracker (template
+        // matching, perhaps) rather than detection-based GT.
 
         Log.i(TAG, "flowerpot_wrong_reacq: trackingRate=${result.trackingRate}% " +
             "reacqs=${result.reacquisitions} losses=${result.losses} " +

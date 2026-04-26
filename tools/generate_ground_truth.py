@@ -61,6 +61,10 @@ def main():
                         help="YOLOv8 model file (default: yolov8n.pt at repo root)")
     parser.add_argument("--score", type=float, default=0.4,
                         help="Detection confidence floor (default: 0.4)")
+    parser.add_argument("--class-name", default=None,
+                        help="COCO class name to track (default: inferred from "
+                             "spec.lockLabel). Examples: person, chair, "
+                             "potted plant, cup")
     args = parser.parse_args()
 
     video_path = Path(args.video)
@@ -85,9 +89,20 @@ def main():
     spec = json.loads(spec_path.read_text())
     lock_frame = spec["lockFrame"]
     lock_box = spec["lockBox"]
+    spec_label = spec.get("lockLabel", "person")
+    target_class = args.class_name or spec_label
 
     print(f"Loading YOLOv8: {model_path}")
     model = YOLO(model_path)
+
+    # Resolve class name -> COCO class id via the model's names map
+    name_to_id = {v: k for k, v in model.names.items()}
+    if target_class not in name_to_id:
+        print(f"Class '{target_class}' not in YOLOv8 COCO classes. "
+              f"Available: {sorted(name_to_id.keys())}", file=sys.stderr)
+        sys.exit(1)
+    target_class_id = name_to_id[target_class]
+    print(f"Tracking class '{target_class}' (id={target_class_id})")
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -101,11 +116,11 @@ def main():
     cap.release()
 
     # First pass — track every frame, collect (frame, track_id, box) tuples
-    # for class 0 (person in COCO). YOLO loads + tracks the whole video.
+    # for the target class.
     print("Running YOLOv8 + ByteTrack on full video...")
     tracks_per_frame = {}  # frame_idx -> list of (track_id, box_n, score)
     for frame_idx, result in enumerate(
-            model.track(source=str(video_path), classes=[0],
+            model.track(source=str(video_path), classes=[target_class_id],
                         conf=args.score, persist=True,
                         stream=True, verbose=False)):
         boxes = result.boxes
