@@ -139,9 +139,20 @@ class VideoReplayTest {
         assertTrue("Should never reacquire non-person (got: ${wrong.map { "${it.label}@F${it.frame}" }})",
             wrong.isEmpty())
 
+        // Identity check: the playground often has multiple people at varying
+        // distances. Earlier runs of this test showed up to 9 reacquires —
+        // some of which could have jumped to a passing person rather than the
+        // locked subject. GT skips frames where ByteTrack itself was lost.
+        val swapped = result.wrongIdentityReacqs(iouThreshold = 0.3f)
+        assertTrue(
+            "Should never reacquire onto a different person. " +
+                "Mismatches: ${swapped.map { "frame ${it.videoFrame} box=${it.box?.toList()}" }}",
+            swapped.isEmpty()
+        )
+
         Log.i(TAG, "person_playground: trackingRate=${result.trackingRate}% " +
             "reacqs=${result.reacquisitions} losses=${result.losses} " +
-            "totalFrames=${result.totalFrames}")
+            "totalFrames=${result.totalFrames} gt=${result.groundTruth?.annotatedFrameCount ?: 0}")
     }
 
     @Test
