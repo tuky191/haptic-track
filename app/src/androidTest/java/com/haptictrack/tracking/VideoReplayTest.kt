@@ -309,14 +309,14 @@ class VideoReplayTest {
      *   "lockBox": [left, top, right, bottom],
      *   "lockLabel": "person",
      *   "analysisWidth": 640,
-     *   "skipFrames": 3
+     *   "fps": 30
      * }
      * ```
      *
      * - lockFrame: which decoded frame to lock on (0-based)
      * - lockBox: normalized bounding box [0,1] to lock on
      * - lockLabel: COCO label to lock with
-     * - analysisWidth: downscale width for frames (default 640, matches production)
+     * - analysisWidth: longer-side downscale target (default 640, matches production)
      * - fps: video framerate, used for natural frame dropping (default 30)
      *
      * Frame dropping simulates live camera behavior: the pipeline processes one
@@ -410,8 +410,13 @@ class VideoReplayTest {
                     val framesToSkip = ((processingMs / frameDurationMs).toInt() - 1).coerceAtLeast(0)
                     return@decodeAll framesToSkip
                 }
-                // Frame before lockFrame — release back to pool so STFrameReader can reuse it.
-                ot.bitmapRecycler?.invoke(bitmap)
+                // Frame before lockFrame — feed to processBitmap so lastFrameBitmap
+                // is populated when lockOnObject runs and the pipeline state matches
+                // production (which processes every frame regardless of lock state).
+                // Currently all specs use lockFrame=0 so this branch is dead, but
+                // keeping it well-formed prevents a latent bug if any future spec
+                // moves the lock past frame 0.
+                ot.processBitmap(bitmap)
                 return@decodeAll 0
             }
         } finally {

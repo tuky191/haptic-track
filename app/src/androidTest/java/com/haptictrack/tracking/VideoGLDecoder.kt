@@ -35,7 +35,14 @@ class VideoGLDecoder(private val videoFile: File) {
     companion object {
         private const val TAG = "VideoGLDec"
         private const val DEQUEUE_TIMEOUT_US = 10_000L
-        private const val BITMAP_TIMEOUT_MS = 2_000L
+        /** Per-frame poll cap on the GL pipeline. Sized for the worst plausible
+         *  stall (lock burst on the processing thread + GC + ML inference spike)
+         *  with margin. A real stall above this is a genuine hang we want to
+         *  surface; transient hiccups under it pass through. The previous 2s
+         *  cap was firing during heavy ML bursts and truncating tests at
+         *  non-deterministic points — run-to-run video-frame counts varied by
+         *  30%+ on the same input. */
+        private const val BITMAP_TIMEOUT_MS = 10_000L
     }
 
     private val extractor = MediaExtractor()
@@ -175,12 +182,13 @@ class VideoGLDecoder(private val videoFile: File) {
                         }
 
                         val bm = bitmapQueue.poll(BITMAP_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-                        if (bm == null) {
-                            Log.w(TAG, "Timed out waiting for bitmap from GL pipeline " +
-                                "(rendered=$renderedCount, delivered=$deliveredCount)")
-                            outputDone = true
-                            break
-                        }
+                            ?: throw IllegalStateException(
+                                "GL pipeline stalled — no bitmap within ${BITMAP_TIMEOUT_MS}ms " +
+                                "(rendered=$renderedCount delivered=$deliveredCount " +
+                                "videoFrameIdx=$videoFrameIdx ${videoFile.name}). " +
+                                "Either the GL/processing thread is wedged or BITMAP_TIMEOUT_MS " +
+                                "is too tight for the current device. Don't silently truncate the " +
+                                "test — partial-result asserts mislead more than they help.")
 
                         val skips = onFrame(pendingPboFrame, bm)
                         deliveredCount++
