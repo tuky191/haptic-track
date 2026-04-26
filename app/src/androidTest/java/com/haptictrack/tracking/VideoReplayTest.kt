@@ -355,6 +355,32 @@ class VideoReplayTest {
             "totalFrames=${result.totalFrames}")
     }
 
+    // crowd_street: synthetic stock-video test (Pexels 12699538, CC0). 12.2s
+    // portrait shot of a busy market street — six detected persons in the lock
+    // frame alone. Lock target picked via EfficientDet-Lite2 detection (the
+    // same model the app uses) so the box is what the production detector
+    // would produce. Tests reacquisition through occlusion and discrimination
+    // among many same-category candidates at once.
+
+    @Test
+    fun crowd_street_no_wrong_category_lock() {
+        val result = replayVideo("crowd_street")
+
+        // The dense-multi-person scene means an "A→B" person swap is invisible
+        // to PERSON_LABELS. Primary signals: no timeout (the lock should be
+        // reacquired through brief occlusions) and tracking rate that doesn't
+        // collapse (catastrophic mistracking would push it near zero).
+        assertFalse("Should not timeout", result.timedOut)
+
+        val wrong = result.wrongCategoryReacqs(PERSON_LABELS)
+        assertTrue("Should never reacquire non-person (got: ${wrong.map { "${it.label}@F${it.frame}" }})",
+            wrong.isEmpty())
+
+        Log.i(TAG, "crowd_street: trackingRate=${result.trackingRate}% " +
+            "reacqs=${result.reacquisitions} losses=${result.losses} " +
+            "totalFrames=${result.totalFrames}")
+    }
+
     // --- Replay infrastructure ---
 
     data class ReplayEvent(
