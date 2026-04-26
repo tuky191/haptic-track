@@ -70,6 +70,20 @@ class ReacquisitionEngine(
         const val MAX_GALLERY_SIZE = 12
         /** Maximum negative examples to store. */
         const val MAX_NEGATIVE_EXAMPLES = 10
+        /** Max paired (face, body) memory entries from non-lock persons observed
+         *  during VT-confirmed tracking. Used asymmetrically for #83 phase 2. */
+        const val MAX_SCENE_FACE_PAIRS = 16
+        /** Floor for face cosine similarity to a stored scene-other to count as
+         *  "I recognize this face from earlier — it's not the lock." Above this
+         *  AND lock-face match below → veto. Same band as FACE_FLOOR but for
+         *  the OTHER side of the comparison. */
+        const val SCENE_FACE_MATCH_FLOOR = 0.40f
+        /** Margin by which a candidate's body must match a stored scene-other
+         *  better than it matches the lock for the body-only veto path to fire.
+         *  Without a margin we'd reject any candidate that's slightly closer to
+         *  any stored other than to the lock — too aggressive on borderline
+         *  same-person frames. */
+        const val SCENE_BODY_VETO_MARGIN = 0.10f
         /**
          * Max frozen negatives used for OnlineClassifier cold-start at lock time.
          * The full frozen-negatives asset (~1500) is used for adaptive-floor
@@ -212,6 +226,77 @@ class ReacquisitionEngine(
         }
     }
 
+    /** Paired face + body embedding from a non-lock person observed during VT-
+     *  confirmed tracking. Used asymmetrically: at gate time, candidate compares
+     *  against lock AND against this memory. If a stored other matches better
+     *  than the lock, candidate is rejected. The face-body LINK lets us recognize
+     *  someone later when only one modality is visible. (#83 phase 2) */
+    private data class ScenePersonPair(val face: FloatArray, val body: FloatArray)
+    private val _sceneFacePairs = mutableListOf<ScenePersonPair>()
+
+    /** Snapshot of stored scene face-body pairs (read-only). Test/debug helper. */
+    val sceneFacePairCount: Int get() = _sceneFacePairs.size
+
+    /**
+     * Add a paired face+body embedding observed for a non-lock person during
+     * VT-confirmed tracking. Caller is responsible for ensuring the pair came
+     * from the SAME detection at the same frame (the "link" is what makes this
+     * useful asymmetrically later).
+     *
+     * Filters near-lock matches the same way [addSceneNegative] does — if the
+     * body is too similar to the lock gallery (sim >= 0.85) we skip, since
+     * the detection is likely the lock itself rather than a genuine other.
+     * Same for face: if face matches lock face (sim >= 0.6), skip.
+     */
+    fun addScenePersonPair(face: FloatArray, body: FloatArray) {
+        // Reject if this pair is too close to the lock — it's probably the lock
+        // itself from a duplicate detection, and we'd later reject the lock.
+        val gallerySim = if (_embeddingGallery.isNotEmpty()) {
+            bestGallerySimilarity(body, _embeddingGallery)
+        } else 0f
+        val faceMatchesLock = lockedFaceEmbedding?.let {
+            cosineSimilarity(it, face) >= 0.6f
+        } ?: false
+        if (gallerySim >= 0.85f || faceMatchesLock) {
+            return
+        }
+        if (_sceneFacePairs.size >= MAX_SCENE_FACE_PAIRS) {
+            _sceneFacePairs.removeAt(0)
+        }
+        _sceneFacePairs.add(ScenePersonPair(face.copyOf(), body.copyOf()))
+        Log.d(TAG, "Scene person pair added (bodySim=${"%.3f".format(gallerySim)}) — total=${_sceneFacePairs.size}")
+    }
+
+    /**
+     * Best face-cosine of [candidateFace] against any stored scene other.
+     * Returns 0 if no stored faces. Used in [scoreCandidate] for the
+     * face-recognized-as-known-other veto.
+     */
+    internal fun bestSceneFaceMatch(candidateFace: FloatArray): Float {
+        if (_sceneFacePairs.isEmpty()) return 0f
+        var best = 0f
+        for (p in _sceneFacePairs) {
+            val s = cosineSimilarity(p.face, candidateFace)
+            if (s > best) best = s
+        }
+        return best
+    }
+
+    /**
+     * Best body-cosine of [candidateBody] against any stored scene-other body.
+     * Used for the no-face veto path: if body sim to a stored other exceeds
+     * body sim to the lock by [SCENE_BODY_VETO_MARGIN], reject.
+     */
+    internal fun bestSceneBodyMatch(candidateBody: FloatArray): Float {
+        if (_sceneFacePairs.isEmpty()) return 0f
+        var best = 0f
+        for (p in _sceneFacePairs) {
+            val s = cosineSimilarity(p.body, candidateBody)
+            if (s > best) best = s
+        }
+        return best
+    }
+
     /** Prototype margin: sim(candidate, pos_centroid) - sim(candidate, neg_centroid).
      *  Returns margin in [-1, 1]. Positive = closer to locked object than to scene.
      *  Returns 0 when no negatives exist (no discrimination possible). */
@@ -275,6 +360,7 @@ class ReacquisitionEngine(
         recomputeCentroid()
         _negativeExamples.clear()
         _negativeCentroid = null
+        _sceneFacePairs.clear()
         _classifier.clear()
         _lastTrainPositives = 0
         _lastTrainNegatives = 0
@@ -368,6 +454,7 @@ class ReacquisitionEngine(
         _adaptiveOsnetFloor = null
         _negativeExamples.clear()
         _negativeCentroid = null
+        _sceneFacePairs.clear()
         _classifier.clear()
         _lastTrainPositives = 0
         _lastTrainNegatives = 0
@@ -665,11 +752,46 @@ class ReacquisitionEngine(
         // through OSNet alone in those cases).
         val hasFaceGate = lockedIsPerson && candidateIsPerson &&
             lockedFaceEmbedding != null && candidate.faceEmbedding != null
+        val lockFaceSim = if (hasFaceGate) {
+            cosineSimilarity(lockedFaceEmbedding!!, candidate.faceEmbedding!!).coerceIn(0f, 1f)
+        } else 0f
         if (hasFaceGate) {
-            val faceSim = cosineSimilarity(lockedFaceEmbedding!!, candidate.faceEmbedding!!).coerceIn(0f, 1f)
-            if (faceSim < FACE_FLOOR) {
-                dualLog(Log.DEBUG, "  FACE_GATE_REJECT: faceSim=${fmtF(faceSim)} < ${fmtF(FACE_FLOOR)} (reIdSim=${fmtF(reIdScore)})")
+            if (lockFaceSim < FACE_FLOOR) {
+                dualLog(Log.DEBUG, "  FACE_GATE_REJECT: faceSim=${fmtF(lockFaceSim)} < ${fmtF(FACE_FLOOR)} (reIdSim=${fmtF(reIdScore)})")
                 return null
+            }
+        }
+
+        // --- GATE: Scene face-body memory veto (#83 phase 2) ---
+        // Use the paired (face, body) memory of non-lock persons observed during
+        // VT-confirmed tracking to reject candidates that look more like a known
+        // OTHER person than like the lock. Two paths:
+        //
+        // (a) Face-known: candidate's face matches a stored other-person face
+        //     better than it matches the lock face. Only fires when both
+        //     candidate face and lockedFaceEmbedding exist (else lock-face
+        //     baseline is missing).
+        // (b) Body-known: candidate has no face but its body matches a stored
+        //     other-person body better than the lock body by SCENE_BODY_VETO_MARGIN.
+        //     Pays off when face was visible earlier (so the body got linked)
+        //     but isn't visible now.
+        if (lockedIsPerson && candidateIsPerson && _sceneFacePairs.isNotEmpty()) {
+            // (a) Face path
+            if (hasFaceGate) {
+                val sceneFaceMatch = bestSceneFaceMatch(candidate.faceEmbedding!!)
+                if (sceneFaceMatch >= SCENE_FACE_MATCH_FLOOR && sceneFaceMatch > lockFaceSim) {
+                    dualLog(Log.DEBUG, "  SCENE_FACE_VETO: sceneFace=${fmtF(sceneFaceMatch)} > lockFace=${fmtF(lockFaceSim)} (reIdSim=${fmtF(reIdScore)})")
+                    return null
+                }
+            }
+            // (b) Body path — only when face data isn't available to drive (a)
+            if (!hasFaceGate && candidate.reIdEmbedding != null && lockedReIdEmbedding != null) {
+                val sceneBodyMatch = bestSceneBodyMatch(candidate.reIdEmbedding!!)
+                val lockBodyMatch = reIdScore  // already computed against locked re-ID
+                if (sceneBodyMatch > lockBodyMatch + SCENE_BODY_VETO_MARGIN) {
+                    dualLog(Log.DEBUG, "  SCENE_BODY_VETO: sceneBody=${fmtF(sceneBodyMatch)} > lockBody=${fmtF(lockBodyMatch)}+${fmtF(SCENE_BODY_VETO_MARGIN)}")
+                    return null
+                }
             }
         }
 
