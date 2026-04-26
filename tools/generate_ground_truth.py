@@ -76,14 +76,15 @@ def main():
 
     model_path = args.model
     if not Path(model_path).is_absolute():
-        # Try relative to script, then repo root
+        # Try CWD first, then relative-to-script, then repo root.
         candidates = [
+            Path.cwd() / model_path,
             Path(__file__).parent / model_path,
-            Path(__file__).parent.parent.parent / model_path,
+            Path(__file__).parent.parent / model_path,
         ]
         for c in candidates:
             if c.exists():
-                model_path = str(c)
+                model_path = str(c.resolve())
                 break
 
     spec = json.loads(spec_path.read_text())

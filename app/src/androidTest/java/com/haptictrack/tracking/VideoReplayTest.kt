@@ -143,7 +143,7 @@ class VideoReplayTest {
         // distances. Earlier runs of this test showed up to 9 reacquires —
         // some of which could have jumped to a passing person rather than the
         // locked subject. GT skips frames where ByteTrack itself was lost.
-        val swapped = result.wrongIdentityReacqs(iouThreshold = 0.3f)
+        val swapped = result.wrongIdentityReacqs()
         assertTrue(
             "Should never reacquire onto a different person. " +
                 "Mismatches: ${swapped.map { "frame ${it.videoFrame} box=${it.box?.toList()}" }}",
@@ -184,7 +184,7 @@ class VideoReplayTest {
         // GT is absent — we don't fail closed on missing ground truth, but
         // when it exists we enforce that REACQUIRE bboxes match the lock
         // subject's GT bbox (IoU >= 0.3) on frames where GT is confident.
-        val swapped = result.wrongIdentityReacqs(iouThreshold = 0.3f)
+        val swapped = result.wrongIdentityReacqs()
         assertTrue(
             "Should never reacquire onto a different person (son↔wife swap). " +
                 "Mismatches: ${swapped.map { "frame ${it.videoFrame} box=${it.box?.toList()}" }}",
@@ -451,9 +451,12 @@ class VideoReplayTest {
                 for (i in 0 until anns.length()) {
                     val a = anns.getJSONObject(i)
                     val frame = a.getInt("frame")
-                    val box = a.opt("box") ?: continue
-                    if (box == JSONObject.NULL) continue
-                    val arr = box as org.json.JSONArray
+                    // optJSONArray returns null for both missing keys AND
+                    // JSONObject.NULL AND non-array types (e.g. malformed GT
+                    // file with a stray string in "box"). Skip cleanly in all
+                    // those cases instead of throwing ClassCastException.
+                    val arr = a.optJSONArray("box") ?: continue
+                    if (arr.length() < 4) continue
                     map[frame] = floatArrayOf(
                         arr.getDouble(0).toFloat(),
                         arr.getDouble(1).toFloat(),
@@ -485,8 +488,15 @@ class VideoReplayTest {
          * absent for an event's frame (subject was lost/ambiguous in GT),
          * the event is skipped — we don't enforce identity where GT itself
          * is uncertain. Returns an empty list when no GT is loaded.
+         *
+         * Default 0.5: empirically the engine's reacquire boxes overlap GT
+         * (YOLOv8) by 0.88-0.96 on correct matches, so 0.5 is well below the
+         * noise floor and catches cases where the engine landed on a clearly
+         * different subject. Tighter would risk flaking on slight detector
+         * disagreement on the same person; looser lets two adjacent persons
+         * pass when they shouldn't.
          */
-        fun wrongIdentityReacqs(iouThreshold: Float = 0.3f): List<ReplayEvent> {
+        fun wrongIdentityReacqs(iouThreshold: Float = 0.5f): List<ReplayEvent> {
             val gt = groundTruth ?: return emptyList()
             return events.filter { event ->
                 if (event.type != "REACQUIRE") return@filter false
