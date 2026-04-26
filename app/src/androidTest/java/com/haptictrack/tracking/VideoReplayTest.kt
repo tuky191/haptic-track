@@ -334,6 +334,27 @@ class VideoReplayTest {
             "totalFrames=${result.totalFrames}")
     }
 
+    // person_distance: synthetic stock-video test (Pexels 5320110, cottonbro studio,
+    // CC0). 13.6s — single shirtless man with distinctive tattoos walks from
+    // mid-distance toward camera, ending at close-up. Tests scale tolerance:
+    // gallery embeddings learned from a small crop (~12% of frame height at
+    // lock time) must continue to match as the subject grows ~6× over the clip.
+    // Adaptive size threshold and re-id at varied scale are exercised here.
+
+    @Test
+    fun person_distance_tracking_through_scale_change() {
+        val result = replayVideo("person_distance")
+
+        // Single-subject video — no wrong-person assertion is meaningful here.
+        // Primary signal is whether tracking survives the scale change. A timeout
+        // means the gallery couldn't bridge the small→large transition.
+        assertFalse("Should not timeout", result.timedOut)
+
+        Log.i(TAG, "person_distance: trackingRate=${result.trackingRate}% " +
+            "reacqs=${result.reacquisitions} losses=${result.losses} " +
+            "totalFrames=${result.totalFrames}")
+    }
+
     // --- Replay infrastructure ---
 
     data class ReplayEvent(

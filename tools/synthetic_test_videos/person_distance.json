@@ -1,0 +1,10 @@
+{
+  "_source": "Pexels video 5320110 'A Man Walking Towards the Camera' by cottonbro studio (CC0). Trimmed to 13.6s starting from where subject is at moderate scale. Single subject — shirtless man with distinctive tattoos walks from mid-distance to close-up.",
+  "_lockTarget": "Lone subject at center frame, ~12% of frame height at lock time. Tests scale tolerance: gallery embeddings learned from a small crop must continue to match as the subject grows ~6× over the clip. Adaptive size threshold and re-id at varied scale also exercised.",
+  "_caveat": "Single-subject video — no wrong-person assertion is meaningful. Primary signal is whether tracking survives the scale change.",
+  "lockFrame": 0,
+  "lockBox": [0.460, 0.430, 0.535, 0.730],
+  "lockLabel": "person",
+  "analysisWidth": 640,
+  "fps": 25
+}
