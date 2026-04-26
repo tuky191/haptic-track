@@ -1,0 +1,10 @@
+{
+  "_source": "Pexels video 8915048 'Men Wearing Suit Walking Together' by Kampus Production (CC0). 8s clip — two men in nearly-identical black suits with bow ties walk side-by-side in a wedding/event setting, with a third man (gray jacket) on the far left and a woman (patterned blouse) on the far right. Four 'person'-class objects in frame.",
+  "_lockTarget": "Lighter-haired man in black suit (3rd from left). Tests color-histogram-can't-discriminate scenario — the 4th-from-left man wears identical clothing. Hair color is the main color discriminator; faces are clearly distinct.",
+  "_caveat": "Only 198 frames at 25fps (~8s). Short for tracking dynamics but excellent for the same-clothing-different-face identity-discrimination case.",
+  "lockFrame": 0,
+  "lockBox": [0.266, 0.083, 0.430, 1.0],
+  "lockLabel": "person",
+  "analysisWidth": 640,
+  "fps": 25
+}
