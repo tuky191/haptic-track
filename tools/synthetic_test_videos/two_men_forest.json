@@ -1,0 +1,9 @@
+{
+  "_source": "Pexels video 4830416 'Two Men Walking in the Forest' by cottonbro studio (CC0). Trimmed to last ~17s where both men are walking close to camera at moderate scale. Tests person identity discrimination when two subjects share similar earth-tone outdoor clothing.",
+  "_lockTarget": "Left figure (younger, darker olive jacket). The right figure (older, white-bearded, lighter olive) is consistently nearby — probes wrong-person discrimination via face gate (different ages) + body re-id.",
+  "lockFrame": 0,
+  "lockBox": [0.297, 0.370, 0.375, 0.754],
+  "lockLabel": "person",
+  "analysisWidth": 640,
+  "fps": 25
+}

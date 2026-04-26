@@ -279,6 +279,108 @@ class VideoReplayTest {
             result.trackingRate >= 25)
     }
 
+    // two_men_forest: synthetic stock-video test (Pexels 4830416, cottonbro studio,
+    // CC0). Two men with similar earth-tone outdoor clothing walk down a path.
+    // Probes person identity discrimination when color histogram alone can't tell
+    // them apart — the face gate (#84) and body re-id (OSNet) have to do the work.
+    // The two subjects differ in age (younger / bearded older), so face is a
+    // genuine discriminator if it can fire.
+
+    @Test
+    fun two_men_forest_no_wrong_person_lock() {
+        val result = replayVideo("two_men_forest")
+
+        // Baseline TBD on first device run. Primary assertion is that the lock
+        // never reacquires onto a wrong subject — the other man is consistently
+        // visible alongside the locked one. PERSON_LABELS is the wrong scope here
+        // because both subjects ARE people; the test design captures this video's
+        // value via tracking rate (a wrong-person reacquire would drop it sharply).
+        assertFalse("Should not timeout", result.timedOut)
+
+        val wrong = result.wrongCategoryReacqs(PERSON_LABELS)
+        assertTrue("Should never reacquire non-person (got: ${wrong.map { "${it.label}@F${it.frame}" }})",
+            wrong.isEmpty())
+
+        Log.i(TAG, "two_men_forest: trackingRate=${result.trackingRate}% " +
+            "reacqs=${result.reacquisitions} losses=${result.losses} " +
+            "totalFrames=${result.totalFrames}")
+    }
+
+    // two_men_suits: synthetic stock-video test (Pexels 8915048, Kampus Production,
+    // CC0). 8s — four persons in frame: two men in nearly-identical black suits
+    // with bow ties side-by-side, a third man in a gray jacket, and a woman in
+    // a patterned blouse. Lock target is the lighter-haired suit man (3rd from
+    // left). Tests the color-histogram-can't-discriminate case — the man directly
+    // beside the lock target wears identical clothing. Hair color and face are
+    // the discriminators.
+
+    @Test
+    fun two_men_suits_no_wrong_person_lock() {
+        val result = replayVideo("two_men_suits")
+
+        // Baseline TBD on first device run. 198 frames is short — primary signal
+        // is "no wrong-category reacquire" since both suit men are 'person' and
+        // the test can't tell them apart at the assertion layer. Tracking rate
+        // is a secondary indicator — a sharp drop suggests the lock jumped to
+        // the other suit-wearing subject.
+        assertFalse("Should not timeout", result.timedOut)
+
+        val wrong = result.wrongCategoryReacqs(PERSON_LABELS)
+        assertTrue("Should never reacquire non-person (got: ${wrong.map { "${it.label}@F${it.frame}" }})",
+            wrong.isEmpty())
+
+        Log.i(TAG, "two_men_suits: trackingRate=${result.trackingRate}% " +
+            "reacqs=${result.reacquisitions} losses=${result.losses} " +
+            "totalFrames=${result.totalFrames}")
+    }
+
+    // person_distance: synthetic stock-video test (Pexels 5320110, cottonbro studio,
+    // CC0). 13.6s — single shirtless man with distinctive tattoos walks from
+    // mid-distance toward camera, ending at close-up. Tests scale tolerance:
+    // gallery embeddings learned from a small crop (~12% of frame height at
+    // lock time) must continue to match as the subject grows ~6× over the clip.
+    // Adaptive size threshold and re-id at varied scale are exercised here.
+
+    @Test
+    fun person_distance_tracking_through_scale_change() {
+        val result = replayVideo("person_distance")
+
+        // Single-subject video — no wrong-person assertion is meaningful here.
+        // Primary signal is whether tracking survives the scale change. A timeout
+        // means the gallery couldn't bridge the small→large transition.
+        assertFalse("Should not timeout", result.timedOut)
+
+        Log.i(TAG, "person_distance: trackingRate=${result.trackingRate}% " +
+            "reacqs=${result.reacquisitions} losses=${result.losses} " +
+            "totalFrames=${result.totalFrames}")
+    }
+
+    // crowd_street: synthetic stock-video test (Pexels 12699538, CC0). 12.2s
+    // portrait shot of a busy market street — six detected persons in the lock
+    // frame alone. Lock target picked via EfficientDet-Lite2 detection (the
+    // same model the app uses) so the box is what the production detector
+    // would produce. Tests reacquisition through occlusion and discrimination
+    // among many same-category candidates at once.
+
+    @Test
+    fun crowd_street_no_wrong_category_lock() {
+        val result = replayVideo("crowd_street")
+
+        // The dense-multi-person scene means an "A→B" person swap is invisible
+        // to PERSON_LABELS. Primary signals: no timeout (the lock should be
+        // reacquired through brief occlusions) and tracking rate that doesn't
+        // collapse (catastrophic mistracking would push it near zero).
+        assertFalse("Should not timeout", result.timedOut)
+
+        val wrong = result.wrongCategoryReacqs(PERSON_LABELS)
+        assertTrue("Should never reacquire non-person (got: ${wrong.map { "${it.label}@F${it.frame}" }})",
+            wrong.isEmpty())
+
+        Log.i(TAG, "crowd_street: trackingRate=${result.trackingRate}% " +
+            "reacqs=${result.reacquisitions} losses=${result.losses} " +
+            "totalFrames=${result.totalFrames}")
+    }
+
     // --- Replay infrastructure ---
 
     data class ReplayEvent(

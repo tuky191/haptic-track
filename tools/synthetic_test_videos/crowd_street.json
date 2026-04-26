@@ -1,0 +1,10 @@
+{
+  "_source": "Pexels video 12699538 'Crowd of People Walking in a City Street' (CC0). 12.2s portrait shot of a busy market street with dozens of pedestrians at varied distances. Six person detections in the lock frame alone — the densest scene in the test suite by far.",
+  "_lockTarget": "Detection #1 from EfficientDet-Lite2 — foreground subject in the left-center of frame 30 (~21-41% horizontal, ~51-91% vertical, 8.1% of frame area). Five other detected persons share the frame at lock time. Tests reacquisition through occlusion and discrimination among many same-category candidates simultaneously.",
+  "_caveat": "We can't tell if the lock 'jumps' to a different person mid-track — both are 'person' to the assertion layer. Same blind spot as boy_indoor_wife_swap. Primary signal is no timeout + no obvious tracking-rate collapse.",
+  "lockFrame": 30,
+  "lockBox": [0.212, 0.512, 0.415, 0.915],
+  "lockLabel": "person",
+  "analysisWidth": 640,
+  "fps": 60
+}
