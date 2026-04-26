@@ -168,9 +168,21 @@ class VideoReplayTest {
         assertTrue("Should never reacquire non-person (got: ${wrong.map { "${it.label}@F${it.frame}" }})",
             wrong.isEmpty())
 
+        // Identity check via ground truth (sidecar .gt.json from
+        // tools/synthetic_test_videos/generate_ground_truth.py). Empty when
+        // GT is absent — we don't fail closed on missing ground truth, but
+        // when it exists we enforce that REACQUIRE bboxes match the lock
+        // subject's GT bbox (IoU >= 0.3) on frames where GT is confident.
+        val swapped = result.wrongIdentityReacqs(iouThreshold = 0.3f)
+        assertTrue(
+            "Should never reacquire onto a different person (son↔wife swap). " +
+                "Mismatches: ${swapped.map { "frame ${it.videoFrame} box=${it.box?.toList()}" }}",
+            swapped.isEmpty()
+        )
+
         Log.i(TAG, "boy_indoor_wife_swap: trackingRate=${result.trackingRate}% " +
             "reacqs=${result.reacquisitions} losses=${result.losses} " +
-            "totalFrames=${result.totalFrames}")
+            "totalFrames=${result.totalFrames} gt=${result.groundTruth?.annotatedFrameCount ?: 0}")
     }
 
     @Test
@@ -387,13 +399,54 @@ class VideoReplayTest {
         val frame: Int,
         val type: String,
         val objectId: Int? = null,
-        val label: String? = null
+        val label: String? = null,
+        /** Source video frame index this event occurred on (matches GT keys). */
+        val videoFrame: Int? = null,
+        /** Bbox in normalized [l,t,r,b] at event time, when available. */
+        val box: FloatArray? = null
     )
+
+    /**
+     * Per-frame ground truth: the lock subject's bbox at that source video frame,
+     * or null if ByteTrack reported the subject lost / ambiguous on that frame.
+     *
+     * Loaded from `<name>.gt.json` produced by `tools/synthetic_test_videos/
+     * generate_ground_truth.py`. Matched frames are trustworthy; we don't enforce
+     * identity on lost/ambiguous frames since GT itself is uncertain there.
+     */
+    class GroundTruth(private val byFrame: Map<Int, FloatArray>) {
+        fun boxAt(frame: Int): FloatArray? = byFrame[frame]
+        val annotatedFrameCount: Int get() = byFrame.size
+
+        companion object {
+            fun loadOrNull(file: File): GroundTruth? {
+                if (!file.exists()) return null
+                val obj = JSONObject(file.readText())
+                val anns = obj.getJSONArray("annotations")
+                val map = HashMap<Int, FloatArray>(anns.length())
+                for (i in 0 until anns.length()) {
+                    val a = anns.getJSONObject(i)
+                    val frame = a.getInt("frame")
+                    val box = a.opt("box") ?: continue
+                    if (box == JSONObject.NULL) continue
+                    val arr = box as org.json.JSONArray
+                    map[frame] = floatArrayOf(
+                        arr.getDouble(0).toFloat(),
+                        arr.getDouble(1).toFloat(),
+                        arr.getDouble(2).toFloat(),
+                        arr.getDouble(3).toFloat()
+                    )
+                }
+                return GroundTruth(map)
+            }
+        }
+    }
 
     data class ReplayResult(
         val events: List<ReplayEvent>,
         val framesTracked: Int,
-        val totalFrames: Int
+        val totalFrames: Int,
+        val groundTruth: GroundTruth? = null
     ) {
         val trackingRate: Int get() = if (totalFrames > 0) framesTracked * 100 / totalFrames else 0
         val reacquisitions: Int get() = events.count { it.type == "REACQUIRE" }
@@ -401,6 +454,36 @@ class VideoReplayTest {
         val timedOut: Boolean get() = events.any { it.type == "TIMEOUT" }
         fun wrongCategoryReacqs(validLabels: Set<String>): List<ReplayEvent> =
             events.filter { it.type == "REACQUIRE" && it.label !in validLabels }
+
+        /**
+         * REACQUIRE events whose bbox doesn't match the ground-truth subject's
+         * bbox at the same video frame (IoU below [iouThreshold]). When GT is
+         * absent for an event's frame (subject was lost/ambiguous in GT),
+         * the event is skipped — we don't enforce identity where GT itself
+         * is uncertain. Returns an empty list when no GT is loaded.
+         */
+        fun wrongIdentityReacqs(iouThreshold: Float = 0.3f): List<ReplayEvent> {
+            val gt = groundTruth ?: return emptyList()
+            return events.filter { event ->
+                if (event.type != "REACQUIRE") return@filter false
+                val frame = event.videoFrame ?: return@filter false
+                val box = event.box ?: return@filter false
+                val gtBox = gt.boxAt(frame) ?: return@filter false
+                computeIou(box, gtBox) < iouThreshold
+            }
+        }
+
+        private fun computeIou(a: FloatArray, b: FloatArray): Float {
+            val il = maxOf(a[0], b[0])
+            val it = maxOf(a[1], b[1])
+            val ir = minOf(a[2], b[2])
+            val ib = minOf(a[3], b[3])
+            if (il >= ir || it >= ib) return 0f
+            val inter = (ir - il) * (ib - it)
+            val areaA = (a[2] - a[0]) * (a[3] - a[1])
+            val areaB = (b[2] - b[0]) * (b[3] - b[1])
+            return inter / (areaA + areaB - inter)
+        }
     }
 
     /**
@@ -447,6 +530,13 @@ class VideoReplayTest {
         val analysisWidth = spec.optInt("analysisWidth", 640)
         val fps = spec.optInt("fps", 30)
         val frameDurationMs = 1000L / fps
+
+        val gtFile = File(testVideoDir, "$name.gt.json")
+        val groundTruth = GroundTruth.loadOrNull(gtFile)
+        if (groundTruth != null) {
+            Log.i(TAG, "Loaded ground truth from $gtFile " +
+                "(${groundTruth.annotatedFrameCount} annotated frames)")
+        }
 
         val ot = sharedTracker ?: error("sharedTracker not initialized — @BeforeClass failed?")
         Log.i(TAG, "Starting replay of $name")
@@ -498,14 +588,20 @@ class VideoReplayTest {
                     // Check state AFTER processing to detect transitions
                     val nowLost = ot.reacquisition.framesLost
                     val lockedObj = if (nowLost == 0 && prevLost > 0) ot.reacquisition.lockedId else null
+                    val curBox = ot.reacquisition.lastKnownBox?.let {
+                        floatArrayOf(it.left, it.top, it.right, it.bottom)
+                    }
                     when {
                         wasSearching && lockedObj != null && nowLost == 0 ->
                             events.add(ReplayEvent(framesProcessed, "REACQUIRE",
-                                lockedObj, ot.reacquisition.lastKnownLabel))
+                                lockedObj, ot.reacquisition.lastKnownLabel,
+                                videoFrame = frameIndex, box = curBox))
                         nowLost == 1 && prevLost == 0 ->
-                            events.add(ReplayEvent(framesProcessed, "LOST"))
+                            events.add(ReplayEvent(framesProcessed, "LOST",
+                                videoFrame = frameIndex))
                         ot.reacquisition.hasTimedOut && prevLost <= ot.reacquisition.maxFramesLost ->
-                            events.add(ReplayEvent(framesProcessed, "TIMEOUT"))
+                            events.add(ReplayEvent(framesProcessed, "TIMEOUT",
+                                videoFrame = frameIndex))
                     }
 
                     framesProcessed++
@@ -529,7 +625,7 @@ class VideoReplayTest {
         }
 
         val framesDropped = totalVideoFrames - framesProcessed - 1
-        val result = ReplayResult(events, framesTracked, framesProcessed)
+        val result = ReplayResult(events, framesTracked, framesProcessed, groundTruth)
         Log.i(TAG, "Replay complete: $framesProcessed processed / $totalVideoFrames total " +
             "($framesDropped dropped, ${framesDropped * 100 / totalVideoFrames.coerceAtLeast(1)}% drop rate), " +
             "${result.trackingRate}% tracked, ${result.reacquisitions} reacqs, " +
