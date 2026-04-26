@@ -447,13 +447,33 @@ class ObjectTracker(
                         // Collect scene negatives every 5 confirmed frames.
                         // tracked has screen-space boxes but bitmap is rotated,
                         // so convert back to rotated-image space before cropping.
+                        // Scene negatives + paired face+body memory (#83 phase 2).
+                        // Both run on this 5-confirmed-frame cadence. We tried
+                        // slowing scene-pair collection to every 15 frames in
+                        // response to the perf review (face+body inference is
+                        // ~16-20ms per non-lock person), but on real boy_indoor
+                        // footage that cut accumulation to zero pairs across the
+                        // full clip — short multi-person lock windows didn't see
+                        // the wife enough at %15 to learn her. The mechanism
+                        // needs the data more than the hot path needs the ms;
+                        // keeping %5 and noting async batching as a follow-up
+                        // optimization once we can measure real device fps cost.
                         if (vtConfirmedFrames % 5 == 0) {
+                            val collectScenePair = reacquisition.lockedIsPerson
                             for (det in tracked) {
                                 if (det.id == reacquisition.lockedId) continue
                                 val rotBox = mapToRotated(det.boundingBox.left, det.boundingBox.top,
                                     det.boundingBox.right, det.boundingBox.bottom, deviceRot)
                                 val negEmb = appearanceEmbedder.embed(bitmap, rotBox)
                                 if (negEmb != null) reacquisition.addSceneNegative(negEmb)
+
+                                if (collectScenePair && det.label == "person") {
+                                    val faceEmb = faceEmbedder.embedFace(bitmap, rotBox)
+                                    val bodyEmb = personReId.embed(bitmap, rotBox)
+                                    if (faceEmb != null && bodyEmb != null) {
+                                        reacquisition.addScenePersonPair(faceEmb, bodyEmb)
+                                    }
+                                }
                             }
                         }
                     } else {

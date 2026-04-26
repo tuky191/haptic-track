@@ -1208,6 +1208,181 @@ class ReacquisitionEngineTest {
         assertNull("Bad face vetoes good body via face gate", bodyScore)
     }
 
+    // --- Scene face-body memory (#83 phase 2) ---
+
+    @Test
+    fun `scene face memory rejects candidate matching a stored other-person face`() {
+        val emb = floatArrayOf(0.5f, 0.5f)
+        val lockFace = floatArrayOf(0.9f, 0.3f, 0.1f)
+        val lockReId = floatArrayOf(0.9f, 0.3f, 0.1f, 0.2f)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
+            listOf(emb), null, null, cocoLabel = "person",
+            reIdEmbedding = lockReId, faceEmbedding = lockFace)
+        engine.processFrame(emptyList())
+
+        // Earlier in the session we observed person B with face_B + body_B.
+        val otherFace = floatArrayOf(0.1f, 0.9f, 0.1f)
+        val otherBody = floatArrayOf(0.2f, 0.8f, 0.2f, 0.3f)
+        engine.addScenePersonPair(otherFace, otherBody)
+
+        // Candidate has high body match to lock (0.66-ish) but its face matches
+        // the stored other-person face — that's a stronger signal than lock-face match.
+        val candidate = obj(id = 99, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "person", embedding = emb,
+            reIdEmbedding = floatArrayOf(0.7f, 0.5f, 0.3f, 0.4f),  // moderate body match to lock
+            faceEmbedding = floatArrayOf(0.12f, 0.88f, 0.12f))     // matches other_face
+
+        val score = engine.scoreCandidate(candidate, engine.lastKnownBox!!)
+        assertNull("Candidate face matching stored other should be vetoed", score)
+    }
+
+    @Test
+    fun `scene face memory does not veto when scene-face barely beats lock-face (margin)`() {
+        // Regression for review finding: without a margin, sceneFace=0.42 vs
+        // lockFace=0.41 would trigger a hard reject on numerical noise.
+        // SCENE_FACE_VETO_MARGIN=0.05 means scene must beat lock by >5pp.
+        val emb = floatArrayOf(0.5f, 0.5f)
+        // Lock face (3-dim): tuned so candidate face has ~0.55 cosine to it.
+        val lockFace = floatArrayOf(1.0f, 0.0f, 0.0f)
+        val lockReId = floatArrayOf(0.9f, 0.3f, 0.1f, 0.2f)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
+            listOf(emb), null, null, cocoLabel = "person",
+            reIdEmbedding = lockReId, faceEmbedding = lockFace)
+        engine.processFrame(emptyList())
+
+        // Stored other face: candidate has ~0.58 cosine to it.
+        // Difference scene-vs-lock face = ~0.03, BELOW the 0.05 margin.
+        val otherFace = floatArrayOf(0.99f, 0.14f, 0.0f)
+        val otherBody = floatArrayOf(0.2f, 0.8f, 0.2f, 0.3f)
+        engine.addScenePersonPair(otherFace, otherBody)
+
+        val candidate = obj(id = 99, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "person", embedding = emb,
+            reIdEmbedding = floatArrayOf(0.85f, 0.35f, 0.1f, 0.2f),  // strong body match to lock
+            faceEmbedding = floatArrayOf(0.97f, 0.24f, 0.0f))         // ~0.58 to other, ~0.55 to lock
+
+        val score = engine.scoreCandidate(candidate, engine.lastKnownBox!!)
+        assertNotNull("Face veto should not fire when scene/lock face match is within margin", score)
+    }
+
+    @Test
+    fun `scene body memory vetoes no-face candidate matching stored body better than lock`() {
+        val emb = floatArrayOf(0.5f, 0.5f)
+        val lockFace = floatArrayOf(0.9f, 0.3f, 0.1f)
+        val lockReId = floatArrayOf(0.9f, 0.3f, 0.1f, 0.2f)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
+            listOf(emb), null, null, cocoLabel = "person",
+            reIdEmbedding = lockReId, faceEmbedding = lockFace)
+        engine.processFrame(emptyList())
+
+        // Stored other-person — face was visible earlier, paired with body.
+        val otherFace = floatArrayOf(0.1f, 0.9f, 0.1f)
+        val otherBody = floatArrayOf(0.1f, 0.1f, 0.9f, 0.1f)
+        engine.addScenePersonPair(otherFace, otherBody)
+
+        // Candidate now: NO face (head turned, occluded). Body sim to lock = ~0.5
+        // (passes the 0.45 OSNet floor). Body sim to stored other = much higher.
+        val candidate = obj(id = 99, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "person", embedding = emb,
+            reIdEmbedding = floatArrayOf(0.12f, 0.12f, 0.92f, 0.12f),  // close to other_body
+            faceEmbedding = null)                                       // no face this time
+
+        val score = engine.scoreCandidate(candidate, engine.lastKnownBox!!)
+        assertNull("No-face candidate whose body matches stored other better than lock should be vetoed", score)
+    }
+
+    @Test
+    fun `scene memory does not reject genuine lock match`() {
+        // Sanity check: even with stored others, a candidate that genuinely
+        // matches the lock face must still pass.
+        val emb = floatArrayOf(0.5f, 0.5f)
+        val lockFace = floatArrayOf(0.9f, 0.3f, 0.1f)
+        val lockReId = floatArrayOf(0.9f, 0.3f, 0.1f, 0.2f)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
+            listOf(emb), null, null, cocoLabel = "person",
+            reIdEmbedding = lockReId, faceEmbedding = lockFace)
+        engine.processFrame(emptyList())
+
+        // Stored other person.
+        engine.addScenePersonPair(
+            floatArrayOf(0.1f, 0.9f, 0.1f),
+            floatArrayOf(0.2f, 0.8f, 0.2f, 0.3f),
+        )
+
+        // Candidate matches the lock face strongly. Should pass.
+        val candidate = obj(id = 99, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
+            label = "person", embedding = emb,
+            reIdEmbedding = floatArrayOf(0.88f, 0.32f, 0.12f, 0.22f),  // strong body match
+            faceEmbedding = floatArrayOf(0.88f, 0.32f, 0.12f))          // strong face match
+
+        val score = engine.scoreCandidate(candidate, engine.lastKnownBox!!)
+        assertNotNull("Strong lock match should pass despite scene memory", score)
+    }
+
+    @Test
+    fun `addScenePersonPair filters near-lock body to avoid self-poisoning`() {
+        val emb = floatArrayOf(0.9f, 0.3f)
+        val lockFace = floatArrayOf(0.9f, 0.3f, 0.1f)
+        // Body filter compares OSNet→OSNet, so the test body and lockReId must
+        // share dimensionality (real OSNet is 512-dim; we use 4-dim here for
+        // hand-tractable cosine math).
+        val lockReId = floatArrayOf(0.9f, 0.3f, 0.1f, 0.2f)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
+            listOf(emb), null, null, cocoLabel = "person",
+            reIdEmbedding = lockReId, faceEmbedding = lockFace)
+
+        // Try to add a pair whose body is essentially the lock — duplicate
+        // detection of the same person should NOT pollute scene memory.
+        engine.addScenePersonPair(
+            floatArrayOf(0.1f, 0.9f, 0.1f),                  // unrelated face
+            floatArrayOf(0.91f, 0.29f, 0.11f, 0.19f),         // body ≈ lock body
+        )
+        assertEquals("Near-lock body should not be added", 0, engine.sceneFacePairCount)
+
+        // A genuine other person passes.
+        engine.addScenePersonPair(
+            floatArrayOf(0.1f, 0.9f, 0.1f),
+            floatArrayOf(0.1f, 0.9f, 0.5f, 0.4f),             // far from lock body
+        )
+        assertEquals("Genuine other should be added", 1, engine.sceneFacePairCount)
+    }
+
+    @Test
+    fun `addScenePersonPair filters near-lock face to avoid linking back to lock`() {
+        val emb = floatArrayOf(0.5f, 0.5f)
+        val lockFace = floatArrayOf(0.9f, 0.3f, 0.1f)
+        val lockReId = floatArrayOf(0.9f, 0.3f, 0.1f, 0.2f)
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
+            listOf(emb), null, null, cocoLabel = "person",
+            reIdEmbedding = lockReId, faceEmbedding = lockFace)
+
+        // Face nearly matches lock face — must be filtered.
+        engine.addScenePersonPair(
+            floatArrayOf(0.88f, 0.32f, 0.12f),   // ~lock face
+            floatArrayOf(0.1f, 0.9f),             // body unrelated to lock
+        )
+        assertEquals("Near-lock face should not be added", 0, engine.sceneFacePairCount)
+    }
+
+    @Test
+    fun `scene face pair memory bounded at MAX_SCENE_FACE_PAIRS`() {
+        // Lock face/body axes set so test data is consistently far from both.
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
+            listOf(floatArrayOf(1f, 0f)), null, null, cocoLabel = "person",
+            reIdEmbedding = floatArrayOf(1f, 0f, 0f, 0f),
+            faceEmbedding = floatArrayOf(1f, 0f, 0f))
+
+        // Add 20 pairs orthogonal to the lock axes — none should be filtered.
+        repeat(20) { i ->
+            engine.addScenePersonPair(
+                floatArrayOf(0f, 1f - 0.01f * i, 0.05f * i),       // far from lock face axis
+                floatArrayOf(0f, 1f, 0f, 0.01f * i),                // far from lock body axis
+            )
+        }
+        assertEquals("Memory should cap at MAX_SCENE_FACE_PAIRS",
+            ReacquisitionEngine.MAX_SCENE_FACE_PAIRS, engine.sceneFacePairCount)
+    }
+
     @Test
     fun `no reId or face falls back to generic embedding tier`() {
         val emb = floatArrayOf(0.9f, 0.3f)
