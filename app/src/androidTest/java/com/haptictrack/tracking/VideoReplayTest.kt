@@ -55,6 +55,9 @@ class VideoReplayTest {
          */
         private var sharedTracker: ObjectTracker? = null
 
+        /** Audit (#92): per-video stability summaries, printed in @AfterClass. */
+        private val auditSummaries = LinkedHashMap<String, JSONObject>()
+
         @BeforeClass
         @JvmStatic
         fun loadModelsOnce() {
@@ -72,8 +75,50 @@ class VideoReplayTest {
         @AfterClass
         @JvmStatic
         fun shutdownTracker() {
+            printEmbeddingStabilityTable()
             sharedTracker?.shutdown()
             sharedTracker = null
+        }
+
+        /**
+         * Audit (#92): print a per-video × per-embedder × per-k stability table
+         * to logcat. The same numbers are written per-session as
+         * `embedding_stability.json` next to each session's crops/.
+         */
+        private fun printEmbeddingStabilityTable() {
+            if (auditSummaries.isEmpty()) {
+                Log.i(TAG, "[Audit #92] no stability summaries collected (audit disabled or no replays ran)")
+                return
+            }
+            val header = "[Audit #92] === Embedding stability ==="
+            Log.i(TAG, header)
+            // First row tells us cadence
+            val firstSummary = auditSummaries.values.first()
+            val interval = firstSummary.optInt("samplingIntervalFrames", -1)
+            Log.i(TAG, "[Audit #92] sampling cadence = every $interval confirmed frames " +
+                "(k=1 ≈ ${interval * 33}ms at 30fps)")
+            Log.i(TAG, "[Audit #92] %-32s | %-8s | %-22s | %-22s | %-22s".format(
+                "video", "embedder", "k=1 p10/p50/p90 (n)", "k=5 p10/p50/p90 (n)", "k=30 p10/p50/p90 (n)"
+            ))
+            for ((video, summary) in auditSummaries) {
+                val embedders = summary.optJSONObject("embedders") ?: continue
+                val keys = embedders.keys()
+                while (keys.hasNext()) {
+                    val embName = keys.next()
+                    val emb = embedders.getJSONObject(embName)
+                    val cells = listOf(1, 5, 30).map { k ->
+                        emb.optJSONObject("k$k")?.let {
+                            "%.2f/%.2f/%.2f (%d)".format(
+                                it.getDouble("p10"), it.getDouble("p50"),
+                                it.getDouble("p90"), it.getInt("n")
+                            )
+                        } ?: "—"
+                    }
+                    Log.i(TAG, "[Audit #92] %-32s | %-8s | %-22s | %-22s | %-22s".format(
+                        video, embName, cells[0], cells[1], cells[2]
+                    ))
+                }
+            }
         }
     }
 
@@ -656,6 +701,11 @@ class VideoReplayTest {
             // Clear callbacks so subsequent tests don't see stale state.
             ot.bitmapRecycler = null
             ot.onDetectionResult = null
+            // Audit (#92): flush stability JSON now (inside the test's lock
+            // session) so we can collect a per-video summary. The @After
+            // teardown's clearLock is then a no-op for audit purposes.
+            ot.clearLock()
+            ot.lastEmbeddingStabilitySummary?.let { auditSummaries[name] = it }
         }
 
         val framesDropped = totalVideoFrames - framesProcessed - 1

@@ -22,12 +22,44 @@ class ObjectTracker(
     var deviceRotationProvider: (() -> Int)? = null
 ) {
 
+    companion object {
+        /** Sample the locked object every Nth confirmed frame and submit to [auditExecutor]. */
+        private const val AUDIT_STABILITY_INTERVAL = 5
+        /** Save a crop composite every Nth confirmed frame (subset of stability cadence). */
+        private const val AUDIT_COMPOSITE_INTERVAL = 30
+    }
+
     private val detector: ObjectDetector
     private val appearanceEmbedder: AppearanceEmbedder
     private val personClassifier: PersonAttributeClassifier
     private val faceEmbedder: FaceEmbedder
     private val personReId: PersonReIdEmbedder
     private val scenarioRecorder = ScenarioRecorder()
+
+    /** Embedding-input audit (#92): periodic crops + per-embedder stability log. */
+    private val cropDebugCapture: CropDebugCapture
+    private val stabilityLogger = EmbeddingStabilityLogger()
+    /**
+     * Most recent stability summary written by [clearLock]. Read by tests
+     * (see [VideoReplayTest]) to aggregate per-video noise floors.
+     */
+    var lastEmbeddingStabilitySummary: org.json.JSONObject? = null
+        private set
+    /**
+     * Audit work (3 embedder calls + optional composite encode) runs off the
+     * processing thread on a low-priority single-thread pool. Bounded queue +
+     * DiscardOldest means we drop audit samples under backpressure rather than
+     * stall the tracking pipeline. The single-thread pool serializes all audit
+     * work — including the composite-write path that [CropDebugCapture] now
+     * shares with us via constructor injection — so audit never adds more than
+     * one concurrent caller into the production-shared embedder monitors.
+     */
+    private val auditExecutor = java.util.concurrent.ThreadPoolExecutor(
+        1, 1, 0L, java.util.concurrent.TimeUnit.MILLISECONDS,
+        java.util.concurrent.LinkedBlockingQueue<Runnable>(4),
+        { r -> Thread(r, "AuditEmbed").apply { priority = Thread.MIN_PRIORITY } },
+        java.util.concurrent.ThreadPoolExecutor.DiscardOldestPolicy()
+    )
 
     // Keep last frame for computing embedding when user taps to lock
     private val lastFrameLock = Any()
@@ -196,6 +228,9 @@ class ObjectTracker(
         faceEmbedder = FaceEmbedder(context, personClassifier.faceDetector)
         personReId = PersonReIdEmbedder(context)
 
+        cropDebugCapture = CropDebugCapture(appearanceEmbedder, personReId, faceEmbedder, auditExecutor)
+        stabilityLogger.samplingIntervalFrames = AUDIT_STABILITY_INTERVAL
+
         // Wire ReacquisitionEngine logs to session logger
         reacquisition.sessionLogger = { msg -> debugCapture.log("[Reacq] $msg") }
         onLoadingStatus?.invoke("Ready")
@@ -302,6 +337,18 @@ class ObjectTracker(
             val locked = TrackedObject(result.trackingId, result.boundingBox, result.label)
             debugCapture.capture(DebugEvent.LOCK, result.snapshotBmp, listOf(locked), lockedObject = locked,
                 extraInfo = "id=${result.trackingId} label=${result.label} gallery=${result.gallery.size}")
+
+            // Audit instrumentation (#92): seed the stability ring with lock-time
+            // embeddings so frame 0 has something to compare frame 5 against.
+            cropDebugCapture.startSession(debugCapture.sessionDir)
+            stabilityLogger.clear()
+            val isPerson = result.label == "person"
+            cropDebugCapture.capture("LOCK", 0, result.snapshotBmp, result.boundingBox, isPerson, result.label)
+            stabilityLogger.record("mnv3", 0, result.gallery.firstOrNull())
+            if (isPerson) {
+                stabilityLogger.record("osnet", 0, result.reIdEmb)
+                stabilityLogger.record("face", 0, result.faceEmb)
+            }
         } finally {
             result.snapshotBmp.recycle()
         }
@@ -311,6 +358,18 @@ class ObjectTracker(
         scenarioRecorder.recordEvent("CLEAR")
         scenarioRecorder.stop()
         debugCapture.log("CLEAR by user")
+        // Audit (#92): drain pending audit work so the JSON includes every
+        // sample queued during the session, then flush BEFORE the debug
+        // session dir is nulled.
+        try {
+            auditExecutor.submit {}.get(2, java.util.concurrent.TimeUnit.SECONDS)
+        } catch (e: Exception) {
+            android.util.Log.w("AuditEmbed", "Audit drain timeout: ${e.message}")
+        }
+        val summary = stabilityLogger.flush(debugCapture.sessionDir)
+        if (summary != null) lastEmbeddingStabilitySummary = summary
+        cropDebugCapture.endSession()
+        stabilityLogger.clear()
         debugCapture.endSession()
         reacquisition.clear()
         visualTracker.stop()
@@ -475,6 +534,18 @@ class ObjectTracker(
                                     }
                                 }
                             }
+                        }
+
+                        // Audit instrumentation (#92): periodically run all three
+                        // embedders on the locked object's current VT crop and
+                        // record into the stability logger. The production
+                        // pipeline never embeds OSNet on the lock during VT
+                        // tracking, so we need our own sampling cadence to get
+                        // a per-embedder noise floor. Cost ≈ 17ms per sample on
+                        // person locks; gated by AUDIT_ENABLED for release builds.
+                        if (CropDebugCapture.AUDIT_ENABLED &&
+                            vtConfirmedFrames % AUDIT_STABILITY_INTERVAL == 0) {
+                            runAuditSample(bitmap, rawBox)
                         }
                     } else {
                         // Only count as unconfirmed if detector actually found detections
@@ -1026,9 +1097,55 @@ class ObjectTracker(
         return results
     }
 
+    /**
+     * Audit instrumentation (#92): snapshot the current frame + locked-object
+     * box on the processing thread, then offload all embedder calls + the
+     * composite-PNG encode to [auditExecutor]. Cost on the processing thread
+     * is just one bitmap.copy (~4ms per audit fire ≈ 0.8ms/frame averaged at
+     * the 5-frame cadence) — meaningfully cheaper than running the embedders
+     * synchronously, and isolates audit overhead from production timing so
+     * tests don't see audit-induced hangs from GPU/embedder contention.
+     */
+    private fun runAuditSample(bitmap: Bitmap, rawBox: RectF) {
+        val isPerson = reacquisition.lockedIsPerson
+        val frame = vtConfirmedFrames
+        val saveComposite = frame % AUDIT_COMPOSITE_INTERVAL == 0
+        val label = reacquisition.lastKnownLabel
+        val snapshot = try {
+            bitmap.copy(Bitmap.Config.ARGB_8888, false) ?: return
+        } catch (e: Throwable) { return }
+        val box = RectF(rawBox)
+        try {
+            auditExecutor.execute {
+                try {
+                    val mnv3 = appearanceEmbedder.embedWithFallback(snapshot, box)
+                    val osnet = if (isPerson) personReId.embed(snapshot, box) else null
+                    val face = if (isPerson) faceEmbedder.embedFace(snapshot, box) else null
+                    stabilityLogger.record("mnv3", frame, mnv3)
+                    if (isPerson) {
+                        stabilityLogger.record("osnet", frame, osnet)
+                        stabilityLogger.record("face", frame, face)
+                    }
+                    if (saveComposite) {
+                        cropDebugCapture.capture("VT", frame, snapshot, box, isPerson, label)
+                    }
+                } catch (e: Throwable) {
+                    android.util.Log.w("AuditEmbed", "Audit sample failed: ${e.message}")
+                } finally {
+                    snapshot.recycle()
+                }
+            }
+        } catch (e: java.util.concurrent.RejectedExecutionException) {
+            // Executor shut down concurrently — drop the snapshot.
+            snapshot.recycle()
+        }
+    }
+
     fun shutdown() {
         scenarioRecorder.stop()
         debugCapture.shutdown()
+        cropDebugCapture.shutdown()
+        auditExecutor.shutdownNow()
         embeddingExecutor.shutdownNow()
         lockExecutor.shutdownNow()
         pendingLockResult.getAndSet(null)?.snapshotBmp?.recycle()

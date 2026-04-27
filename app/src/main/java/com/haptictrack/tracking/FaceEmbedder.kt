@@ -3,6 +3,7 @@ package com.haptictrack.tracking
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.PointF
 import android.graphics.RectF
 import android.util.Log
 import com.google.mediapipe.framework.image.BitmapImageBuilder
@@ -125,6 +126,55 @@ class FaceEmbedder(context: Context, sharedFaceDetector: FaceDetector? = null) {
     fun close() {
         gpu.close()
         if (ownsFaceDetector) faceDetector.close()
+    }
+
+    /**
+     * Audit/debug only — runs BlazeFace and returns the 112×112 input fed to
+     * MobileFaceNet plus the face bbox and keypoints in person-crop pixel
+     * coordinates. The current pipeline ignores the keypoints, so visualizing
+     * them is the whole point — we can see what alignment we're throwing away.
+     * Caller must recycle [DebugFaceCrop.faceCrop] and [DebugFaceCrop.personCrop].
+     */
+    data class DebugFaceCrop(
+        /** The full person crop fed to BlazeFace. Caller recycles. */
+        val personCrop: Bitmap,
+        /** BlazeFace bbox in personCrop pixel space, or null if no face detected. */
+        val faceBoxOnPerson: RectF?,
+        /** BlazeFace keypoints in personCrop pixel space (typically 6: 2 eyes, nose, mouth, 2 ears). */
+        val keypoints: List<PointF>,
+        /** The 112×112 stretched crop fed to MobileFaceNet, or null if no face. Caller recycles. */
+        val faceCrop: Bitmap?
+    )
+
+    fun debugFaceCrop(bitmap: Bitmap, personBox: RectF): DebugFaceCrop? {
+        val personCrop = cropNormalized(bitmap, personBox) ?: return null
+        return try {
+            val mpImage = BitmapImageBuilder(personCrop).build()
+            val faces = synchronized(faceDetector) { faceDetector.detect(mpImage) }
+            if (faces.detections().isEmpty()) {
+                return DebugFaceCrop(personCrop, null, emptyList(), null)
+            }
+            val face = faces.detections().maxByOrNull {
+                it.boundingBox().width() * it.boundingBox().height()
+            }!!
+            val fb = face.boundingBox()
+            val faceBox = RectF(fb.left, fb.top, fb.right, fb.bottom)
+            val kps = face.keypoints().orElse(emptyList()).map { kp ->
+                // MediaPipe normalized keypoints — multiply by personCrop dims.
+                PointF(kp.x() * personCrop.width, kp.y() * personCrop.height)
+            }
+            val fx = fb.left.toInt().coerceIn(0, personCrop.width - 1)
+            val fy = fb.top.toInt().coerceIn(0, personCrop.height - 1)
+            val fw = fb.width().toInt().coerceIn(1, personCrop.width - fx)
+            val fh = fb.height().toInt().coerceIn(1, personCrop.height - fy)
+            val faceRaw = Bitmap.createBitmap(personCrop, fx, fy, fw, fh)
+            val faceResized = Bitmap.createScaledBitmap(faceRaw, INPUT_SIZE, INPUT_SIZE, true)
+            if (faceResized !== faceRaw) faceRaw.recycle()
+            DebugFaceCrop(personCrop, faceBox, kps, faceResized)
+        } catch (e: Exception) {
+            personCrop.recycle()
+            null
+        }
     }
 
     /** InsightFace preprocessing: (pixel - 127.5) / 128.0 → [-1, +1]. Fills both batch slots. */

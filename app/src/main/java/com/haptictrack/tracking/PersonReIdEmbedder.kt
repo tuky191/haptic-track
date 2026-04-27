@@ -103,6 +103,23 @@ class PersonReIdEmbedder(context: Context) {
         gpu.close()
     }
 
+    /**
+     * Audit/debug only — returns the resized 256×128 input bitmap fed to OSNet
+     * without computing the embedding. Used by [CropDebugCapture] to make the
+     * stretching/aspect-ratio behavior visible. Caller must recycle.
+     */
+    fun debugInput(bitmap: Bitmap, personBox: RectF): Bitmap? {
+        val crop = cropNormalized(bitmap, personBox) ?: return null
+        return try {
+            val resized = Bitmap.createScaledBitmap(crop, INPUT_WIDTH, INPUT_HEIGHT, true)
+            if (resized !== crop) crop.recycle()
+            resized
+        } catch (e: Exception) {
+            crop.recycle()
+            null
+        }
+    }
+
     /** ImageNet normalization: (pixel/255 - mean) / std per channel */
     private fun fillInputBuffer(bitmap: Bitmap) {
         inputBuffer.rewind()
