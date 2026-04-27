@@ -182,6 +182,24 @@ class ReacquisitionEngine(
     private var _adaptiveMobileNetFloor: Float? = null
     private var _adaptiveOsnetFloor: Float? = null
 
+    /**
+     * Live impostor stats per modality (#102 Phase 1 — diagnostic only, no gating yet).
+     * Computed lazily from the *live* gallery × *live* scene-negative cohort.
+     * Used to expose z-scores in [scoreCandidate]'s log line so we can characterize
+     * the same-vs-different separation across the existing replay scenarios before
+     * deciding what threshold the embedding override gate should use.
+     *
+     * Invalidated (set to dirty) on lock, addEmbedding, addSceneNegative,
+     * addScenePersonPair, addFaceEmbedding. Recomputed on next read.
+     */
+    private var _mnv3LiveStats: ImpostorStats? = null
+    private var _osnetLiveStats: ImpostorStats? = null
+    private var _faceLiveStats: ImpostorStats? = null
+    private var _liveStatsDirty: Boolean = true
+
+    /** Min cohort size for trustworthy z-norm stats. Below this, [znMnv3Sim] etc. return null. */
+    private val MIN_COHORT_FOR_ZNORM = 5
+
     /** Online classifier trained from gallery (positives) + scene negatives. */
     private val _classifier = OnlineClassifier()
     val classifierTrained: Boolean get() = _classifier.isTrained
@@ -216,7 +234,69 @@ class ReacquisitionEngine(
         if (_negativeExamples.size >= MAX_NEGATIVE_EXAMPLES) _negativeExamples.removeAt(0)
         _negativeExamples.add(embedding.copyOf())
         _negativeCentroid = computeCentroid(_negativeExamples)
+        _liveStatsDirty = true
     }
+
+    // ---------------------------------------------------------------------
+    // Live impostor stats / Z-norm (#102 Phase 1)
+    // ---------------------------------------------------------------------
+
+    private fun recomputeLiveStatsIfNeeded() {
+        if (!_liveStatsDirty) return
+        _mnv3LiveStats = if (_negativeExamples.size >= MIN_COHORT_FOR_ZNORM) {
+            computeImpostorStats(_embeddingGallery, _negativeExamples)
+        } else null
+
+        val osnetCohort = _sceneFacePairs.map { it.body }
+        _osnetLiveStats = if (osnetCohort.size >= MIN_COHORT_FOR_ZNORM) {
+            computeImpostorStats(lockedReIdEmbedding, osnetCohort)
+        } else null
+
+        val faceCohort = _sceneFacePairs.map { it.face }
+        _faceLiveStats = if (faceCohort.size >= MIN_COHORT_FOR_ZNORM) {
+            computeImpostorStats(lockedFaceEmbedding, faceCohort)
+        } else null
+        _liveStatsDirty = false
+    }
+
+    /**
+     * Z-normalized MNV3 similarity for [candidate]: how many σ above the live
+     * impostor distribution does this candidate's best-gallery match sit?
+     * Returns null when the cohort is below [MIN_COHORT_FOR_ZNORM] or the
+     * stats degenerate (σ ≈ 0). Phase 1: diagnostic only — log, don't gate.
+     */
+    fun znMnv3Sim(candidate: FloatArray): Float? {
+        recomputeLiveStatsIfNeeded()
+        val stats = _mnv3LiveStats ?: return null
+        if (stats.std < 1e-6f || _embeddingGallery.isEmpty()) return null
+        val raw = bestGallerySimilarity(candidate, _embeddingGallery)
+        return (raw - stats.mean) / stats.std
+    }
+
+    /** Z-normalized OSNet similarity. Null when cohort < [MIN_COHORT_FOR_ZNORM]. */
+    fun znOsnetSim(candidate: FloatArray): Float? {
+        recomputeLiveStatsIfNeeded()
+        val stats = _osnetLiveStats ?: return null
+        val anchor = lockedReIdEmbedding ?: return null
+        if (stats.std < 1e-6f) return null
+        val raw = cosineSimilarity(anchor, candidate)
+        return (raw - stats.mean) / stats.std
+    }
+
+    /** Z-normalized face similarity. Null when cohort < [MIN_COHORT_FOR_ZNORM]. */
+    fun znFaceSim(candidate: FloatArray): Float? {
+        recomputeLiveStatsIfNeeded()
+        val stats = _faceLiveStats ?: return null
+        val anchor = lockedFaceEmbedding ?: return null
+        if (stats.std < 1e-6f) return null
+        val raw = cosineSimilarity(anchor, candidate)
+        return (raw - stats.mean) / stats.std
+    }
+
+    /** Read-only access to the most recent live stats (for log/test inspection). */
+    val mnv3LiveStats: ImpostorStats? get() { recomputeLiveStatsIfNeeded(); return _mnv3LiveStats }
+    val osnetLiveStats: ImpostorStats? get() { recomputeLiveStatsIfNeeded(); return _osnetLiveStats }
+    val faceLiveStats: ImpostorStats? get() { recomputeLiveStatsIfNeeded(); return _faceLiveStats }
 
     /** Add a scene negative — an embedding from a non-locked detection seen during tracking.
      *  Builds the negative prototype for discriminative scoring. */
@@ -274,6 +354,7 @@ class ReacquisitionEngine(
             _sceneFacePairs.removeAt(0)
         }
         _sceneFacePairs.add(ScenePersonPair(face.copyOf(), body.copyOf()))
+        _liveStatsDirty = true
         Log.d(TAG, "Scene pair added: bodySim=${"%.3f".format(bodySim)} faceSim=${"%.3f".format(faceSim)} — total=${_sceneFacePairs.size}")
     }
 
@@ -378,6 +459,10 @@ class ReacquisitionEngine(
         lockedPersonAttributes = personAttrs
         lockedReIdEmbedding = reIdEmbedding?.copyOf()
         lockedFaceEmbedding = faceEmbedding?.copyOf()
+        _mnv3LiveStats = null
+        _osnetLiveStats = null
+        _faceLiveStats = null
+        _liveStatsDirty = true
         lastKnownBox = RectF(boundingBox)
         lastKnownLabel = label
         lastKnownSize = boundingBox.width() * boundingBox.height()
@@ -432,6 +517,7 @@ class ReacquisitionEngine(
     fun addFaceEmbedding(embedding: FloatArray) {
         if (lockedFaceEmbedding == null) {
             lockedFaceEmbedding = embedding.copyOf()
+            _liveStatsDirty = true
             dualLog(Log.INFO, "FACE_EMBED added (${embedding.size}-dim)")
         }
     }
@@ -449,6 +535,7 @@ class ReacquisitionEngine(
         _embeddingGallery.add(embedding.copyOf())
         recomputeCentroid()
         maybeRetrainClassifier()
+        _liveStatsDirty = true
     }
 
     fun clear() {
@@ -462,6 +549,10 @@ class ReacquisitionEngine(
         _minGallerySim = 1f
         _adaptiveMobileNetFloor = null
         _adaptiveOsnetFloor = null
+        _mnv3LiveStats = null
+        _osnetLiveStats = null
+        _faceLiveStats = null
+        _liveStatsDirty = true
         _negativeExamples.clear()
         _negativeCentroid = null
         _sceneFacePairs.clear()
@@ -572,7 +663,13 @@ class ReacquisitionEngine(
         val faceSim = if (lockedFaceEmbedding != null && candidate.faceEmbedding != null) {
             " face=${fmtF(cosineSimilarity(lockedFaceEmbedding!!, candidate.faceEmbedding!!))}"
         } else ""
-        dualLog(Log.INFO, "REACQUIRE id=${candidate.id} label=\"${candidate.label}\" after $framesLost frames (lockedLabel=\"$lockedLabel\") sim=${fmtF(sim)}$reIdSim$faceSim box=${fmtBox(candidate.boundingBox)}")
+        // Z-norm diagnostics (#102 Phase 1) — null when cohort below MIN_COHORT_FOR_ZNORM.
+        val znStr = buildString {
+            candidate.embedding?.let { znMnv3Sim(it) }?.let { append(" znMnv3=${fmtF(it)}") }
+            candidate.reIdEmbedding?.let { znOsnetSim(it) }?.let { append(" znOsnet=${fmtF(it)}") }
+            candidate.faceEmbedding?.let { znFaceSim(it) }?.let { append(" znFace=${fmtF(it)}") }
+        }
+        dualLog(Log.INFO, "REACQUIRE id=${candidate.id} label=\"${candidate.label}\" after $framesLost frames (lockedLabel=\"$lockedLabel\") sim=${fmtF(sim)}$reIdSim$faceSim$znStr box=${fmtBox(candidate.boundingBox)}")
         lockedId = candidate.id
         updateFromMatch(candidate)
         return candidate
@@ -645,7 +742,16 @@ class ReacquisitionEngine(
                     val clsStr = if (_classifier.isTrained && candidate.embedding != null) {
                         " cls=${fmtF(_classifier.predict(candidate.embedding!!))}"
                     } else ""
-                    dualLog(Log.DEBUG, "  scored id=${candidate.id} label=\"${candidate.label}\" score=${fmtF(score)} sim=${sim?.let { fmtF(it) } ?: "n/a"} color=${colorSim?.let { fmtF(it) } ?: "n/a"}$attrStr$reIdStr$faceStr$marginStr$clsStr (min=${fmtF(minScoreThreshold)})")
+                    // Z-norm diagnostics (#102 Phase 1) — null when cohort < MIN_COHORT_FOR_ZNORM.
+                    val znMnv3 = candidate.embedding?.let { znMnv3Sim(it) }
+                    val znOsnet = candidate.reIdEmbedding?.let { znOsnetSim(it) }
+                    val znFace = candidate.faceEmbedding?.let { znFaceSim(it) }
+                    val znStr = buildString {
+                        znMnv3?.let { append(" znMnv3=${fmtF(it)}") }
+                        znOsnet?.let { append(" znOsnet=${fmtF(it)}") }
+                        znFace?.let { append(" znFace=${fmtF(it)}") }
+                    }
+                    dualLog(Log.DEBUG, "  scored id=${candidate.id} label=\"${candidate.label}\" score=${fmtF(score)} sim=${sim?.let { fmtF(it) } ?: "n/a"} color=${colorSim?.let { fmtF(it) } ?: "n/a"}$attrStr$reIdStr$faceStr$marginStr$clsStr$znStr (min=${fmtF(minScoreThreshold)})")
                 }
                 Pair(candidate, score)
             } else {
@@ -999,17 +1105,62 @@ class ReacquisitionEngine(
      * similar than scene noise.
      */
     private fun computeAdaptiveFloor(positives: List<FloatArray>, negatives: List<FloatArray>): Float {
-        if (positives.isEmpty() || negatives.isEmpty()) return Float.NaN
+        val s = computeImpostorStats(positives, negatives) ?: return Float.NaN
+        return s.mean + 0.5f * s.std
+    }
+
+    /**
+     * Single-template variant: compares each negative directly to one anchor
+     * embedding (no gallery). Used for OSNet / face where the lock side is a
+     * single embedding rather than an augmented gallery.
+     */
+    private fun computeAdaptiveFloor(anchor: FloatArray, negatives: List<FloatArray>): Float {
+        val s = computeImpostorStats(anchor, negatives) ?: return Float.NaN
+        return s.mean + 0.5f * s.std
+    }
+
+    /**
+     * Per-modality impostor distribution used both for the adaptive floor
+     * (mean + 0.5σ → gate threshold) and for live z-score normalization
+     * (#102). The stats describe the empirical noise floor between the
+     * locked identity and known-impostor embeddings, so z = (rawSim − mean) / std
+     * tells us how many σ above the noise floor a given candidate's match sits.
+     */
+    data class ImpostorStats(val mean: Float, val std: Float, val n: Int)
+
+    /** Gallery variant: for each negative, scores `bestGallerySimilarity(neg, gallery)`. */
+    private fun computeImpostorStats(
+        gallery: List<FloatArray>,
+        negatives: List<FloatArray>,
+    ): ImpostorStats? {
+        if (gallery.isEmpty() || negatives.isEmpty()) return null
         val sims = FloatArray(negatives.size) { i ->
-            bestGallerySimilarity(negatives[i], positives)
+            bestGallerySimilarity(negatives[i], gallery)
         }
+        return finishStats(sims)
+    }
+
+    /** Single-anchor variant: for each negative, scores `cosineSimilarity(anchor, neg)`. */
+    private fun computeImpostorStats(
+        anchor: FloatArray?,
+        negatives: List<FloatArray>,
+    ): ImpostorStats? {
+        if (anchor == null || negatives.isEmpty()) return null
+        val sims = FloatArray(negatives.size) { i ->
+            cosineSimilarity(anchor, negatives[i])
+        }
+        return finishStats(sims)
+    }
+
+    private fun finishStats(sims: FloatArray): ImpostorStats? {
+        if (sims.isEmpty()) return null
         var sum = 0f
         for (s in sims) sum += s
         val mean = sum / sims.size
         var sqSum = 0f
         for (s in sims) sqSum += (s - mean) * (s - mean)
         val std = kotlin.math.sqrt(sqSum / sims.size)
-        return mean + 0.5f * std
+        return ImpostorStats(mean, std, sims.size)
     }
 
     /**
