@@ -294,6 +294,30 @@ class VideoReplayTest {
             result.trackingRate >= 70)
     }
 
+    /**
+     * kid_to_wife_panning: small distant kid in doorway, camera pans to wife
+     * in next room. Live-device session showed engine sim=0.864 reacquiring
+     * onto wife at frame 1 of search, but raw lock-gallery max sim is 0.541.
+     * Diagnostic test: runs the video so the augmented session.log captures
+     * ACCUM/TEMPLATE/DRIFT events during the VT lock window. Pull the log
+     * via adb to inspect the moment of accumulator firing.
+     *
+     * No assertions — when we have a hypothesis confirmed and a fix landing,
+     * tighten this into a wrongIdentityReacqs() check (boy_indoor_wife_swap
+     * does this once GT exists).
+     */
+    @Test
+    fun kid_to_wife_panning_diagnostic() {
+        val result = replayVideo("kid_to_wife_panning")
+
+        Log.i(TAG, "kid_to_wife_panning: trackingRate=${result.trackingRate}% " +
+            "reacqs=${result.reacquisitions} losses=${result.losses} " +
+            "totalFrames=${result.totalFrames}")
+
+        val firstReacq = result.events.firstOrNull { it.type == "REACQUIRE" }
+        Log.i(TAG, "kid_to_wife_panning first REACQUIRE: $firstReacq")
+    }
+
     // flowerpot_wrong_reacq: white bowl/flowerpot on table, camera zooms away and returns.
     // Black potted plant nearby. Tests that the wrong plant is NOT reacquired.
     // Regression test for: mature gallery accepting sim=0.000 candidates after timeout.
