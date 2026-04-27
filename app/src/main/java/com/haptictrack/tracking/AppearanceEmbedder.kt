@@ -18,16 +18,30 @@ import com.google.mediapipe.tasks.vision.imageembedder.ImageEmbedder
  * similarity against the stored reference.
  *
  * Model: MobileNetV3 Large — ~10MB, ~8ms per crop.
+ *
+ * #100 input flow: every embed call consumes a [CanonicalCrop] at exactly
+ * [MNV3_INPUT_SIZE]² so MediaPipe's internal `keep_aspect_ratio=false`
+ * stretch is bypassed — the model sees uniformly aspect-preserved input
+ * across every detection. When segmentation succeeds, the masked canonical
+ * is fed instead of the raw canonical so the model embeds foreground only.
  */
-class AppearanceEmbedder(context: Context) {
+class AppearanceEmbedder(
+    context: Context,
+    private val cropper: CanonicalCropper = CanonicalCropper(),
+) {
 
     companion object {
         private const val TAG = "AppearEmbed"
         private const val MODEL_PATH = "mobilenet_v3_large_embedder.tflite"
+        /**
+         * MobileNetV3 Large native input. We pre-letterbox to this so MediaPipe
+         * skips its internal resize and can't silently re-stretch our inputs.
+         */
+        const val MNV3_INPUT_SIZE = 224
     }
 
     private val embedder: ImageEmbedder
-    private val segmenter: ObjectSegmenter = ObjectSegmenter(context)
+    private val segmenter: ObjectSegmenter = ObjectSegmenter(context, cropper)
 
     init {
         embedder = try {
@@ -56,6 +70,18 @@ class AppearanceEmbedder(context: Context) {
     )
 
     /**
+     * Compute an MNV3 embedding from a prepared [CanonicalCrop]. Caller owns
+     * [canonical] and is responsible for recycling. Required dims: 224×224.
+     */
+    fun embed(canonical: CanonicalCrop): FloatArray? {
+        if (canonical.targetWidth != MNV3_INPUT_SIZE || canonical.targetHeight != MNV3_INPUT_SIZE) {
+            Log.w(TAG, "Canonical dims ${canonical.targetWidth}×${canonical.targetHeight} != expected ${MNV3_INPUT_SIZE}²")
+            return null
+        }
+        return embedBitmap(canonical.bitmap)
+    }
+
+    /**
      * Extract an embedding using segmentation masking. Returns null if segmentation
      * fails — caller should NOT match against unmasked embeddings since they include
      * too much background noise for reliable identity discrimination.
@@ -73,25 +99,51 @@ class AppearanceEmbedder(context: Context) {
     }
 
     /**
-     * Single segmentation pass that returns both the embedding and the masked crop.
-     * When [fallback] is true, falls back to raw crop if segmentation fails (used at lock time).
-     * Caller must recycle [EmbedResult.maskedCrop] when done.
+     * Single segmentation pass that returns both the embedding and the masked
+     * crop. When [fallback] is true and segmentation fails, the embedding is
+     * computed from a raw MNV3 canonical (no mask), and [EmbedResult.maskedCrop]
+     * is null. When [fallback] is false and segmentation fails, both fields are null.
+     *
+     * The returned [EmbedResult.maskedCrop], when present, is the segmenter
+     * canonical at [ObjectSegmenter.MODEL_SIZE]² with non-foreground pixels
+     * blacked out — useful for color-histogram computation. Caller recycles it.
      */
     fun embedAndCrop(bitmap: Bitmap, normalizedBox: RectF, fallback: Boolean = false): EmbedResult {
-        val segmented: Bitmap? = segmenter.segmentAndCrop(bitmap, normalizedBox)
-        val crop: Bitmap = segmented
-            ?: (if (fallback) cropNormalized(bitmap, normalizedBox) else null)
-            ?: return EmbedResult(null, null)
-        val embedding = try {
-            embedBitmap(crop)
-        } catch (e: Exception) {
-            Log.w(TAG, "Embed failed: ${e.message}")
-            null
+        // Try the segmenter canonical path first.
+        val segCanonical = cropper.prepare(
+            bitmap, normalizedBox,
+            targetWidth = ObjectSegmenter.MODEL_SIZE, targetHeight = ObjectSegmenter.MODEL_SIZE,
+        )
+        val masked: Bitmap? = if (segCanonical != null) {
+            try { segmenter.segmentCanonical(segCanonical) }
+            finally { segCanonical.bitmap.recycle() }
+        } else null
+
+        if (masked != null) {
+            // Downscale masked 512² → 224² for MNV3. Both letterbox-fit the same
+            // source aspect, so this is a clean shrink — no aspect distortion.
+            val mnv3Input = Bitmap.createScaledBitmap(masked, MNV3_INPUT_SIZE, MNV3_INPUT_SIZE, true)
+            val embedding = try {
+                embedBitmap(mnv3Input)
+            } catch (e: Exception) {
+                Log.w(TAG, "Embed failed: ${e.message}")
+                null
+            }
+            if (mnv3Input !== masked) mnv3Input.recycle()
+            return EmbedResult(embedding, masked)
         }
-        // Return the segmented crop for histogram use (not the fallback raw crop).
-        // If segmentation failed and we used a raw crop fallback, recycle it and return null maskedCrop.
-        if (segmented == null) crop.recycle()
-        return EmbedResult(embedding, segmented)
+
+        // Segmentation skipped or failed. Caller may want a raw fallback.
+        if (!fallback) return EmbedResult(null, null)
+        val mnv3Canonical = cropper.prepare(
+            bitmap, normalizedBox,
+            targetWidth = MNV3_INPUT_SIZE, targetHeight = MNV3_INPUT_SIZE,
+        ) ?: return EmbedResult(null, null)
+        return try {
+            EmbedResult(embedBitmap(mnv3Canonical.bitmap), null)
+        } finally {
+            mnv3Canonical.bitmap.recycle()
+        }
     }
 
     /**
@@ -104,40 +156,58 @@ class AppearanceEmbedder(context: Context) {
     )
 
     /**
-     * Embed the crop plus augmented variants (rotated 90°/180°/270°, flipped).
-     * Uses the segmenter to mask out background pixels before embedding.
-     * Returns embeddings covering multiple orientations plus the masked crop for histogram use.
-     * Single segmentation pass — avoids calling the segmenter twice.
-     * Caller must recycle [AugmentedResult.maskedCrop] when done.
+     * Embed the canonical crop plus augmented variants (rotated 90/180/270, flipped).
+     * Uses the segmenter to mask out background pixels before embedding when possible.
+     * Returns embeddings covering multiple orientations plus the masked segmenter
+     * canonical for histogram use (caller recycles). Single segmentation pass.
      */
     fun embedWithAugmentations(bitmap: Bitmap, normalizedBox: RectF): AugmentedResult {
-        val segmented = segmenter.segmentAndCrop(bitmap, normalizedBox)
-        val crop = segmented ?: cropNormalized(bitmap, normalizedBox) ?: return AugmentedResult(emptyList(), null)
+        // Obtain the same pair (mnv3-input, masked-crop) as embedAndCrop, but
+        // we need to keep the mnv3-input around for rotations.
+        val segCanonical = cropper.prepare(
+            bitmap, normalizedBox,
+            targetWidth = ObjectSegmenter.MODEL_SIZE, targetHeight = ObjectSegmenter.MODEL_SIZE,
+        )
+        val masked: Bitmap? = if (segCanonical != null) {
+            try { segmenter.segmentCanonical(segCanonical) }
+            finally { segCanonical.bitmap.recycle() }
+        } else null
+
+        // Build the mnv3-input source: from masked canonical when available,
+        // otherwise from a raw mnv3 canonical (lock time wants gallery diversity
+        // even when segmentation fails).
+        val (mnv3Source, ownsSource) = if (masked != null) {
+            Pair(Bitmap.createScaledBitmap(masked, MNV3_INPUT_SIZE, MNV3_INPUT_SIZE, true), true)
+        } else {
+            val raw = cropper.prepare(
+                bitmap, normalizedBox,
+                targetWidth = MNV3_INPUT_SIZE, targetHeight = MNV3_INPUT_SIZE,
+            )
+            if (raw == null) return AugmentedResult(emptyList(), masked)
+            Pair(raw.bitmap, true)  // canonical owner — we recycle below
+        }
+
         val results = mutableListOf<FloatArray>()
-
         try {
-            // Original
-            embedBitmap(crop)?.let { results.add(it) }
+            embedBitmap(mnv3Source)?.let { results.add(it) }
 
-            // Rotated 90°, 180°, 270°
             for (degrees in listOf(90f, 180f, 270f)) {
-                val rotated = rotateBitmap(crop, degrees)
+                val rotated = rotateBitmap(mnv3Source, degrees)
                 embedBitmap(rotated)?.let { results.add(it) }
-                if (rotated !== crop) rotated.recycle()
+                if (rotated !== mnv3Source) rotated.recycle()
             }
 
-            // Horizontal flip
-            val flipped = flipBitmap(crop)
+            val flipped = flipBitmap(mnv3Source)
             embedBitmap(flipped)?.let { results.add(it) }
             flipped.recycle()
         } catch (e: Exception) {
             Log.w(TAG, "Augmented embedding failed: ${e.message}")
+        } finally {
+            if (ownsSource) mnv3Source.recycle()
         }
-        // Don't recycle crop here — if it's the segmented one, return it for histogram use
-        if (segmented == null) crop.recycle()
 
         Log.d(TAG, "Generated ${results.size} augmented embeddings")
-        return AugmentedResult(results, segmented)
+        return AugmentedResult(results, masked)
     }
 
     private fun embedBitmap(bitmap: Bitmap): FloatArray? {

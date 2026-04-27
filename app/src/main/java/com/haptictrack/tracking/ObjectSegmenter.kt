@@ -18,9 +18,11 @@ import java.nio.ByteOrder
 /**
  * Segments an object from its background using the magic_touch model via raw TFLite.
  *
- * Given a full frame and a bounding box, returns a cropped bitmap where background
- * pixels are zeroed out (transparent black). This ensures embeddings encode only the
- * object's appearance, not the surrounding context.
+ * Given a [CanonicalCrop] at [MODEL_SIZE]² (already aspect-preserved-letterboxed),
+ * produces a binary foreground mask in canonical pixel space and applies it to
+ * yield a masked bitmap. Pre-#100 callers used [segmentAndCrop] which built its
+ * own stretch-to-square crop; that wrapper now delegates to the canonical path
+ * so the model sees uniformly-shaped input regardless of bbox aspect.
  *
  * Model: magic_touch.tflite (~6MB).
  * Input:  [1, 512, 512, 4] float32 — RGB (0-1) + keypoint channel (1.0 at ROI center)
@@ -28,16 +30,22 @@ import java.nio.ByteOrder
  *
  * Runs via raw TFLite GPU delegate (bypasses MediaPipe's broken GPU mask readback).
  */
-class ObjectSegmenter(context: Context) {
+class ObjectSegmenter(
+    context: Context,
+    private val cropper: CanonicalCropper = CanonicalCropper(),
+) {
 
     companion object {
         private const val TAG = "ObjSegmenter"
         private const val MODEL_ASSET = "magic_touch.tflite"
-        private const val MODEL_SIZE = 512
+        const val MODEL_SIZE = 512
         /** Confidence threshold: pixels below this are considered background. */
         private const val MASK_THRESHOLD = 0.8f
-        /** Max pixels for segmenter input. Large crops downscaled for speed. */
-        private const val MAX_SEGMENT_PIXELS = 90_000  // ~300x300
+        /** Skip segmentation if the bbox covers more than this fraction of the frame. */
+        private const val MAX_BBOX_FRACTION = 0.5f
+        /** Minimum / maximum acceptable foreground percentage of a useful mask. */
+        private const val MIN_USEFUL_FG_PCT = 5
+        private const val MAX_USEFUL_FG_PCT = 95
         /** Radius (in model pixels) for the keypoint indicator blob. */
         private const val KEYPOINT_RADIUS = 8
     }
@@ -60,91 +68,99 @@ class ObjectSegmenter(context: Context) {
     }
 
     /**
-     * Segment the object at [normalizedBox] from the full [bitmap], then crop.
+     * Segment the object inside [canonical] (must be [MODEL_SIZE]²) and apply
+     * the mask. Returns a freshly-allocated [MODEL_SIZE]² bitmap with non-foreground
+     * pixels zeroed, or null when the bbox is too large, when the model is
+     * unhappy with the mask quality (foreground % out of range), or on error.
      *
-     * Returns a cropped bitmap where background pixels are zeroed, or null on failure.
-     * The crop region matches [normalizedBox] (same as AppearanceEmbedder.cropBitmap).
+     * Caller owns [canonical] (no recycle here) and the returned bitmap.
      */
     @Synchronized
-    fun segmentAndCrop(bitmap: Bitmap, normalizedBox: RectF): Bitmap? {
-        var cropBitmap: Bitmap? = null
+    fun segmentCanonical(canonical: CanonicalCrop): Bitmap? {
+        if (canonical.targetWidth != MODEL_SIZE || canonical.targetHeight != MODEL_SIZE) {
+            Log.w(TAG, "Canonical dims ${canonical.targetWidth}×${canonical.targetHeight} != expected ${MODEL_SIZE}²")
+            return null
+        }
+        // Skip segmentation for crops covering most of the frame — same guard
+        // as the legacy path, since a >50% bbox usually means we're already
+        // pointing at the subject directly.
+        val srcBox = canonical.sourceBoxNormalized
+        val frac = (srcBox.right - srcBox.left) * (srcBox.bottom - srcBox.top)
+        if (frac > MAX_BBOX_FRACTION) return null
+
         return try {
-            val imgW = bitmap.width
-            val imgH = bitmap.height
-
-            // Crop to bounding box with padding FIRST, then segment the crop.
-            val pad = 0.05f
-            val cl = ((normalizedBox.left - pad) * imgW).toInt().coerceIn(0, imgW - 1)
-            val ct = ((normalizedBox.top - pad) * imgH).toInt().coerceIn(0, imgH - 1)
-            val cr = ((normalizedBox.right + pad) * imgW).toInt().coerceIn(cl + 1, imgW)
-            val cb = ((normalizedBox.bottom + pad) * imgH).toInt().coerceIn(ct + 1, imgH)
-            val cw = cr - cl
-            val ch = cb - ct
-            if (cw < 10 || ch < 10) return null
-
-            // Skip segmentation for crops that cover most of the frame
-            val cropFraction = (cw.toFloat() * ch) / (imgW.toFloat() * imgH)
-            if (cropFraction > 0.5f) return null
-
-            cropBitmap = Bitmap.createBitmap(bitmap, cl, ct, cw, ch)
-            val inputCrop = if (cropBitmap!!.config != Bitmap.Config.ARGB_8888) {
-                val c = cropBitmap!!.copy(Bitmap.Config.ARGB_8888, false)
-                cropBitmap!!.recycle()
-                c.also { cropBitmap = it }
-            } else cropBitmap!!
-
-            // Resize to model input size
-            val resized = Bitmap.createScaledBitmap(inputCrop, MODEL_SIZE, MODEL_SIZE, true)
-
-            // Fill input buffer: RGB normalized to [0,1] + keypoint channel
-            fillInputBuffer(resized)
-            if (resized !== inputCrop) resized.recycle()
+            fillInputBuffer(canonical.bitmap)
 
             val t0 = android.os.SystemClock.elapsedRealtimeNanos()
             outputBuffer.rewind()
             interpreter.run(inputBuffer, outputBuffer)
             val segMs = (android.os.SystemClock.elapsedRealtimeNanos() - t0) / 1_000_000f
 
-            // Read mask from output buffer
             outputBuffer.rewind()
             val mask = FloatArray(MODEL_SIZE * MODEL_SIZE)
             outputBuffer.asFloatBuffer().get(mask)
 
-            // Apply mask to the crop pixels (map model coords back to crop coords)
-            val srcPixels = IntArray(cw * ch)
-            inputCrop.getPixels(srcPixels, 0, cw, 0, 0, cw, ch)
+            // Apply mask in canonical space — no remap needed (bitmap is at MODEL_SIZE²).
+            val totalPixels = MODEL_SIZE * MODEL_SIZE
+            val srcPixels = IntArray(totalPixels)
+            canonical.bitmap.getPixels(srcPixels, 0, MODEL_SIZE, 0, 0, MODEL_SIZE, MODEL_SIZE)
 
             var fgCount = 0
-            val totalPixels = cw * ch
             val black = Color.BLACK
-            for (y in 0 until ch) {
-                for (x in 0 until cw) {
-                    val maskX = (x.toFloat() / cw * MODEL_SIZE).toInt().coerceIn(0, MODEL_SIZE - 1)
-                    val maskY = (y.toFloat() / ch * MODEL_SIZE).toInt().coerceIn(0, MODEL_SIZE - 1)
-                    if (mask[maskY * MODEL_SIZE + maskX] >= MASK_THRESHOLD) {
-                        fgCount++
-                    } else {
-                        srcPixels[y * cw + x] = black
-                    }
+            for (i in 0 until totalPixels) {
+                if (mask[i] >= MASK_THRESHOLD) {
+                    fgCount++
+                } else {
+                    srcPixels[i] = black
                 }
             }
 
             val fgPct = if (totalPixels > 0) fgCount * 100 / totalPixels else 0
-            Log.d(TAG, "Mask: ${fgCount}/${totalPixels} fg pixels (${fgPct}%) crop=${cw}x${ch} ${String.format("%.0f", segMs)}ms")
+            Log.d(TAG, "Mask: ${fgCount}/${totalPixels} fg pixels (${fgPct}%) ${String.format("%.0f", segMs)}ms")
 
-            if (fgPct < 5 || fgPct > 95) {
+            if (fgPct < MIN_USEFUL_FG_PCT || fgPct > MAX_USEFUL_FG_PCT) {
                 Log.d(TAG, "Mask not useful (${fgPct}%), falling back to raw crop")
                 return null
             }
 
-            val maskedCrop = Bitmap.createBitmap(cw, ch, Bitmap.Config.ARGB_8888)
-            maskedCrop.setPixels(srcPixels, 0, cw, 0, 0, cw, ch)
-            maskedCrop
+            val masked = Bitmap.createBitmap(MODEL_SIZE, MODEL_SIZE, Bitmap.Config.ARGB_8888)
+            masked.setPixels(srcPixels, 0, MODEL_SIZE, 0, 0, MODEL_SIZE, MODEL_SIZE)
+            masked
         } catch (e: Exception) {
             Log.w(TAG, "Segmentation failed: ${e.message}")
             null
+        }
+    }
+
+    /**
+     * Legacy entrypoint — builds a canonical, segments, and crops the masked
+     * canonical back to source-bbox aspect (matching the historical contract
+     * that callers expect for color-histogram + MNV3 input). Returned bitmap's
+     * dimensions are the crop's *post-pad* source pixel size; pixels are
+     * masked with [Color.BLACK] outside the foreground.
+     */
+    fun segmentAndCrop(bitmap: Bitmap, normalizedBox: RectF): Bitmap? {
+        val canonical = cropper.prepare(
+            bitmap, normalizedBox,
+            targetWidth = MODEL_SIZE, targetHeight = MODEL_SIZE,
+        ) ?: return null
+        val pad = canonical.padding
+        val drawW = canonical.drawWidth
+        val drawH = canonical.drawHeight
+        val masked = try {
+            segmentCanonical(canonical)
         } finally {
-            cropBitmap?.recycle()
+            canonical.bitmap.recycle()
+        } ?: return null
+
+        return try {
+            if (drawW <= 0 || drawH <= 0) null
+            else Bitmap.createBitmap(masked, pad.left, pad.top, drawW, drawH)
+        } catch (e: Exception) {
+            Log.w(TAG, "Crop after mask failed: ${e.message}")
+            null
+        } finally {
+            masked.recycle()
         }
     }
 
@@ -170,7 +186,6 @@ class ObjectSegmenter(context: Context) {
             inputBuffer.putFloat(Color.green(pixel) / 255f)
             inputBuffer.putFloat(Color.blue(pixel) / 255f)
 
-            // Keypoint channel: 1.0 within radius of center
             val dx = x - cx
             val dy = y - cy
             inputBuffer.putFloat(if (dx * dx + dy * dy <= radiusSq) 1f else 0f)
@@ -179,37 +194,30 @@ class ObjectSegmenter(context: Context) {
     }
 
     /**
-     * Extract the contour of the object at [normalizedBox] as normalized [0,1] points.
-     * Uses the segmentation mask + OpenCV findContours + approxPolyDP for a smooth outline.
-     * Returns an empty list on failure.
+     * Extract the object contour as normalized [0,1] points in the full source
+     * frame's coordinate space. Uses the segmentation mask + OpenCV
+     * findContours + approxPolyDP for a smooth outline.
      */
     @Synchronized
     fun extractContour(bitmap: Bitmap, normalizedBox: RectF): List<PointF> {
-        var crop: Bitmap? = null
+        val canonical = cropper.prepare(
+            bitmap, normalizedBox,
+            targetWidth = MODEL_SIZE, targetHeight = MODEL_SIZE,
+        ) ?: return emptyList()
         return try {
-            val imgW = bitmap.width
-            val imgH = bitmap.height
-            val pad = 0.05f
-            val cropLeft = ((normalizedBox.left - pad) * imgW).toInt().coerceIn(0, imgW - 1)
-            val cropTop = ((normalizedBox.top - pad) * imgH).toInt().coerceIn(0, imgH - 1)
-            val cropRight = ((normalizedBox.right + pad) * imgW).toInt().coerceIn(cropLeft + 1, imgW)
-            val cropBottom = ((normalizedBox.bottom + pad) * imgH).toInt().coerceIn(cropTop + 1, imgH)
-            val cropW = cropRight - cropLeft
-            val cropH = cropBottom - cropTop
-            if (cropW < 10 || cropH < 10) return emptyList()
+            extractContourFromCanonical(canonical, bitmap.width, bitmap.height)
+        } finally {
+            canonical.bitmap.recycle()
+        }
+    }
 
-            crop = Bitmap.createBitmap(bitmap, cropLeft, cropTop, cropW, cropH)
-            val inputCrop = if (crop.config != Bitmap.Config.ARGB_8888) {
-                val c = crop.copy(Bitmap.Config.ARGB_8888, false)
-                crop.recycle()
-                c.also { crop = it }
-            } else crop!!
-
-            // Resize to model input size
-            val resized = Bitmap.createScaledBitmap(inputCrop, MODEL_SIZE, MODEL_SIZE, true)
-            fillInputBuffer(resized)
-            if (resized !== inputCrop) resized.recycle()
-
+    private fun extractContourFromCanonical(
+        canonical: CanonicalCrop,
+        fullW: Int,
+        fullH: Int,
+    ): List<PointF> {
+        return try {
+            fillInputBuffer(canonical.bitmap)
             outputBuffer.rewind()
             interpreter.run(inputBuffer, outputBuffer)
 
@@ -217,7 +225,6 @@ class ObjectSegmenter(context: Context) {
             val mask = FloatArray(MODEL_SIZE * MODEL_SIZE)
             outputBuffer.asFloatBuffer().get(mask)
 
-            // Build binary mask
             val maskMat = Mat(MODEL_SIZE, MODEL_SIZE, CvType.CV_8UC1)
             val maskBytes = ByteArray(MODEL_SIZE * MODEL_SIZE)
             for (i in mask.indices) {
@@ -225,12 +232,10 @@ class ObjectSegmenter(context: Context) {
             }
             maskMat.put(0, 0, maskBytes)
 
-            // Heavy erosion to shrink mask well inside the object boundary.
             val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, org.opencv.core.Size(15.0, 15.0))
             Imgproc.erode(maskMat, maskMat, kernel)
             kernel.release()
 
-            // Find contours
             val contours = mutableListOf<MatOfPoint>()
             val hierarchy = Mat()
             Imgproc.findContours(maskMat, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
@@ -241,17 +246,27 @@ class ObjectSegmenter(context: Context) {
 
             val largest = contours.maxByOrNull { Imgproc.contourArea(it) } ?: return emptyList()
 
-            // Smooth contour
             val contour2f = MatOfPoint2f(*largest.toArray())
             val epsilon = Imgproc.arcLength(contour2f, true) * 0.003
             val approx = MatOfPoint2f()
             Imgproc.approxPolyDP(contour2f, approx, epsilon, true)
 
-            // Convert mask-space points → full image normalized [0,1] coordinates
+            val pad = canonical.padding
+            val drawW = canonical.drawWidth.toFloat()
+            val drawH = canonical.drawHeight.toFloat()
+            val sc = canonical.sourceCropPx
+
             val points = approx.toArray().map { pt ->
-                val pixX = cropLeft + pt.x.toFloat() / MODEL_SIZE * cropW
-                val pixY = cropTop + pt.y.toFloat() / MODEL_SIZE * cropH
-                PointF(pixX / imgW, pixY / imgH)
+                // Mask coord == canonical coord (bitmap is exactly MODEL_SIZE²).
+                val cx = pt.x.toFloat()
+                val cy = pt.y.toFloat()
+                // Within the rendered source region (drawDest in target pixels)?
+                val dx = ((cx - pad.left) / drawW).coerceIn(0f, 1f)
+                val dy = ((cy - pad.top) / drawH).coerceIn(0f, 1f)
+                // Source-pixel coords inside the cropped (post-pad) region.
+                val sxPx = sc.left + dx * sc.width()
+                val syPx = sc.top + dy * sc.height()
+                PointF(sxPx / fullW, syPx / fullH)
             }
 
             contours.forEach { it.release() }
@@ -263,8 +278,6 @@ class ObjectSegmenter(context: Context) {
         } catch (e: Exception) {
             Log.w(TAG, "Contour extraction failed: ${e.message}")
             emptyList()
-        } finally {
-            crop?.recycle()
         }
     }
 
