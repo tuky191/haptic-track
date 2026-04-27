@@ -56,8 +56,17 @@ class CropDebugCapture(
         private const val HEADER_HEIGHT = 28
         private const val PADDING = 6
 
-        /** Audit enabled at compile time. Flip to false to disable instrumentation. */
-        const val AUDIT_ENABLED = true
+        /**
+         * Audit enabled at compile time. **Off by default** because the audit
+         * thread shares `@Synchronized` embedder monitors with the production
+         * pipeline; on multi-test suite runs the contention slows search-mode
+         * embedding work enough to perturb tracking-rate and reacquire-identity
+         * assertions (see #96). The audit's own *output* is unaffected by
+         * this contention — embeddings are deterministic functions of (frame,
+         * box) — so flipping this to true is the right one-shot move when
+         * collecting a baseline. Then flip back to false before merging.
+         */
+        const val AUDIT_ENABLED = false
     }
 
     private val frameTimeFormat = DateTimeFormatter.ofPattern("HHmmss_SSS")
