@@ -22,6 +22,13 @@ class ObjectTracker(
     var deviceRotationProvider: (() -> Int)? = null
 ) {
 
+    companion object {
+        /** Sample the locked object every Nth confirmed frame and submit to [auditExecutor]. */
+        private const val AUDIT_STABILITY_INTERVAL = 5
+        /** Save a crop composite every Nth confirmed frame (subset of stability cadence). */
+        private const val AUDIT_COMPOSITE_INTERVAL = 30
+    }
+
     private val detector: ObjectDetector
     private val appearanceEmbedder: AppearanceEmbedder
     private val personClassifier: PersonAttributeClassifier
@@ -38,16 +45,14 @@ class ObjectTracker(
      */
     var lastEmbeddingStabilitySummary: org.json.JSONObject? = null
         private set
-    /** Sample the locked object every Nth confirmed frame and submit to [auditExecutor]. */
-    private val AUDIT_STABILITY_INTERVAL = 5
-    /** Save a crop composite every Nth confirmed frame (subset of stability cadence). */
-    private val AUDIT_COMPOSITE_INTERVAL = 30
     /**
      * Audit work (3 embedder calls + optional composite encode) runs off the
      * processing thread on a low-priority single-thread pool. Bounded queue +
      * DiscardOldest means we drop audit samples under backpressure rather than
-     * stall the tracking pipeline. The pool serializes audit work so we don't
-     * add concurrent calls into already-synchronized embedders.
+     * stall the tracking pipeline. The single-thread pool serializes all audit
+     * work — including the composite-write path that [CropDebugCapture] now
+     * shares with us via constructor injection — so audit never adds more than
+     * one concurrent caller into the production-shared embedder monitors.
      */
     private val auditExecutor = java.util.concurrent.ThreadPoolExecutor(
         1, 1, 0L, java.util.concurrent.TimeUnit.MILLISECONDS,
@@ -223,7 +228,7 @@ class ObjectTracker(
         faceEmbedder = FaceEmbedder(context, personClassifier.faceDetector)
         personReId = PersonReIdEmbedder(context)
 
-        cropDebugCapture = CropDebugCapture(appearanceEmbedder, personReId, faceEmbedder)
+        cropDebugCapture = CropDebugCapture(appearanceEmbedder, personReId, faceEmbedder, auditExecutor)
         stabilityLogger.samplingIntervalFrames = AUDIT_STABILITY_INTERVAL
 
         // Wire ReacquisitionEngine logs to session logger
@@ -337,7 +342,6 @@ class ObjectTracker(
             // embeddings so frame 0 has something to compare frame 5 against.
             cropDebugCapture.startSession(debugCapture.sessionDir)
             stabilityLogger.clear()
-            stabilityLogger.samplingIntervalFrames = AUDIT_STABILITY_INTERVAL
             val isPerson = result.label == "person"
             cropDebugCapture.capture("LOCK", 0, result.snapshotBmp, result.boundingBox, isPerson, result.label)
             stabilityLogger.record("mnv3", 0, result.gallery.firstOrNull())

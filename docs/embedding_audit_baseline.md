@@ -131,7 +131,9 @@ adb shell am instrument -w \
   -e class com.haptictrack.tracking.VideoReplayTest#man_desk_camera_swing_reacquires_correctly \
   com.haptictrack.test/androidx.test.runner.AndroidJUnitRunner
 
-# Full suite (currently flaky — see "Known issues" above):
+# Full suite — runs ~44 minutes with audit on; expect 2 audit-induced failures
+# (man_desk_camera_swing_tracking_rate, mouse_desk_rotation_reacquires_correctly).
+# See "Notes from baseline collection" above:
 adb shell am instrument -w com.haptictrack.test/androidx.test.runner.AndroidJUnitRunner
 
 # Pull results:

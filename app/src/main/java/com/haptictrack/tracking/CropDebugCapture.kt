@@ -13,9 +13,8 @@ import java.io.File
 import java.io.FileOutputStream
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
-import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.ThreadPoolExecutor
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.Executor
+import java.util.concurrent.RejectedExecutionException
 
 /**
  * Audit instrumentation (#92): captures the actual crops fed to each embedder
@@ -45,6 +44,13 @@ class CropDebugCapture(
     private val appearanceEmbedder: AppearanceEmbedder,
     private val personReId: PersonReIdEmbedder,
     private val faceEmbedder: FaceEmbedder,
+    /**
+     * Worker that runs composite-write tasks. Shared with [ObjectTracker.auditExecutor]
+     * so all audit work — stability sampling and composite writing — serializes on
+     * one thread. Avoids a separate `captureExecutor` adding a third concurrent
+     * caller to the `@Synchronized` segmenter / BlazeFace monitors.
+     */
+    private val executor: Executor,
 ) {
 
     companion object {
@@ -70,13 +76,6 @@ class CropDebugCapture(
     }
 
     private val frameTimeFormat = DateTimeFormatter.ofPattern("HHmmss_SSS")
-
-    private val captureQueue = LinkedBlockingQueue<Runnable>(8)
-    private val captureExecutor = ThreadPoolExecutor(
-        1, 1, 0L, TimeUnit.MILLISECONDS, captureQueue,
-        { r -> Thread(r, "CropAudit-IO").apply { priority = Thread.MIN_PRIORITY } },
-        ThreadPoolExecutor.DiscardOldestPolicy()
-    )
 
     @Volatile private var sessionDir: File? = null
     @Volatile private var capturesThisSession: Int = 0
@@ -146,20 +145,23 @@ class CropDebugCapture(
         val ts = LocalTime.now().format(frameTimeFormat)
         val box = RectF(normalizedBox)
 
-        captureExecutor.execute {
-            try {
-                writeComposite(dir, eventTag, frameIndex, ts, snapshot, box, isPerson, label)
-            } catch (e: Throwable) {
-                Log.w(TAG, "Composite write failed: ${e.message}")
-            } finally {
-                snapshot.recycle()
+        try {
+            executor.execute {
+                try {
+                    writeComposite(dir, eventTag, frameIndex, ts, snapshot, box, isPerson, label)
+                } catch (e: Throwable) {
+                    Log.w(TAG, "Composite write failed: ${e.message}")
+                } finally {
+                    snapshot.recycle()
+                }
             }
+        } catch (e: RejectedExecutionException) {
+            // Shared executor shut down concurrently — drop the snapshot.
+            snapshot.recycle()
         }
     }
 
     fun shutdown() {
-        captureExecutor.shutdown()
-        captureExecutor.awaitTermination(2, TimeUnit.SECONDS)
         endSession()
     }
 
@@ -274,7 +276,6 @@ class CropDebugCapture(
         }
 
         // Build composite
-        val tileBlockHeight = HEADER_HEIGHT + TILE_WIDTH + PADDING * 2  // worst-case square tile
         val titleHeight = 32
         // Compute actual tile heights (preserve aspect) and total composite height
         val tileHeights = tiles.map { tile ->

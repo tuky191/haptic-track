@@ -34,13 +34,13 @@ class EmbeddingStabilityLogger {
         val K_VALUES = intArrayOf(1, 5, 30)    // samples back to compare against
     }
 
-    private class Ring(capacity: Int) {
+    private class Ring(private val capacity: Int) {
         val embeddings = arrayOfNulls<FloatArray>(capacity)
         val frames = IntArray(capacity)
         var size = 0
         var head = 0   // next write index
 
-        fun add(frame: Int, emb: FloatArray, capacity: Int) {
+        fun add(frame: Int, emb: FloatArray) {
             embeddings[head] = emb
             frames[head] = frame
             head = (head + 1) % capacity
@@ -48,7 +48,7 @@ class EmbeddingStabilityLogger {
         }
 
         /** Returns the embedding [k] samples back from the most recent, or null if not enough samples yet. */
-        fun nthBack(k: Int, capacity: Int): Pair<Int, FloatArray>? {
+        fun nthBack(k: Int): Pair<Int, FloatArray>? {
             if (size <= k) return null
             val idx = (head - 1 - k + capacity) % capacity
             val emb = embeddings[idx] ?: return null
@@ -87,12 +87,12 @@ class EmbeddingStabilityLogger {
         val stats = embedders.getOrPut(embedderName) { EmbedderStats(embedderName) }
         // Compute deltas first (against the existing ring), then add.
         for (k in K_VALUES) {
-            val past = stats.ring.nthBack(k - 1, RING_CAPACITY) ?: continue
+            val past = stats.ring.nthBack(k - 1) ?: continue
             val sim = cosineSimilarity(past.second, emb)
             stats.deltas[k]?.add(sim)
         }
         // Defensive copy — the caller may reuse the array.
-        stats.ring.add(frameIndex, emb.copyOf(), RING_CAPACITY)
+        stats.ring.add(frameIndex, emb.copyOf())
         stats.sampledFrames.add(frameIndex)
     }
 
