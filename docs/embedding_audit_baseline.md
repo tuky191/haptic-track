@@ -110,6 +110,72 @@ Three patterns hold across every video:
 | **#94** masked OSNet | OSNet currently embeds wallpaper alongside the person. Masking removes that. | OSNet k=30 p50 climbs (less drift from background context). Same-person sim rises, different-person stays put. The win is wider separation, not just shifted means. |
 | **#95** letterbox | Aspect-ratio jitter between consecutive frames produces input variation that all three embedders convert into output variation. Letterboxing fixes the input side. | Primary signal is k=1 self-similarity rising — narrower noise band. |
 
+## Validation pass — are the numbers actually meaningful?
+
+Stability percentiles tell us "how consistent is *the same object* across frames" but say nothing about "does the embedder distinguish *different* objects." If MNV3 of the locked person is 0.91 across consecutive frames AND 0.89 against a different person in the same frame, the embedder is useless regardless of how stable it is. So we computed **same-vs-different cosines from the per-frame `scenario.json` detection embeddings**:
+
+- "same" = consecutive same-id detection pairs (≤5 frame gap)
+- "different" = distinct-id pairs in the same frame, both `label=='person'`
+
+| Video | Embedder | Same p10/p50/p90 (n) | Different p10/p50/p90 (n) | p50 separation |
+|---|---|---|---|---|
+| crowd_street | MNV3 | 0.43 / 1.00 / 1.00 (42) | 0.20 / 0.34 / 0.57 (45) | **+0.66** |
+| | OSNet | 0.81 / 1.00 / 1.00 (42) | 0.44 / 0.51 / 0.63 (45) | **+0.49** |
+| person_playground_tracking_rate | MNV3 | 0.42 / 0.86 / 1.00 (96) | 0.25 / 0.25 / 0.25 (1) | **+0.61** |
+| | OSNet | 0.82 / 0.92 / 1.00 (91) | 0.57 / 0.57 / 0.57 (1) | **+0.35** |
+| boy_indoor_wife_swap_tracking_rate | MNV3 | 0.67 / 0.95 / 1.00 (79) | 0.34 / 0.39 / 0.40 (5) | **+0.56** |
+| | OSNet | 0.93 / 1.00 / 1.00 (48) | 0.54 / 0.60 / 0.61 (5) | **+0.40** |
+
+**The embedders DO discriminate.** Same-vs-different separation at the p50 is +0.35 to +0.66 across the multi-person tests. The wrong-person reacquires we see in production aren't a "discrimination is broken" failure — they're threshold/edge-case failures. Same-p50 inflates to 1.00 in many cases because production caches embeddings across frames (same id → reused embedding); the honest "same" signal is the p10 column where recomputation actually fired.
+
+> Caveat: only `crowd_street` has a robust diff sample (45 pairs); the others have ≤5 because in single-prominent-subject scenes the secondary persons are frequently undetected by EfficientDet. Larger diff samples need denser scenes.
+
+## Validation pass — what do the actual crops look like?
+
+> ![crowd_street lock](embedding_audit_examples/crowd_street_lock.jpg)
+>
+> *crowd_street LOCK — bbox is **73×258 pixels** (a tall, narrow strip). Segmenter succeeds and cleanly isolates the purple-shirted subject from the surrounding crowd; this is the cleanest masked crop we've captured. OSNet sees the raw 73×258 stretched to 128×256 — modest distortion. BlazeFace finds **no face** (subject too small at this distance), so face contributes nothing on this lock.*
+
+> ![person_playground lock](embedding_audit_examples/person_playground_lock.jpg)
+>
+> *person_playground LOCK — pathological. Bbox is **28×50 pixels**. Segmenter "succeeds" but the mask is mostly empty pixels (segmenter latched onto a small object in the box). OSNet upscales 28→128 px (4.5×). BlazeFace finds no face. **At this resolution every embedder is essentially embedding noise** — explains MNV3 k=1 p10 = 0.20 on this video. A min-bbox-size guard at lock time would reject this.*
+
+> ![boy_indoor lock](embedding_audit_examples/boy_indoor_lock.jpg)
+>
+> *boy_indoor LOCK — tight bbox, segmenter isolates the child cleanly, BlazeFace **finds the face with all 6 keypoints**. Face crop has motion blur (kid moving) and is tilted/off-center — the alignment that #93 will add would normalize this. OSNet sees a near-2:1 raw crop with mild stretch.*
+
+What this tells us about each Phase 1 fix:
+
+- **#93 face alignment** helps the cases where BlazeFace finds a face (man_desk, boy_indoor) — visible misalignment in the face inputs across composites confirms the headroom. Doesn't help when no face is detected (crowd_street, person_playground), so its impact is bounded by face-detection success rate.
+- **#94 mask OSNet** helps when segmentation succeeds (most cases). Doesn't help when bbox triggers the segmenter's >50%-area guard (man_desk close-up). Should be measurable on crowd_street and boy_indoor.
+- **#95 letterbox** is the most universally applicable — every embedder currently stretches. Visible distortion in OSNet inputs across all composites.
+
+**Out-of-scope finding worth tracking**: locks on tiny bboxes (≲50 px on either side) produce embeddings that no Phase 1 fix can rescue. Worth a separate min-bbox-size guard at lock time. Filing as a follow-up.
+
+### Update from broader composite review
+
+After viewing more composites directly (not just the LOCK frames I'd cherry-picked), two findings I hadn't accounted for:
+
+**Segmentation has a third failure mode beyond "succeeds" and ">50% area rejected": *fragmented mask*.**
+
+> ![chair Swiss-cheese mask](embedding_audit_examples/chair_seg_swiss_cheese.jpg)
+>
+> *chair_living_room VT f=270 — segmenter caught **only the seat** of the chair. The back, legs, and most of the body were marked as background. MNV3 sees an input that's mostly black pixels, which the embedder treats as image content rather than "no information here." On chair f=570 the same chair gets a Swiss-cheese mask with multiple holes inside the foreground.*
+
+The segmenter's existing acceptance gate (5% < fg% < 95%) admits these — fragmented masks have plausible foreground percentages. This kind of partial mask is more common than I'd assumed and is worse than full segmentation failure because the embedder produces noisy output rather than clean fallback. **#94 needs to add structural quality gating** (connected-component count, top-component area share) before threading the mask through to OSNet, otherwise OSNet inherits the same noise.
+
+**Each embedder consumes a differently-distorted version of the same subject.**
+
+| Source bbox aspect | OSNet input | MNV3 input | Face input |
+|---|---|---|---|
+| 73×258 (1:3.5, crowd_street) | stretch to 1:2 (some squashing) | stretch to 1:1 (severe vertical squash) | n/a (no face) |
+| 28×50 (1:1.8, person_playground) | upscale + stretch (4.5×) | upscale + stretch (8×) | n/a (no face) |
+| 146×133 (1:0.9, boy_indoor f=150) | stretch to 1:2 (severe vertical stretch) | stretch to 1:1 (mild) | from BlazeFace bbox in person space |
+
+Same subject, two seconds apart, three differently-shaped inputs into the three embedders. A subject going from "standing tall" to "bent over playing" yields completely different shape ratios — the embedder is being asked to recognize the same subject through wildly different warps.
+
+This makes the originally-scoped Phase 1 PRs harder to reason about than they should be. **#100 (canonical-crop preparation)** is the strategic fix: produce one aspect-preserving crop per detection and feed it consistently to all embedders. #93 (face alignment) and #94 (mask OSNet, with quality gating) then land on top as small wrapper changes. #95 (per-embedder letterbox) is closed as superseded by #100.
+
 ## Notes from baseline collection
 
 - **What we initially called a "hang" was a stale 277 MB test video.** `person_playground_tracking.mp4` on the device was the 4K original from earlier work, not the 92 MB / 640 px version checked into the repo. 4K decode on Adreno 740 ran at ~0.05 fps GL throughput on that file, making the test take 7+ minutes for 24 processed frames. With the correct file pushed (`adb push test_videos/person_playground_tracking.mp4 ...`), the same test runs in 7m39s with 1531 processed frames — slow but completing. Issue #96 was filed before this was understood and is now closed.
