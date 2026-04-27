@@ -170,6 +170,14 @@ class AppearanceEmbedder(context: Context) {
         return segmenter.extractContour(bitmap, normalizedBox)
     }
 
+    /**
+     * Audit/debug only — returns the segmenter's masked crop without computing
+     * an embedding. Caller must recycle. Null if segmentation failed (large
+     * crop, empty mask, etc.). Used by [CropDebugCapture] for visual review.
+     */
+    fun debugMaskedCrop(bitmap: Bitmap, normalizedBox: RectF): Bitmap? =
+        segmenter.segmentAndCrop(bitmap, normalizedBox)
+
     fun shutdown() {
         embedder.close()
         segmenter.shutdown()
