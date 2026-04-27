@@ -121,6 +121,17 @@ class ObjectTracker(
     private var templateMismatchCount = 0
 
     /**
+     * Floor on `bestLockGallerySimilarity(emb)` for accumulating a new
+     * embedding into the gallery during VT tracking. New entries below this
+     * are drifting away from the lock identity and would poison the gallery
+     * — letting later wrong-person candidates score artificially high. Set
+     * inside the lock-gallery's own internal pairwise distribution
+     * (mean across augmentations ≈ 0.79; min ≈ 0.66) — anything substantially
+     * below that is no longer the same identity.
+     */
+    private val GALLERY_ADD_LOCK_SIM_FLOOR = 0.5f
+
+    /**
      * VT box size sanity check: the tracker's output box shouldn't grow
      * dramatically relative to the box it was initialized with. Objects don't
      * physically grow 5x in a fraction of a second — if VT is producing a
@@ -488,11 +499,27 @@ class ObjectTracker(
                             // embedding is better than no embedding for gallery diversity
                             val emb = appearanceEmbedder.embedWithFallback(bitmap, rawBox)
                             if (emb != null) {
-                                // Diversity check: only add if meaningfully different from centroid
+                                // Two-gate accumulation. Both must hold:
+                                //   1. Diverse from the existing centroid — don't add near-
+                                //      duplicates that cost RAM without adding identity coverage.
+                                //   2. Still close to the original lock identity — don't poison
+                                //      the gallery with a drifted VT crop. Without this clause
+                                //      a brief VT drift adds non-lock embeddings during the
+                                //      lock window and a later candidate matches against THOSE
+                                //      at high cosine, defeating identity discrimination.
+                                //
+                                // Old gate: `centroidSim < 0.92 OR gallery.size < 8`. The
+                                // size escape hatch forced gallery growth to 8 regardless of
+                                // identity — the structural source of the pollution. On a
+                                // diagnostic where a small distant kid was locked and the
+                                // camera panned, lockSim≈0.06 entries were waved through and
+                                // a different person scored sim=0.864 against the polluted
+                                // gallery vs 0.541 against the raw lock-only embeddings.
                                 val centroidSim = reacquisition.centroidSimilarity(emb)
-                                if (centroidSim < 0.92f || reacquisition.embeddingGallery.size < 8) {
+                                val lockSim = reacquisition.bestLockGallerySimilarity(emb)
+                                if (centroidSim < 0.92f && lockSim > GALLERY_ADD_LOCK_SIM_FLOOR) {
                                     reacquisition.addEmbedding(emb)
-                                    android.util.Log.d("AppearEmbed", "Gallery +1 → ${reacquisition.embeddingGallery.size} (centroidSim=${centroidSim})")
+                                    android.util.Log.d("AppearEmbed", "Gallery +1 → ${reacquisition.embeddingGallery.size} (centroidSim=${"%.3f".format(centroidSim)}, lockSim=${"%.3f".format(lockSim)})")
                                 }
                             }
                             // Progressive face embedding: try to capture face during tracking
