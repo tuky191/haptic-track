@@ -552,6 +552,18 @@ class ObjectTracker(
                                 val faceEmb = faceEmbedder.embedFace(bitmap, rawBox)
                                 if (faceEmb != null) reacquisition.addFaceEmbedding(faceEmb)
                             }
+
+                            // Augment the SessionRoster's lock-slot body gallery (#108)
+                            // every 5 confirmed VT frames. Without this the lock slot
+                            // stays at 1 body sample from seedLock while non-lock slots
+                            // accumulate continuously, creating an asymmetric ROSTER_REJECT
+                            // disadvantage for the locked subject.
+                            if (vtConfirmedFrames % 5 == 0 &&
+                                reacquisition.lockedIsPerson &&
+                                reacquisition.lockedReIdEmbedding != null) {
+                                val lockBodyEmb = personReId.embed(bitmap, rawBox)
+                                if (lockBodyEmb != null) reacquisition.augmentLockReId(lockBodyEmb)
+                            }
                         }
 
                         // Collect scene negatives + roster observations every 5 confirmed

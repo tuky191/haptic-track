@@ -595,6 +595,18 @@ class ReacquisitionEngine(
         }
     }
 
+    /** Augment the [SessionRoster]'s lock-slot body gallery with a fresh OSNet
+     *  embedding observed during VT-confirmed tracking (#108). Without this,
+     *  the lock body gallery stays at one entry from [seedLock] while non-lock
+     *  slots accumulate per-frame observations — creating an asymmetric
+     *  disadvantage at [ROSTER_REJECT] time. Doesn't touch [lockedReIdEmbedding]
+     *  (anchor for raw-cosine paths) — only the roster's lock-slot gallery. */
+    fun augmentLockReId(embedding: FloatArray) {
+        if (_roster.lockSlot == null) return
+        _roster.augmentLock(face = null, body = embedding, frameIdx = ++_observationFrame)
+        _liveStatsDirty = true
+    }
+
     /** Add a new embedding to the gallery (e.g. from a confirmed visual tracker frame). */
     fun addEmbedding(embedding: FloatArray) {
         if (_embeddingGallery.size >= MAX_GALLERY_SIZE) {
@@ -963,25 +975,32 @@ class ReacquisitionEngine(
         // --- GATE: Roster open-set rejection (#108) ---
         // Identity is judged by RANK among all known persons in the session.
         // The roster holds slot 0 = lock and slots 1..N = other persons seen
-        // during the session. If the candidate's best-matching slot is NOT
-        // the lock and the score gap exceeds [ROSTER_REJECT_MARGIN], the
-        // candidate is more likely that other person than the lock — reject.
+        // during the session. If a SINGLE non-lock slot's match score exceeds
+        // the lock by [ROSTER_REJECT_MARGIN], the candidate is more likely
+        // that specific person than the lock — reject.
+        //
+        // We use [bestNonLockSlotMatch] (per-slot) rather than per-modality
+        // maxima across slots so the comparison reasons about ONE specific
+        // distractor, not "max-of-maxima" which can inflate when face/body
+        // maxima come from different slots.
         //
         // Subsumes the older SCENE_FACE_VETO + SCENE_BODY_VETO (#83 phase 2)
-        // by treating face and body uniformly: best score across modalities
-        // wins, and a single strong modality is sufficient evidence.
+        // by treating face and body uniformly within a slot: a single strong
+        // modality is sufficient evidence.
         if (lockedIsPerson && candidateIsPerson && _roster.nonLockCount > 0) {
             val candFace = candidate.faceEmbedding
             val candBody = candidate.reIdEmbedding
             if (candFace != null || candBody != null) {
-                val (lockFace, lockBody) = _roster.lockMatch(candFace, candBody)
-                val (otherFace, otherBody) = _roster.bestNonLockMatch(candFace, candBody)
-                val lockScore = maxOf(lockFace, lockBody)
-                val otherScore = maxOf(otherFace, otherBody)
-                if (otherScore >= ROSTER_REJECT_FLOOR &&
-                    otherScore > lockScore + ROSTER_REJECT_MARGIN) {
-                    dualLog(Log.DEBUG, "  ROSTER_REJECT: nonLock=${fmtF(otherScore)} (face=${fmtF(otherFace)} body=${fmtF(otherBody)}) > lock=${fmtF(lockScore)} (face=${fmtF(lockFace)} body=${fmtF(lockBody)}) +${fmtF(ROSTER_REJECT_MARGIN)}")
-                    return null
+                val nonLock = _roster.bestNonLockSlotMatch(candFace, candBody)
+                if (nonLock != null) {
+                    val (lockFace, lockBody) = _roster.lockMatch(candFace, candBody)
+                    val lockScore = maxOf(lockFace, lockBody)
+                    val otherScore = maxOf(nonLock.faceSim, nonLock.bodySim)
+                    if (otherScore >= ROSTER_REJECT_FLOOR &&
+                        otherScore > lockScore + ROSTER_REJECT_MARGIN) {
+                        dualLog(Log.DEBUG, "  ROSTER_REJECT: slot=${nonLock.slotId} nonLock=${fmtF(otherScore)} (face=${fmtF(nonLock.faceSim)} body=${fmtF(nonLock.bodySim)}) > lock=${fmtF(lockScore)} (face=${fmtF(lockFace)} body=${fmtF(lockBody)}) +${fmtF(ROSTER_REJECT_MARGIN)}")
+                        return null
+                    }
                 }
             }
         }

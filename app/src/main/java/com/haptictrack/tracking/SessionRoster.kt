@@ -30,7 +30,13 @@ import android.util.Log
  *   embeddings per modality (FIFO). The roster caps at [MAX_SLOTS] tracklets,
  *   evicting LRU when exceeded.
  *
- * NOT thread-safe. Caller (ReacquisitionEngine) is responsible for serializing.
+ * Thread-safety: mutation methods ([seedLock], [augmentLock], [observePerson],
+ * [clear], [clearNonLock]) are [Synchronized] on the instance — cheap insurance
+ * since they're called from the main processing thread and (for [observePerson])
+ * potentially the lock-burst executor. Read methods don't take the lock; they
+ * iterate `_slots` directly and may briefly observe a partially-mutated state.
+ * In practice all reads happen on the same processing thread that drives the
+ * mutations, so this is safe.
  */
 class SessionRoster {
 
@@ -126,6 +132,7 @@ class SessionRoster {
      * Initialize slot 0 with the locked person's face/body data. Idempotent —
      * a second call replaces the lock slot. Other slots are preserved.
      */
+    @Synchronized
     fun seedLock(face: FloatArray?, body: FloatArray?, frameIdx: Int = 0) {
         // Remove any existing lock slot.
         _slots.removeAll { it.isLock }
@@ -147,6 +154,7 @@ class SessionRoster {
      * Augment the lock slot with another (face, body) sample collected during
      * VT-confirmed tracking. Skips if the lock slot doesn't exist yet.
      */
+    @Synchronized
     fun augmentLock(face: FloatArray?, body: FloatArray?, frameIdx: Int) {
         val lock = lockSlot ?: return
         face?.let { lock.pushFace(it) }
@@ -163,6 +171,7 @@ class SessionRoster {
      * Returns the slot ID this observation was assigned to, or null if it was
      * filtered (lock-near or insufficient signal).
      */
+    @Synchronized
     fun observePerson(face: FloatArray?, body: FloatArray?, frameIdx: Int): Int? {
         if (face == null && body == null) return null
 
@@ -251,7 +260,11 @@ class SessionRoster {
         return faceSim to bodySim
     }
 
-    /** Best face/body cosine of [face]/[body] against any non-lock slot. (0 if none.) */
+    /** Best face/body cosine of [face]/[body] against any non-lock slot,
+     *  taken independently per modality. Useful for cohort statistics; NOT
+     *  for reject-gate decisions where the per-modality maxima could come
+     *  from different slots and inflate the apparent score. Use
+     *  [bestNonLockSlotMatch] for the open-set rejection gate. */
     fun bestNonLockMatch(face: FloatArray?, body: FloatArray?): Pair<Float, Float> {
         var bestFace = 0f
         var bestBody = 0f
@@ -267,6 +280,37 @@ class SessionRoster {
             }
         }
         return bestFace to bestBody
+    }
+
+    /** A single non-lock slot's match data — face and body sims come from the
+     *  SAME slot, so a downstream reject gate can reason about "this specific
+     *  person beat the lock" rather than "max-of-maxima across all non-lock
+     *  slots". */
+    data class SlotMatch(val slotId: Int, val faceSim: Float, val bodySim: Float)
+
+    /** Best non-lock slot's match against [face]/[body]. Score = max(faceSim,
+     *  bodySim) per slot, single-slot winner returned with both modalities
+     *  intact. Returns null when no non-lock slots exist. Used for the
+     *  open-set rejection gate in [ReacquisitionEngine.scoreCandidate]. */
+    fun bestNonLockSlotMatch(face: FloatArray?, body: FloatArray?): SlotMatch? {
+        if (face == null && body == null) return null
+        var winner: PersonTracklet? = null
+        var winnerScore = -1f
+        var winnerFace = 0f
+        var winnerBody = 0f
+        for (slot in _slots) {
+            if (slot.isLock) continue
+            val faceSim = if (face != null) slot.bestFaceSim(face) else 0f
+            val bodySim = if (body != null) slot.bestBodySim(body) else 0f
+            val score = maxOf(faceSim, bodySim)
+            if (score > winnerScore) {
+                winnerScore = score
+                winnerFace = faceSim
+                winnerBody = bodySim
+                winner = slot
+            }
+        }
+        return winner?.let { SlotMatch(it.id, winnerFace, winnerBody) }
     }
 
     /**
@@ -338,12 +382,14 @@ class SessionRoster {
     val nonLockCount: Int get() = _slots.count { !it.isLock }
 
     /** Drop everything. Called on lock clear / engine reset. */
+    @Synchronized
     fun clear() {
         _slots.clear()
         _nextId = 0
     }
 
     /** Drop only non-lock slots. Useful when re-locking onto the same target. */
+    @Synchronized
     fun clearNonLock() {
         _slots.removeAll { !it.isLock }
     }

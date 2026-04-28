@@ -211,6 +211,65 @@ class SessionRosterTest {
     }
 
     @Test
+    fun `bestNonLockSlotMatch returns same-slot face plus body — no cross-slot inflation`() {
+        // Two distractor slots, each strong on ONE modality.
+        // Slot A (id1): face = unit(1), body = unit(7) (orthogonal to probe body).
+        // Slot B (id2): face = unit(7) (orthogonal to probe face), body = unit(2).
+        // Probe with face = unit(1), body = unit(2). The per-slot maximum
+        // is 1.0 (face vs A face, OR body vs B body) — no slot scores 1.0
+        // on BOTH modalities.
+        // bestNonLockSlotMatch must return ONE slot's data; the cross-slot
+        // max-of-maxima would falsely report face=1.0 AND body=1.0 for the
+        // same "person".
+        val roster = SessionRoster()
+        roster.seedLock(face = unit(0), body = unit(0), frameIdx = 0)
+        val idA = roster.observePerson(face = unit(1), body = unit(7), frameIdx = 1)
+        val idB = roster.observePerson(face = unit(7), body = unit(2), frameIdx = 2)
+
+        val match = roster.bestNonLockSlotMatch(face = unit(1), body = unit(2))
+        assertNotNull(match)
+        // Winner is whichever slot scored max=1.0 — both A and B score 1.0
+        // on a single modality. The winner returns ONLY that slot's data.
+        assertTrue("winner is A or B", match!!.slotId == idA || match.slotId == idB)
+        if (match.slotId == idA) {
+            // A: face = unit(1), body = unit(7). Probe face vs A face = 1.0,
+            // probe body vs A body = 0 (orthogonal).
+            assertEquals(1f, match.faceSim, 1e-5f)
+            assertEquals(0f, match.bodySim, 1e-5f)
+        } else {
+            // B: face = unit(7), body = unit(2). Probe face vs B face = 0,
+            // probe body vs B body = 1.0.
+            assertEquals(0f, match.faceSim, 1e-5f)
+            assertEquals(1f, match.bodySim, 1e-5f)
+        }
+    }
+
+    @Test
+    fun `bestNonLockSlotMatch returns null with no non-lock slots`() {
+        val roster = SessionRoster()
+        roster.seedLock(face = unit(0), body = unit(0), frameIdx = 0)
+        assertNull(roster.bestNonLockSlotMatch(face = unit(1), body = unit(1)))
+    }
+
+    @Test
+    fun `augmentLock body grows lock slot's body gallery`() {
+        // Verifies the lock-body asymmetry fix (#113 review): repeated
+        // augmentLock(body=...) calls during VT-confirmed tracking grow the
+        // lock slot's body gallery so it isn't stuck at 1 entry from seedLock.
+        val roster = SessionRoster()
+        roster.seedLock(face = null, body = unit(0), frameIdx = 0)
+        val initial = roster.lockSlot!!.bodyGallery.size
+        assertEquals(1, initial)
+
+        roster.augmentLock(face = null, body = unit(0), frameIdx = 5)
+        roster.augmentLock(face = null, body = unit(0), frameIdx = 10)
+        roster.augmentLock(face = null, body = unit(0), frameIdx = 15)
+
+        assertEquals(4, roster.lockSlot!!.bodyGallery.size)
+        assertTrue("observation count grows", roster.lockSlot!!.observationCount >= 4)
+    }
+
+    @Test
     fun `LRU eviction removes oldest non-lock slot when full`() {
         val roster = SessionRoster()
         roster.seedLock(face = unit(0), body = unit(0), frameIdx = 0)
