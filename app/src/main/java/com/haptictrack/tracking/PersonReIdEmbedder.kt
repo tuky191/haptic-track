@@ -26,15 +26,29 @@ import java.nio.ByteOrder
  *   R: (pixel/255 - 0.485) / 0.229
  *   G: (pixel/255 - 0.456) / 0.224
  *   B: (pixel/255 - 0.406) / 0.225
+ *
+ * Input is supplied as a [CanonicalCrop] at exactly [INPUT_WIDTH] × [INPUT_HEIGHT];
+ * the cropper handles aspect-preserving letterbox so OSNet sees uniformly
+ * shaped people instead of arbitrarily stretched ones (#100).
  */
-class PersonReIdEmbedder(context: Context) {
+class PersonReIdEmbedder(
+    context: Context,
+    private val cropper: CanonicalCropper = CanonicalCropper(),
+) {
 
     companion object {
         private const val TAG = "PersonReId"
         private const val MODEL_ASSET = "osnet_x1_0_market.tflite"
-        private const val INPUT_HEIGHT = 256
-        private const val INPUT_WIDTH = 128
+        const val INPUT_HEIGHT = 256
+        const val INPUT_WIDTH = 128
         private const val EMBEDDING_DIM = 512
+        /**
+         * Below this raw bbox dim, OSNet output is unreliable. Lower than the
+         * canonical default (28) — OSNet specifically copes better with low-res
+         * persons than the more generic embedders, and tracking small subjects
+         * is a real use case.
+         */
+        private const val MIN_SOURCE_PIXELS = 16
 
         // ImageNet normalization constants
         private const val MEAN_R = 0.485f
@@ -61,41 +75,45 @@ class PersonReIdEmbedder(context: Context) {
     }
 
     /**
-     * Compute a re-ID embedding for a person crop.
-     * [bitmap] is the full frame, [personBox] is the normalized bounding box.
-     * Returns a 512-dim L2-normalized embedding, or null if the crop is invalid.
+     * Compute a re-ID embedding for a person crop. Wrapper that builds the
+     * OSNet canonical and invokes [embed]. Recycles the canonical bitmap
+     * before returning. Returns null if the bbox is too small or invalid.
      */
     fun embed(bitmap: Bitmap, personBox: RectF): FloatArray? {
-        val crop = cropNormalized(bitmap, personBox) ?: return null
-        try {
-            return embedFromCrop(crop)
+        val canonical = cropper.prepare(
+            bitmap, personBox,
+            targetWidth = INPUT_WIDTH, targetHeight = INPUT_HEIGHT,
+            minSourcePixels = MIN_SOURCE_PIXELS,
+        ) ?: return null
+        return try {
+            embed(canonical)
         } finally {
-            crop.recycle()
+            canonical.bitmap.recycle()
         }
     }
 
     /**
-     * Compute a re-ID embedding from an already-cropped person bitmap.
-     * Does NOT recycle [personCrop].
+     * Compute a re-ID embedding from a prepared [CanonicalCrop]. Caller owns
+     * [canonical] and is responsible for recycling. Required dims: 128×256.
      */
     @Synchronized
-    fun embedFromCrop(personCrop: Bitmap): FloatArray? {
-        if (personCrop.width < 10 || personCrop.height < 20) return null
-        try {
-            val resized = Bitmap.createScaledBitmap(personCrop, INPUT_WIDTH, INPUT_HEIGHT, true)
-            fillInputBuffer(resized)
-            if (resized !== personCrop) resized.recycle()
-
+    fun embed(canonical: CanonicalCrop): FloatArray? {
+        if (canonical.targetWidth != INPUT_WIDTH || canonical.targetHeight != INPUT_HEIGHT) {
+            Log.w(TAG, "Canonical dims ${canonical.targetWidth}×${canonical.targetHeight} != expected ${INPUT_WIDTH}×${INPUT_HEIGHT}")
+            return null
+        }
+        return try {
+            fillInputBuffer(canonical.bitmap)
             interpreter.run(inputBuffer, outputArray)
 
             val embedding = outputArray[0].copyOf()
             com.haptictrack.tracking.l2Normalize(embedding)
 
             Log.d(TAG, "Re-ID embedding computed (${EMBEDDING_DIM}-dim)")
-            return embedding
+            embedding
         } catch (e: Exception) {
             Log.w(TAG, "Re-ID embedding failed: ${e.message}")
-            return null
+            null
         }
     }
 
@@ -104,20 +122,17 @@ class PersonReIdEmbedder(context: Context) {
     }
 
     /**
-     * Audit/debug only — returns the resized 256×128 input bitmap fed to OSNet
-     * without computing the embedding. Used by [CropDebugCapture] to make the
-     * stretching/aspect-ratio behavior visible. Caller must recycle.
+     * Audit/debug only — returns the OSNet canonical input bitmap (post-letterbox)
+     * without computing the embedding. Caller must recycle. Used by
+     * [CropDebugCapture] to make the aspect-preserving behavior visible.
      */
     fun debugInput(bitmap: Bitmap, personBox: RectF): Bitmap? {
-        val crop = cropNormalized(bitmap, personBox) ?: return null
-        return try {
-            val resized = Bitmap.createScaledBitmap(crop, INPUT_WIDTH, INPUT_HEIGHT, true)
-            if (resized !== crop) crop.recycle()
-            resized
-        } catch (e: Exception) {
-            crop.recycle()
-            null
-        }
+        val canonical = cropper.prepare(
+            bitmap, personBox,
+            targetWidth = INPUT_WIDTH, targetHeight = INPUT_HEIGHT,
+            minSourcePixels = MIN_SOURCE_PIXELS,
+        ) ?: return null
+        return canonical.bitmap // caller recycles
     }
 
     /** ImageNet normalization: (pixel/255 - mean) / std per channel */
