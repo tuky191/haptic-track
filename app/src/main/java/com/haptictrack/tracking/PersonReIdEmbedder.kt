@@ -38,7 +38,7 @@ class PersonReIdEmbedder(
 
     companion object {
         private const val TAG = "PersonReId"
-        private const val MODEL_ASSET = "osnet_x1_0_market.tflite"
+        private const val MODEL_ASSET = "osnet_ibn_x1_0_msmt17.tflite"
         const val INPUT_HEIGHT = 256
         const val INPUT_WIDTH = 128
         private const val EMBEDDING_DIM = 512
@@ -71,7 +71,7 @@ class PersonReIdEmbedder(
     init {
         val model = loadTfliteModel(context, MODEL_ASSET)
         gpu = createGpuInterpreter(model, modelName = "OSNet-ReID", cpuThreads = 2)
-        Log.i(TAG, "Loaded OSNet x1.0 Market-1501 (${EMBEDDING_DIM}-dim, ${INPUT_HEIGHT}x${INPUT_WIDTH})")
+        Log.i(TAG, "Loaded OSNet-IBN x1.0 MSMT17 (${EMBEDDING_DIM}-dim, ${INPUT_HEIGHT}x${INPUT_WIDTH})")
     }
 
     /**
