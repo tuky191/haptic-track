@@ -25,4 +25,10 @@ pulled_frames/
 docs/issues/*/slow_7s_case/
 docs/issues/*/fast_3s_case/
 tools/crops/*/
-tools/models/
+# Model artifacts: keep recipe + small TFLite outputs, ignore large intermediates
+tools/models/osnet_hf/
+tools/models/onnx/
+tools/models/tflite/*/saved_model.pb
+tools/models/tflite/*/fingerprint.pb
+tools/models/tflite/*/variables/
+tools/models/tflite/*/assets/
