@@ -24,3 +24,4 @@ tools/test_fixtures/*/frames/
 pulled_frames/
 docs/issues/*/slow_7s_case/
 docs/issues/*/fast_3s_case/
+tools/crops/*/

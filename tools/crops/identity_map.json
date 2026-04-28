@@ -1,0 +1,39 @@
+{
+  "_note": "Manual identity mapping for tracks produced by extract_person_crops.py. ByteTrack ID-switches across reappearances, so a single person typically gets multiple track IDs. We label representative crops per track to recover ground-truth identity for the same-vs-different cosine benchmark.",
+  "videos": {
+    "kid_to_wife": {
+      "tracks": {
+        "1":  "boy",
+        "6":  "wife",
+        "18": "boy",
+        "19": "wife",
+        "20": "boy",
+        "22": "boy",
+        "23": "wife",
+        "27": "wife",
+        "28": "wife"
+      }
+    },
+    "boy_indoor_wife_swap": {
+      "tracks": {
+        "1":  "boy",
+        "6":  "wife",
+        "7":  "wife",
+        "8":  "wife",
+        "14": "wife",
+        "16": "wife",
+        "17": "boy",
+        "19": "boy",
+        "27": "unknown",
+        "30": "boy",
+        "32": "unknown"
+      }
+    },
+    "man_desk": {
+      "tracks": {
+        "1": "man",
+        "3": "man"
+      }
+    }
+  }
+}
