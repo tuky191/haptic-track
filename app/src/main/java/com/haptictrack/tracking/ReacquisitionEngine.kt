@@ -202,11 +202,13 @@ class ReacquisitionEngine(
     private var _adaptiveOsnetFloor: Float? = null
 
     /**
-     * Live impostor stats per modality (#102 Phase 1 — diagnostic only, no gating yet).
+     * Live impostor stats per modality (#102 Phase 1 + Phase 3).
      * Computed lazily from the *live* gallery × *live* scene-negative cohort.
-     * Used to expose z-scores in [scoreCandidate]'s log line so we can characterize
-     * the same-vs-different separation across the existing replay scenarios before
-     * deciding what threshold the embedding override gate should use.
+     *
+     * Phase 1: exposed z-scores in [scoreCandidate]'s log line for calibration.
+     * Phase 3: drives embedding override gates via [overridePasses]
+     * (label/geometric/tentative-bypass). Raw-cosine thresholds remain as the
+     * fallback when stats are unavailable (cohort below [MIN_COHORT_FOR_ZNORM]).
      *
      * Invalidated (set to dirty) on lock, addEmbedding, addSceneNegative,
      * addScenePersonPair, addFaceEmbedding. Recomputed on next read.
@@ -303,32 +305,37 @@ class ReacquisitionEngine(
      * Z-normalized MNV3 similarity for [candidate]: how many σ above the live
      * impostor distribution does this candidate's best-gallery match sit?
      * Returns null when the cohort is below [MIN_COHORT_FOR_ZNORM] or the
-     * stats degenerate (σ ≈ 0). Phase 1: diagnostic only — log, don't gate.
+     * gallery is empty. Phase 3 (#102): the value drives the embedding
+     * override gates via [overridePasses] when available; raw cosine is the
+     * fallback path.
      */
     fun znMnv3Sim(candidate: FloatArray): Float? {
         recomputeLiveStatsIfNeeded()
         val stats = _mnv3LiveStats ?: return null
-        if (stats.std < 1e-6f || _embeddingGallery.isEmpty()) return null
+        if (_embeddingGallery.isEmpty()) return null
+        // stats.std is already clamped to Z_SIGMA_FLOOR by withSigmaFloor()
+        // in recomputeLiveStatsIfNeeded — no extra divide-by-zero guard needed.
         val raw = bestGallerySimilarity(candidate, _embeddingGallery)
         return (raw - stats.mean) / stats.std
     }
 
-    /** Z-normalized OSNet similarity. Null when cohort < [MIN_COHORT_FOR_ZNORM]. */
+    /** Z-normalized OSNet similarity. Null when cohort < [MIN_COHORT_FOR_ZNORM]
+     *  or no locked OSNet anchor. Used by [overridePasses] for the person path. */
     fun znOsnetSim(candidate: FloatArray): Float? {
         recomputeLiveStatsIfNeeded()
         val stats = _osnetLiveStats ?: return null
         val anchor = lockedReIdEmbedding ?: return null
-        if (stats.std < 1e-6f) return null
         val raw = cosineSimilarity(anchor, candidate)
         return (raw - stats.mean) / stats.std
     }
 
-    /** Z-normalized face similarity. Null when cohort < [MIN_COHORT_FOR_ZNORM]. */
+    /** Z-normalized face similarity. Null when cohort < [MIN_COHORT_FOR_ZNORM]
+     *  or no locked face anchor. Available to gate logic but not currently
+     *  driving any production gate (face has its own [FACE_FLOOR] path). */
     fun znFaceSim(candidate: FloatArray): Float? {
         recomputeLiveStatsIfNeeded()
         val stats = _faceLiveStats ?: return null
         val anchor = lockedFaceEmbedding ?: return null
-        if (stats.std < 1e-6f) return null
         val raw = cosineSimilarity(anchor, candidate)
         return (raw - stats.mean) / stats.std
     }
