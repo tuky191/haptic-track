@@ -37,18 +37,37 @@ class ReacquisitionEngine(
 
     companion object {
         private const val TAG = "Reacq"
-        /** Embedding similarity above this bypasses the label gate (cross-category protection). */
+        /** Raw-cosine fallback used when z-score is unavailable (no live or frozen cohort).
+         *  In production the frozen offline pool (~1500 entries) is loaded via
+         *  [create], so this fallback is only ever hit by unit tests with direct
+         *  construction. See [Z_LABEL_OVERRIDE_THRESHOLD] for the calibrated path. */
         const val APPEARANCE_OVERRIDE_THRESHOLD = 0.7f
-        /** Embedding similarity above this bypasses position/size hard filters.
-         *  Lower than label override because position rejection is about camera movement,
-         *  not identity confusion — 0.55 is enough to say "same object, just moved." */
+        /** Raw-cosine fallback for the position/size hard-filter bypass when z-score
+         *  is unavailable. See [Z_GEOMETRIC_OVERRIDE_THRESHOLD] for the calibrated path. */
         const val GEOMETRIC_OVERRIDE_THRESHOLD = 0.55f
-        /** Embedding similarity above this bypasses tentative confirmation.
-         *  Higher than geometric override: overriding position/size is low-risk,
-         *  but skipping multi-frame confirmation needs stronger evidence.
-         *  Keyboard at sim=0.582 overrode geometric gates during phone rotation —
-         *  tentative confirmation would have caught it (single-frame fluke). */
+        /** Raw-cosine fallback for tentative-confirmation bypass when z-score is
+         *  unavailable. See [Z_TENTATIVE_BYPASS_THRESHOLD] for the calibrated path. */
         const val TENTATIVE_BYPASS_THRESHOLD = 0.65f
+
+        // Phase 3 (#102): calibrated z-score thresholds. Phase 2 measurements on
+        // device showed same-person reacquires score z ≥ 1.5 reliably while
+        // wrong-person reacquires cluster in [-0.5, +1.0]. Thresholds picked
+        // from that distribution:
+        /** Z-score above this bypasses the label gate (cross-category protection). */
+        const val Z_LABEL_OVERRIDE_THRESHOLD = 1.5f
+        /** Z-score above this bypasses position/size hard filters. Slightly lower
+         *  than the label-override threshold because position rejection is about
+         *  camera movement, not identity confusion — z ≥ 1 is enough to say
+         *  "same object, just moved." */
+        const val Z_GEOMETRIC_OVERRIDE_THRESHOLD = 1.0f
+        /** Z-score above this bypasses tentative-confirmation. Same band as the
+         *  label override — skipping multi-frame consistency requires confidence. */
+        const val Z_TENTATIVE_BYPASS_THRESHOLD = 1.5f
+        /** Floor on impostor σ when computing z-scores. A homogeneous cohort can
+         *  collapse σ → 0 which inflates z arbitrarily (man_desk hit z=9.34 in
+         *  Phase 2). Cap σ at this floor so the override decision can't be
+         *  driven by a degenerate cohort. */
+        const val Z_SIGMA_FLOOR = 0.05f
         /** Minimum embedding similarity to consider a candidate at all.
          *  If the primary embedder says the candidate is a different object (sim < this),
          *  no amount of re-ID, attributes, or color can rescue it. */
@@ -243,21 +262,44 @@ class ReacquisitionEngine(
 
     private fun recomputeLiveStatsIfNeeded() {
         if (!_liveStatsDirty) return
-        _mnv3LiveStats = if (_negativeExamples.size >= MIN_COHORT_FOR_ZNORM) {
-            computeImpostorStats(_embeddingGallery, _negativeExamples)
+        // MNV3 cohort: live scene negatives + frozen offline pool. Frozen
+        // backfill closes the cold-start gap (#102 Phase 2 finding) where
+        // short-lock scenarios like kid_to_wife_panning never accumulate
+        // enough live negatives for trustworthy stats.
+        val mnv3Cohort = if (_negativeExamples.size >= MIN_COHORT_FOR_ZNORM) {
+            _negativeExamples + frozenNegativesMobileNet
+        } else if (frozenNegativesMobileNet.size >= MIN_COHORT_FOR_ZNORM) {
+            frozenNegativesMobileNet
+        } else emptyList()
+        _mnv3LiveStats = if (mnv3Cohort.size >= MIN_COHORT_FOR_ZNORM) {
+            computeImpostorStats(_embeddingGallery, mnv3Cohort)?.withSigmaFloor()
         } else null
 
-        val osnetCohort = _sceneFacePairs.map { it.body }
+        // OSNet cohort: paired-with-face scene bodies + frozen offline pool.
+        val liveBodies = _sceneFacePairs.map { it.body }
+        val osnetCohort = if (liveBodies.size >= MIN_COHORT_FOR_ZNORM) {
+            liveBodies + frozenNegativesOsnet
+        } else if (frozenNegativesOsnet.size >= MIN_COHORT_FOR_ZNORM) {
+            frozenNegativesOsnet
+        } else emptyList()
         _osnetLiveStats = if (osnetCohort.size >= MIN_COHORT_FOR_ZNORM) {
-            computeImpostorStats(lockedReIdEmbedding, osnetCohort)
+            computeImpostorStats(lockedReIdEmbedding, osnetCohort)?.withSigmaFloor()
         } else null
 
+        // Face cohort: only live for now (no frozen face cohort asset).
+        // TODO(#102): consider a frozen face-impostor pool to close the cold-start
+        // gap on the face modality too.
         val faceCohort = _sceneFacePairs.map { it.face }
         _faceLiveStats = if (faceCohort.size >= MIN_COHORT_FOR_ZNORM) {
-            computeImpostorStats(lockedFaceEmbedding, faceCohort)
+            computeImpostorStats(lockedFaceEmbedding, faceCohort)?.withSigmaFloor()
         } else null
         _liveStatsDirty = false
     }
+
+    /** Apply [Z_SIGMA_FLOOR] so a homogeneous cohort can't inflate z-scores
+     *  arbitrarily — see man_desk z=9.34 in #102 Phase 2 measurements. */
+    private fun ImpostorStats.withSigmaFloor(): ImpostorStats =
+        if (std < Z_SIGMA_FLOOR) ImpostorStats(mean, Z_SIGMA_FLOOR, n) else this
 
     /**
      * Z-normalized MNV3 similarity for [candidate]: how many σ above the live
@@ -297,6 +339,39 @@ class ReacquisitionEngine(
     val mnv3LiveStats: ImpostorStats? get() { recomputeLiveStatsIfNeeded(); return _mnv3LiveStats }
     val osnetLiveStats: ImpostorStats? get() { recomputeLiveStatsIfNeeded(); return _osnetLiveStats }
     val faceLiveStats: ImpostorStats? get() { recomputeLiveStatsIfNeeded(); return _faceLiveStats }
+
+    /**
+     * Pick the appropriate z-score for [candidate] mirroring [effectiveAppearanceSim]'s
+     * modality choice (OSNet for person-person; MNV3 otherwise). Returns null when
+     * stats aren't available for the chosen modality — caller should fall back to
+     * raw cosine in that case.
+     */
+    private fun effectiveAppearanceZ(candidate: TrackedObject): Float? {
+        val candidateIsPerson = candidate.label == "person"
+        val hasReId = lockedIsPerson && candidateIsPerson &&
+            lockedReIdEmbedding != null && candidate.reIdEmbedding != null
+        return when {
+            hasReId -> znOsnetSim(candidate.reIdEmbedding!!)
+            hasEmbeddings && candidate.embedding != null -> znMnv3Sim(candidate.embedding!!)
+            else -> null
+        }
+    }
+
+    /**
+     * Override gate decision: prefer the calibrated z-score; fall back to the raw-
+     * cosine threshold only when z-stats are unavailable (no live cohort and no
+     * frozen pool). Returns true when the embedding evidence is strong enough to
+     * bypass the corresponding hard filter.
+     */
+    private fun overridePasses(
+        candidate: TrackedObject,
+        rawSim: Float,
+        zThresh: Float,
+        rawThresh: Float,
+    ): Boolean {
+        val z = effectiveAppearanceZ(candidate)
+        return if (z != null) z >= zThresh else rawSim >= rawThresh
+    }
 
     /** Add a scene negative — an embedding from a non-locked detection seen during tracking.
      *  Builds the negative prototype for discriminative scoring. */
@@ -619,23 +694,31 @@ class ReacquisitionEngine(
         val sim = if (hasEmbeddings && candidate.embedding != null) {
             bestGallerySimilarity(candidate.embedding!!)
         } else 0f
-        val strongMatch = sim >= APPEARANCE_OVERRIDE_THRESHOLD
+        val strongMatch = overridePasses(
+            candidate, sim,
+            zThresh = Z_TENTATIVE_BYPASS_THRESHOLD,
+            rawThresh = APPEARANCE_OVERRIDE_THRESHOLD,
+        )
 
         // --- Tentative confirmation (DeepSORT-style) ---
         // Don't commit on a single frame. Require the same detection to win
         // for TENTATIVE_MIN_FRAMES consecutive frames.
         //
-        // Tentative bypass logic:
-        //   - Strong match (sim >= 0.7): always bypass
-        //   - Classifier trained + confident (P >= 0.8): bypass — learned boundary says yes
-        //   - Classifier trained + uncertain (P < 0.8): require tentative (classifier tightens)
-        //   - Classifier NOT trained: bypass if sim >= 0.55 (geometric override level)
-        // The classifier only tightens the gate, never loosens beyond geometric override.
+        // Tentative bypass logic (Phase 3 #102 — z-score preferred, raw fallback):
+        //   - Strong z-match (z ≥ 1.5) OR raw fallback sim ≥ 0.7: always bypass
+        //   - Classifier trained + confident (P ≥ 0.8): bypass — learned boundary says yes
+        //   - Classifier trained + uncertain (P < 0.8): require tentative
+        //   - Classifier NOT trained: bypass if z ≥ 1.0 OR raw fallback sim ≥ 0.55
         val clsP = if (_classifier.isTrained && candidate.embedding != null)
             _classifier.predict(candidate.embedding!!) else -1f
+        val geometricOverrideForTentative = overridePasses(
+            candidate, sim,
+            zThresh = Z_GEOMETRIC_OVERRIDE_THRESHOLD,
+            rawThresh = GEOMETRIC_OVERRIDE_THRESHOLD,
+        )
         val skipTentative = strongMatch ||
             (clsP >= 0.8f) ||
-            (clsP < 0f && hasEmbeddings && sim >= GEOMETRIC_OVERRIDE_THRESHOLD)
+            (clsP < 0f && hasEmbeddings && geometricOverrideForTentative)
         if (!skipTentative) {
             val prevBox = tentativeBox
             val candBox = candidate.boundingBox
@@ -912,15 +995,22 @@ class ReacquisitionEngine(
             }
         }
 
-        // Tiered override: geometric gates use a lower threshold (0.55) because
-        // position rejection is about camera movement, not identity confusion.
-        // Label gate uses a higher threshold (0.7) to protect against cross-category leakage.
-        // Use whichever embedding actually drove the gate (OSNet for person-person,
-        // MobileNetV3 otherwise) — OSNet's same-person sim often clears 0.55 even
-        // when MobileNetV3 doesn't, so this lets a strong re-ID match bypass
-        // position/size hard filters during fast camera movement.
-        val geometricOverride = gateActive && appearanceScore > GEOMETRIC_OVERRIDE_THRESHOLD
-        val labelOverride = gateActive && appearanceScore > APPEARANCE_OVERRIDE_THRESHOLD
+        // Tiered override (Phase 3 #102): z-score preferred, raw cosine as fallback.
+        // Geometric gates (position/size) admit lower z (≥1.0) because position
+        // rejection is about camera movement, not identity. Label gate uses a
+        // stricter z (≥1.5) since cross-category confusion is high-risk.
+        // [overridePasses] picks the OSNet z for person-person and the MNV3 z
+        // otherwise, mirroring [effectiveAppearanceSim].
+        val geometricOverride = gateActive && overridePasses(
+            candidate, appearanceScore,
+            zThresh = Z_GEOMETRIC_OVERRIDE_THRESHOLD,
+            rawThresh = GEOMETRIC_OVERRIDE_THRESHOLD,
+        )
+        val labelOverride = gateActive && overridePasses(
+            candidate, appearanceScore,
+            zThresh = Z_LABEL_OVERRIDE_THRESHOLD,
+            rawThresh = APPEARANCE_OVERRIDE_THRESHOLD,
+        )
 
         // --- GATE A: Position hard filter (with time decay) ---
         // Use velocity-predicted position when available. If the subject was moving

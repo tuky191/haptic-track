@@ -1520,13 +1520,22 @@ class ReacquisitionEngineTest {
     fun `uncertain classifier does not bypass tentative`() {
         val embs = (1..5).map { floatArrayOf(0.9f + it * 0.01f, 0.1f, 0f, 0f) }
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup", embs)
-        repeat(5) { i ->
-            engine.addSceneNegative(floatArrayOf(0.1f, 0.9f + i * 0.01f, 0f, 0f))
-        }
+        // Diverse negatives spanning the [positive, negative] axis so the
+        // impostor cohort has realistic variance — without this, σ collapses
+        // and the Phase 3 z-norm gate sees the candidate as clearly above
+        // noise floor regardless of classifier output (#102).
+        engine.addSceneNegative(floatArrayOf(0.1f, 0.9f, 0f, 0f))
+        engine.addSceneNegative(floatArrayOf(0.2f, 0.8f, 0f, 0f))
+        engine.addSceneNegative(floatArrayOf(0.5f, 0.5f, 0f, 0f))   // near the ambiguous boundary
+        engine.addSceneNegative(floatArrayOf(0.4f, 0.6f, 0f, 0f))
+        engine.addSceneNegative(floatArrayOf(0.3f, 0.7f, 0f, 0f))
         assertTrue(engine.classifierTrained)
         engine.processFrame(emptyList())
 
-        // Candidate in between positives and negatives — classifier uncertain
+        // Candidate in between positives and negatives — classifier uncertain.
+        // Also designed to land at z-norm noise floor: its sim to the gallery
+        // is close to the cohort mean since one of the negatives is colinear
+        // with this exact candidate direction.
         val ambiguous = floatArrayOf(0.5f, 0.5f, 0f, 0f)
         assertTrue("Classifier should be uncertain for ambiguous embedding",
             engine.classifierScore(ambiguous) < 0.8f)
