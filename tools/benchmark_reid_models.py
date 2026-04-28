@@ -150,9 +150,68 @@ def build_osnet_embedder():
     return embed
 
 
+def build_torchreid_osnet(arch: str, weights: Path, input_hw=(256, 128),
+                          resize_mode: str = "letterbox"):
+    """Run a torchreid OSNet variant on PyTorch. We bypass the classifier head
+    and read the model's `featuremaps` (post-pool feature vector) directly.
+
+    `resize_mode`: "letterbox" matches the on-device CanonicalCropper (#100);
+    "stretch" matches torchreid's training transform (Resize((H, W)) — direct
+    resize, no aspect preservation). The training-matched mode tells us the
+    model's intrinsic ceiling; the deployment-matched mode tells us what we'd
+    actually ship with."""
+    import torch
+    from torchreid.reid.models import build_model
+    from torchreid.reid.utils import load_pretrained_weights
+
+    model = build_model(name=arch, num_classes=1041, pretrained=False)
+    load_pretrained_weights(model, str(weights))
+    model.eval()
+
+    h, w = input_hw
+
+    def embed(img_path: Path) -> np.ndarray:
+        img = Image.open(img_path).convert("RGB")
+        if resize_mode == "letterbox":
+            img = _resize_letterbox(img, w, h)
+        elif resize_mode == "stretch":
+            img = img.resize((w, h), Image.BILINEAR)
+        else:
+            raise ValueError(f"unknown resize_mode {resize_mode}")
+        arr = np.asarray(img, dtype=np.float32) / 255.0
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        arr = (arr - mean) / std
+        t = torch.from_numpy(np.transpose(arr, (2, 0, 1))[None, ...].copy())
+        with torch.no_grad():
+            feat = model(t).cpu().numpy().reshape(-1)
+        n = np.linalg.norm(feat)
+        return (feat / n).astype(np.float32) if n > 0 else feat.astype(np.float32)
+
+    return embed
+
+
+_MODELS_DIR = Path(__file__).parent / "models/osnet_hf"
+
+
+def _osnet_pair(label: str, arch: str, ckpt_name: str) -> dict:
+    """Return {<label>_<lb|st>: builder} pair for letterbox + stretch modes.
+
+    `label` is the dict key prefix (e.g. "osnet_x1_0_msmt17"); `arch` is the
+    torchreid model name passed to build_model (e.g. "osnet_x1_0")."""
+    weights = _MODELS_DIR / ckpt_name
+    return {
+        f"{label}_lb": (lambda: build_torchreid_osnet(arch, weights, resize_mode="letterbox")),
+        f"{label}_st": (lambda: build_torchreid_osnet(arch, weights, resize_mode="stretch")),
+    }
+
+
 MODELS: dict[str, Callable[[], Callable[[Path], np.ndarray]]] = {
-    "mobilenet_v3_large": build_mobilenet_embedder,
-    "osnet_x1_0_market": build_osnet_embedder,
+    "mobilenet_v3_large":   build_mobilenet_embedder,
+    "osnet_x1_0_market":    build_osnet_embedder,
+    **_osnet_pair("osnet_x1_0_msmt17",     "osnet_x1_0",     "osnet_x1_0_msmt17_combineall.pth"),
+    **_osnet_pair("osnet_ain_x1_0_msmt17", "osnet_ain_x1_0", "osnet_ain_x1_0_msmt17.pth"),
+    **_osnet_pair("osnet_ibn_x1_0_msmt17", "osnet_ibn_x1_0", "osnet_ibn_x1_0_msmt17_combineall.pth"),
 }
 
 

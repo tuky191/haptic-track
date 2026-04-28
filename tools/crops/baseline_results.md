@@ -1,68 +1,102 @@
-# Baseline same-vs-different person cosine — current shipping models
+# Same-vs-different person cosine — full sweep
 
 Method: see `tools/benchmark_reid_models.py`. Track-tagged crops from
-YOLOv8 + ByteTrack on the test videos, identity ground truth from
-`crops/identity_map.json`, ImageNet-normalized letterbox input for OSNet.
+YOLOv8 + ByteTrack on the test videos; identity ground truth from
+`crops/identity_map.json`. The torchreid OSNet variants are loaded from
+the official Hugging Face mirror at
+[kaiyangzhou/osnet](https://huggingface.co/kaiyangzhou/osnet) (saves us
+from the GDrive rate limit on the original torchreid model zoo).
 
-## Headline numbers
+Each torchreid model is run twice:
+- `_lb` (letterbox): aspect-preserving resize with gray padding to
+  256×128. Matches the on-device CanonicalCropper (#100).
+- `_st` (stretch): direct `Resize((256, 128))` — exactly what torchreid
+  used in training. Tells us the model's intrinsic ceiling.
 
-| Video | Model | same p10 | diff p90 | diff p99 | gap (p10 − p90) |
-|---|---|---|---|---|---|
-| kid_to_wife | MobileNetV3 Large | +0.422 | +0.241 | +0.363 | **+0.181** |
-| kid_to_wife | OSNet x1.0 | +0.717 | +0.646 | +0.712 | **+0.071** |
-| boy_indoor_wife_swap | MobileNetV3 Large | +0.174 | +0.372 | +0.491 | **−0.198** |
-| boy_indoor_wife_swap | OSNet x1.0 | +0.547 | +0.773 | +0.858 | **−0.226** |
+The gap metric: `same_p10 − diff_p90`. Positive = the model has a
+working threshold for separating same-vs-different at this device's
+image distribution. Negative = signals overlap, no fixed threshold
+works (the kid_to_wife / #102 failure mode).
 
-## What the numbers say
+## kid_to_wife (n_same=12190, n_diff=12120)
 
-**The structural problem is real, not a calibration miss.** On
-boy_indoor_wife_swap both shipping models produce a NEGATIVE gap — the
-worst 10% of same-person pairs sit below the best 10% of different-person
-pairs. There is no fixed cosine threshold that separates same from
-different on this clip with either model. This is the kid_to_wife
-failure mode generalized: relative ranking, not absolute thresholding,
-is the only axis on which we can win.
+| Model | mode | same p10 | diff p90 | diff p99 | gap |
+|---|---|---:|---:|---:|---:|
+| MobileNetV3 Large | letterbox | +0.422 | +0.241 | +0.363 | **+0.181** |
+| OSNet x1.0 Market (current TFLite) | letterbox | +0.717 | +0.646 | +0.712 | +0.071 |
+| OSNet x1.0 MSMT17 | letterbox | +0.572 | +0.544 | +0.605 | +0.029 |
+| OSNet x1.0 MSMT17 | **stretch** | +0.659 | +0.576 | +0.638 | **+0.083** |
+| OSNet-AIN x1.0 MSMT17 | letterbox | +0.586 | +0.549 | +0.602 | +0.038 |
+| OSNet-AIN x1.0 MSMT17 | stretch | +0.622 | +0.569 | +0.622 | +0.053 |
+| OSNet-IBN x1.0 MSMT17 | letterbox | +0.532 | +0.527 | +0.579 | +0.005 |
+| OSNet-IBN x1.0 MSMT17 | stretch | +0.586 | +0.535 | +0.580 | +0.051 |
 
-OSNet x1.0 on kid_to_wife specifically: same_p10 (0.717) is barely above
-diff_p99 (0.712). At threshold 0.715 you'd accept ~50% of same-person
-matches and reject ~99% of different-person. Increase the threshold
-and you lose more same-person matches faster than you gain different-
-person rejections.
+## boy_indoor_wife_swap (n_same=32866, n_diff=22080)
 
-## Per-identity-pair detail (kid_to_wife)
+| Model | mode | same p10 | diff p90 | gap |
+|---|---|---:|---:|---:|
+| MobileNetV3 Large | letterbox | +0.174 | +0.372 | -0.198 |
+| OSNet x1.0 Market (current TFLite) | letterbox | +0.547 | +0.773 | -0.226 |
+| OSNet x1.0 MSMT17 | letterbox | +0.390 | +0.614 | -0.225 |
+| OSNet x1.0 MSMT17 | stretch | +0.378 | +0.647 | -0.269 |
+| OSNet-AIN x1.0 MSMT17 | letterbox | +0.422 | +0.599 | **-0.177** |
+| OSNet-AIN x1.0 MSMT17 | stretch | +0.413 | +0.638 | -0.225 |
+| **OSNet-IBN x1.0 MSMT17** | **letterbox** | +0.392 | +0.554 | **-0.162** |
+| OSNet-IBN x1.0 MSMT17 | stretch | +0.380 | +0.587 | -0.207 |
 
-OSNet x1.0:
-- boy vs wife: p10=0.526 p50=0.573 p90=0.646
-- boy same: p10=0.727 p50=0.821
-- wife same: p10=0.677 p50=0.837
+## Findings
 
-The boy-vs-wife distribution's TAIL (p90=0.646) is what causes wrong
-reacquires. Engine-logged sim=0.732 (#102 forensic) sits in that tail.
+**No model swap solves the structural overlap.** Both videos still show
+overlapping same-vs-different distributions on every variant. The
+literature-claimed advantages of cross-domain MSMT17 training,
+instance-norm (IBN), and adaptive instance norm (AIN) yield ±5pp gap
+shifts on our footage — meaningful but not transformative.
 
-MobileNetV3 Large:
-- boy vs wife: p10=0.053 p50=0.156 p90=0.241
-- boy same: p10=0.508 p50=0.654
-- wife same: p10=0.259 p50=0.577
+**OSNet-IBN x1.0 MSMT17 is the most consistent improvement** on the
+harder scenario (boy_indoor_wife_swap), narrowing the negative gap from
+-0.226 (current) to -0.162 (+0.064 improvement). On kid_to_wife
+specifically the current Market-trained TFLite still wins (+0.071 vs
++0.005 letterbox), so an unconditional swap would regress the easier
+scenario.
 
-Wider bands but same overlap pattern — wife's same-sim p10=0.259 sits
-BELOW boy-vs-wife p90=0.241 means a fixed threshold can't separate
-"is this candidate the wife I locked on" from "is this candidate the
-boy I'm trying to track" reliably.
+**Letterbox vs stretch is a real choice.** For torchreid-trained
+models, *stretch* matches their training transform and gives noticeably
+better numbers on kid_to_wife (OSNet x1.0 MSMT17: +0.083 stretch vs
++0.029 letterbox). On boy_indoor_wife_swap the relationship inverts —
+*letterbox* preserves more identity signal. The on-device
+CanonicalCropper currently uses letterbox; if we swap to a torchreid
+model, we should consider stretch for that one model and benchmark.
 
-## Implications
+**Engine forensic numbers (#102) cross-validate.** The wife wrong
+reacquire scored reId=0.732 against the boy lock. Our benchmark says
+boy-vs-wife p90 = 0.646 (current Market), p99 = 0.712. The 0.732
+sits above the 99th percentile of cross-person cosines — the outlier
+tail that no fixed threshold can reach without rejecting same-person
+matches. SessionRoster (#108) addresses this by scoring relative to a
+distractor bank instead of an absolute threshold.
 
-1. **A better backbone helps but does not solve.** The literature
-   suggests CION zoo and OSNet-AIN add ~5-12% mAP cross-domain — that
-   would shift the diff_p90 down by some amount and lift same_p10 by
-   some amount. But the *structural* property (overlap exists) is
-   likely to remain because both shipping models already show it on a
-   real-footage dataset.
+## Decision
 
-2. **SessionRoster ranking (#108) is the right fix regardless of
-   model.** Identity-by-rank works even when distributions overlap, as
-   long as the candidate's CORRECT slot tends to outscore the WRONG
-   slot. That's a much weaker condition than a fixed threshold.
+Don't swap OSNet x1.0 Market until SessionRoster (#108) lands and we
+measure residual on real device. If after #108 there's still residual
+identity confusion, **OSNet-IBN x1.0 MSMT17 letterbox** is the
+recommended swap target — it shows the most robust improvement on the
+harder scenarios. Conversion path: PyTorch → ONNX → TFLite via onnx2tf
+(same recipe as the current OSNet TFLite). Same model dimensions
+(2.7M params, 512-dim output, 256×128 input), so the on-device pipeline
+plumbing doesn't need to change.
 
-3. **Model upgrade still worthwhile.** A wider gap reduces the rate at
-   which the lock slot is the second-best match — i.e. it reduces the
-   load on the margin gate.
+## Methodology caveats
+
+- **Identity mapping is manual.** Track IDs from ByteTrack don't always
+  correspond to identities (ID-switches across reappearances). I labeled
+  each track manually from one representative crop. A small number of
+  ambiguous tracks ("unknown") were dropped from comparison.
+- **boy_indoor_wife_swap has high pose variance.** The boy is constantly
+  turning, occluding, changing pose. Same-person variance dominates,
+  giving negative gap on every model. This may overstate the structural
+  overlap — but it also matches what the engine sees on real footage.
+- **CION zoo not evaluated.** README requires signed license + email.
+  Per the literature, CION mobile variants would likely give larger
+  gains than OSNet variants — worth pursuing if the OSNet-IBN swap
+  proves insufficient.
