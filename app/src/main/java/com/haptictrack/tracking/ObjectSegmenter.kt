@@ -155,6 +155,9 @@ class ObjectSegmenter(
 
         return try {
             if (drawW <= 0 || drawH <= 0) null
+            // createBitmap on a sub-region copies pixels into a new buffer
+            // (Android API contract), so recycling `masked` in the finally
+            // block doesn't invalidate the returned bitmap.
             else Bitmap.createBitmap(masked, pad.left, pad.top, drawW, drawH)
         } catch (e: Exception) {
             Log.w(TAG, "Crop after mask failed: ${e.message}")

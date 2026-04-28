@@ -176,8 +176,17 @@ class AppearanceEmbedder(
         // Build the mnv3-input source: from masked canonical when available,
         // otherwise from a raw mnv3 canonical (lock time wants gallery diversity
         // even when segmentation fails).
+        // Wrap createScaledBitmap so a downscale OOM doesn't leak `masked` —
+        // the caller can't reach it via AugmentedResult if we throw before
+        // returning.
         val (mnv3Source, ownsSource) = if (masked != null) {
-            Pair(Bitmap.createScaledBitmap(masked, MNV3_INPUT_SIZE, MNV3_INPUT_SIZE, true), true)
+            try {
+                Pair(Bitmap.createScaledBitmap(masked, MNV3_INPUT_SIZE, MNV3_INPUT_SIZE, true), true)
+            } catch (t: Throwable) {
+                Log.w(TAG, "Augmented downscale failed: ${t.message}")
+                masked.recycle()
+                return AugmentedResult(emptyList(), null)
+            }
         } else {
             val raw = cropper.prepare(
                 bitmap, normalizedBox,
