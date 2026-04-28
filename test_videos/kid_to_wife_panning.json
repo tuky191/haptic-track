@@ -1,0 +1,8 @@
+{
+  "description": "Lock on small distant kid in doorway (~9% bbox), camera pans to wife in next room. First reacquire wrongly matches wife with engine sim=0.864 vs ~0.54 max from raw lock gallery — hypothesis: gallery accumulator added a non-son embedding during the 2s VT window. Use this scenario to inspect ACCUM/TEMPLATE/DRIFT log lines in session.log.",
+  "lockFrame": 0,
+  "lockBox": [0.428, 0.340, 0.517, 0.426],
+  "lockLabel": "person",
+  "analysisWidth": 640,
+  "fps": 60
+}

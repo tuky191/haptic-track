@@ -517,9 +517,14 @@ class ObjectTracker(
                                 // gallery vs 0.541 against the raw lock-only embeddings.
                                 val centroidSim = reacquisition.centroidSimilarity(emb)
                                 val lockSim = reacquisition.bestLockGallerySimilarity(emb)
+                                val boxStr = "%.2f,%.2f,%.2f,%.2f".format(rawBox.left, rawBox.top, rawBox.right, rawBox.bottom)
                                 if (centroidSim < 0.92f && lockSim > GALLERY_ADD_LOCK_SIM_FLOOR) {
                                     reacquisition.addEmbedding(emb)
                                     android.util.Log.d("AppearEmbed", "Gallery +1 → ${reacquisition.embeddingGallery.size} (centroidSim=${"%.3f".format(centroidSim)}, lockSim=${"%.3f".format(lockSim)})")
+                                    debugCapture.log("ACCUM +1 vtFrame=$vtConfirmedFrames gallery=${reacquisition.embeddingGallery.size} lockSim=${"%.3f".format(lockSim)} centroidSim=${"%.3f".format(centroidSim)} box=[$boxStr]")
+                                } else {
+                                    val why = if (lockSim <= GALLERY_ADD_LOCK_SIM_FLOOR) "lockSim<=$GALLERY_ADD_LOCK_SIM_FLOOR" else "centroidSim>=0.92"
+                                    debugCapture.log("ACCUM skip vtFrame=$vtConfirmedFrames gallery=${reacquisition.embeddingGallery.size} lockSim=${"%.3f".format(lockSim)} centroidSim=${"%.3f".format(centroidSim)} box=[$boxStr] ($why)")
                                 }
                             }
                             // Progressive face embedding: try to capture face during tracking
@@ -612,11 +617,13 @@ class ObjectTracker(
                                 sim < TEMPLATE_SIM_LOW -> {
                                     templateMismatchCount++
                                     android.util.Log.d("VisualTracker", "Template mismatch $templateMismatchCount/$TEMPLATE_MISMATCH_MAX (sim=${"%.3f".format(sim)})")
+                                    debugCapture.log("TEMPLATE mismatch vtFrame=$vtConfirmedFrames count=$templateMismatchCount/$TEMPLATE_MISMATCH_MAX lockSim=${"%.3f".format(sim)}")
                                 }
                                 sim > TEMPLATE_SIM_OK -> {
                                     if (templateMismatchCount > 0) {
                                         templateMismatchCount--
                                         android.util.Log.d("VisualTracker", "Template recovery $templateMismatchCount/$TEMPLATE_MISMATCH_MAX (sim=${"%.3f".format(sim)})")
+                                        debugCapture.log("TEMPLATE recovery vtFrame=$vtConfirmedFrames count=$templateMismatchCount/$TEMPLATE_MISMATCH_MAX lockSim=${"%.3f".format(sim)}")
                                     }
                                 }
                                 else -> { /* dead zone — hold the counter */ }
@@ -647,6 +654,7 @@ class ObjectTracker(
                             else -> "$vtUnconfirmedFrames unconfirmed frames (max=$adaptiveMaxUnconfirmed)"
                         }
                         android.util.Log.w("VisualTracker", "DRIFT detected — $reason (conf=${vtResult.confidence}, speed=${velocityEstimator.speed}), stopping")
+                        debugCapture.log("DRIFT vtFrame=$vtConfirmedFrames reason=\"$reason\" conf=${"%.2f".format(vtResult.confidence)} speed=${"%.3f".format(velocityEstimator.speed)}")
                         visualTracker.stop()
                         vtUnconfirmedFrames = 0
                         vtFrameCounter = 0
