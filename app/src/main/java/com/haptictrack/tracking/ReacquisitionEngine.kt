@@ -262,33 +262,31 @@ class ReacquisitionEngine(
 
     private fun recomputeLiveStatsIfNeeded() {
         if (!_liveStatsDirty) return
-        // MNV3 cohort: live scene negatives + frozen offline pool. Frozen
-        // backfill closes the cold-start gap (#102 Phase 2 finding) where
-        // short-lock scenarios like kid_to_wife_panning never accumulate
-        // enough live negatives for trustworthy stats.
-        val mnv3Cohort = if (_negativeExamples.size >= MIN_COHORT_FOR_ZNORM) {
-            _negativeExamples + frozenNegativesMobileNet
-        } else if (frozenNegativesMobileNet.size >= MIN_COHORT_FOR_ZNORM) {
-            frozenNegativesMobileNet
-        } else emptyList()
-        _mnv3LiveStats = if (mnv3Cohort.size >= MIN_COHORT_FOR_ZNORM) {
-            computeImpostorStats(_embeddingGallery, mnv3Cohort)?.withSigmaFloor()
+        // Z-norm requires the impostor cohort to match the test-time
+        // distribution. Live scene negatives DO — they're embeddings of
+        // other detections seen in the same scene/lighting/pose space as
+        // the locked subject. The frozen offline pool (frozenNegativesMobileNet
+        // / frozenNegativesOsnet) was tried as a cold-start backfill in
+        // Phase 3, but on real scenarios the frozen pool's mean was so far
+        // below the test-time impostor mean that z-scores inflated to
+        // useless levels (clearly-wrong wife reacquires at znOsnet=3.06,
+        // chair correct-reacq at znMnv3=8.5 — both off the calibration
+        // we did in Phase 2 with live-only cohort).
+        //
+        // Keeping the cohort live-only means short-lock scenarios produce
+        // no z-score, falling back to raw cosine in the override gate.
+        // The cold-start gap (kid_to_wife_panning) is a separate problem
+        // the override-only Phase 3 doesn't address — needs scoring-level
+        // changes or a session-aware impostor pool, both deferred to Phase 4.
+        _mnv3LiveStats = if (_negativeExamples.size >= MIN_COHORT_FOR_ZNORM) {
+            computeImpostorStats(_embeddingGallery, _negativeExamples)?.withSigmaFloor()
         } else null
 
-        // OSNet cohort: paired-with-face scene bodies + frozen offline pool.
-        val liveBodies = _sceneFacePairs.map { it.body }
-        val osnetCohort = if (liveBodies.size >= MIN_COHORT_FOR_ZNORM) {
-            liveBodies + frozenNegativesOsnet
-        } else if (frozenNegativesOsnet.size >= MIN_COHORT_FOR_ZNORM) {
-            frozenNegativesOsnet
-        } else emptyList()
+        val osnetCohort = _sceneFacePairs.map { it.body }
         _osnetLiveStats = if (osnetCohort.size >= MIN_COHORT_FOR_ZNORM) {
             computeImpostorStats(lockedReIdEmbedding, osnetCohort)?.withSigmaFloor()
         } else null
 
-        // Face cohort: only live for now (no frozen face cohort asset).
-        // TODO(#102): consider a frozen face-impostor pool to close the cold-start
-        // gap on the face modality too.
         val faceCohort = _sceneFacePairs.map { it.face }
         _faceLiveStats = if (faceCohort.size >= MIN_COHORT_FOR_ZNORM) {
             computeImpostorStats(lockedFaceEmbedding, faceCohort)?.withSigmaFloor()
