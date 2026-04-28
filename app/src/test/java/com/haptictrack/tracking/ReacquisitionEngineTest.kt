@@ -1365,22 +1365,28 @@ class ReacquisitionEngineTest {
     }
 
     @Test
-    fun `scene face pair memory bounded at MAX_SCENE_FACE_PAIRS`() {
-        // Lock face/body axes set so test data is consistently far from both.
+    fun `roster non-lock count bounded at MAX_SLOTS`() {
+        // The session roster (#108) replaces the older flat scene-pair list.
+        // Cap is on distinct identities, not raw pair count: near-duplicates
+        // merge into one slot, only DIFFERENT people occupy new slots.
+        // Use a higher-dim space and orthogonal axes so each pair represents
+        // a clearly distinct identity.
+        val n = 32
+        fun unit(axis: Int): FloatArray = FloatArray(n).also { it[axis] = 1f }
+
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
             listOf(floatArrayOf(1f, 0f)), null, null, cocoLabel = "person",
-            reIdEmbedding = floatArrayOf(1f, 0f, 0f, 0f),
-            faceEmbedding = floatArrayOf(1f, 0f, 0f))
+            reIdEmbedding = unit(0), faceEmbedding = unit(0))
 
-        // Add 20 pairs orthogonal to the lock axes — none should be filtered.
-        repeat(20) { i ->
-            engine.addScenePersonPair(
-                floatArrayOf(0f, 1f - 0.01f * i, 0.05f * i),       // far from lock face axis
-                floatArrayOf(0f, 1f, 0f, 0.01f * i),                // far from lock body axis
-            )
+        // Add (MAX_SLOTS + 4) distinct identities — should cap at MAX_SLOTS - 1
+        // non-lock slots (slot 0 is reserved for the lock).
+        val totalToAdd = SessionRoster.MAX_SLOTS + 4
+        repeat(totalToAdd) { i ->
+            // axes 1..totalToAdd, all orthogonal to lock at axis 0.
+            engine.addScenePersonPair(unit(i + 1), unit(i + 1))
         }
-        assertEquals("Memory should cap at MAX_SCENE_FACE_PAIRS",
-            ReacquisitionEngine.MAX_SCENE_FACE_PAIRS, engine.sceneFacePairCount)
+        assertEquals("Non-lock slots should cap at MAX_SLOTS - 1 (lock occupies slot 0)",
+            SessionRoster.MAX_SLOTS - 1, engine.sceneFacePairCount)
     }
 
     @Test

@@ -110,6 +110,15 @@ class ReacquisitionEngine(
          *  any stored other than to the lock — too aggressive on borderline
          *  same-person frames. */
         const val SCENE_BODY_VETO_MARGIN = 0.10f
+        /** Roster open-set rejection floor (#108): non-lock match score must
+         *  exceed this *and* beat lock score by [ROSTER_REJECT_MARGIN] to fire.
+         *  Set to face-merge threshold so the non-lock match must at least
+         *  pass the same evidence bar we use to fuse observations into a slot. */
+        const val ROSTER_REJECT_FLOOR = 0.55f
+        /** Margin by which the best non-lock roster match must exceed the lock
+         *  match before the open-set rejection fires. Same band as the older
+         *  SCENE_FACE/BODY_VETO_MARGINs but applied uniformly across modalities. */
+        const val ROSTER_REJECT_MARGIN = 0.07f
         /**
          * Max frozen negatives used for OnlineClassifier cold-start at lock time.
          * The full frozen-negatives asset (~1500) is used for adaptive-floor
@@ -284,12 +293,12 @@ class ReacquisitionEngine(
             computeImpostorStats(_embeddingGallery, _negativeExamples)?.withSigmaFloor()
         } else null
 
-        val osnetCohort = _sceneFacePairs.map { it.body }
+        val osnetCohort = _roster.allNonLockBodies()
         _osnetLiveStats = if (osnetCohort.size >= MIN_COHORT_FOR_ZNORM) {
             computeImpostorStats(lockedReIdEmbedding, osnetCohort)?.withSigmaFloor()
         } else null
 
-        val faceCohort = _sceneFacePairs.map { it.face }
+        val faceCohort = _roster.allNonLockFaces()
         _faceLiveStats = if (faceCohort.size >= MIN_COHORT_FOR_ZNORM) {
             computeImpostorStats(lockedFaceEmbedding, faceCohort)?.withSigmaFloor()
         } else null
@@ -393,79 +402,60 @@ class ReacquisitionEngine(
         }
     }
 
-    /** Paired face + body embedding from a non-lock person observed during VT-
-     *  confirmed tracking. Used asymmetrically: at gate time, candidate compares
-     *  against lock AND against this memory. If a stored other matches better
-     *  than the lock, candidate is rejected. The face-body LINK lets us recognize
-     *  someone later when only one modality is visible. (#83 phase 2) */
-    private data class ScenePersonPair(val face: FloatArray, val body: FloatArray)
-    private val _sceneFacePairs = mutableListOf<ScenePersonPair>()
+    /** Per-session person roster (#108): clustered tracklets of every distinct
+     *  person seen in the session. Slot 0 is the lock; slots 1..N are other
+     *  persons. At score time, an identity is judged by RANK among all known
+     *  identities + a margin to the second-best — not by an absolute threshold
+     *  to the lock. Subsumes the older `_sceneFacePairs` flat list (#83 phase 2). */
+    private val _roster = SessionRoster()
 
-    /** Snapshot of stored scene face-body pairs (read-only). Test/debug helper. */
-    val sceneFacePairCount: Int get() = _sceneFacePairs.size
+    /** Read-only roster view (test + diagnostic helper). */
+    val roster: SessionRoster get() = _roster
+
+    /** Count of non-lock tracklets — backwards-compat shim for tests that used
+     *  the older `sceneFacePairCount` API. */
+    val sceneFacePairCount: Int get() = _roster.nonLockCount
+
+    /** Monotonically-increasing observation counter. Used as roster frame index
+     *  when ObjectTracker doesn't pass one explicitly (e.g. legacy callers). */
+    private var _observationFrame: Int = 0
 
     /**
-     * Add a paired face+body embedding observed for a non-lock person during
-     * VT-confirmed tracking. Caller is responsible for ensuring the pair came
-     * from the SAME detection at the same frame (the "link" is what makes this
-     * useful asymmetrically later).
+     * Observe a non-lock person detection. Either fuses into an existing roster
+     * tracklet or creates a new one; filters near-lock observations.
      *
-     * Filters near-lock matches the same way [addSceneNegative] does — if the
-     * body is too similar to the lock gallery (sim >= 0.85) we skip, since
-     * the detection is likely the lock itself rather than a genuine other.
-     * Same for face: if face matches lock face (sim >= 0.6), skip.
+     * Replaces [addScenePersonPair]'s old flat-pair behavior with clustered
+     * identity tracking. Either modality can be null when the detector didn't
+     * recover that signal for this candidate, but both null is a no-op.
+     *
+     * @return slot id assigned, or null if filtered (lock-near or empty input).
+     */
+    fun observePerson(face: FloatArray?, body: FloatArray?): Int? {
+        _observationFrame++
+        val slotId = _roster.observePerson(face, body, _observationFrame)
+        if (slotId != null) _liveStatsDirty = true
+        return slotId
+    }
+
+    /**
+     * Backwards-compat alias for [observePerson] retained for the existing
+     * ObjectTracker callsite that passes paired (face, body) collected during
+     * VT-confirmed tracking. New code should call [observePerson] directly
+     * with nullable arguments to support face-missing or body-missing
+     * observations.
      */
     fun addScenePersonPair(face: FloatArray, body: FloatArray) {
-        // Reject if this pair is too close to the lock — it's probably the lock
-        // itself from a duplicate detection, and we'd later reject the lock.
-        //
-        // Compare body to the lock's OSNet body embedding (same dim space).
-        // Earlier this used bestGallerySimilarity against _embeddingGallery,
-        // which holds MobileNetV3 (1280-dim) embeddings — cosineSimilarity
-        // between OSNet (512-dim) and MNV3 falls through the size check and
-        // returns 0, so the body half of this filter was silently dead.
-        val bodySim = lockedReIdEmbedding?.let { cosineSimilarity(it, body) } ?: 0f
-        val faceSim = lockedFaceEmbedding?.let { cosineSimilarity(it, face) } ?: 0f
-        if (bodySim >= 0.85f || faceSim >= 0.6f) {
-            Log.d(TAG, "Scene pair rejected: bodySim=${"%.3f".format(bodySim)} faceSim=${"%.3f".format(faceSim)} (looks like lock)")
-            return
-        }
-        if (_sceneFacePairs.size >= MAX_SCENE_FACE_PAIRS) {
-            _sceneFacePairs.removeAt(0)
-        }
-        _sceneFacePairs.add(ScenePersonPair(face.copyOf(), body.copyOf()))
-        _liveStatsDirty = true
-        Log.d(TAG, "Scene pair added: bodySim=${"%.3f".format(bodySim)} faceSim=${"%.3f".format(faceSim)} — total=${_sceneFacePairs.size}")
+        observePerson(face, body)
     }
 
-    /**
-     * Best face-cosine of [candidateFace] against any stored scene other.
-     * Returns 0 if no stored faces. Used in [scoreCandidate] for the
-     * face-recognized-as-known-other veto.
-     */
+    /** Best face-cosine of [candidateFace] against any non-lock roster slot. */
     internal fun bestSceneFaceMatch(candidateFace: FloatArray): Float {
-        if (_sceneFacePairs.isEmpty()) return 0f
-        var best = 0f
-        for (p in _sceneFacePairs) {
-            val s = cosineSimilarity(p.face, candidateFace)
-            if (s > best) best = s
-        }
-        return best
+        return _roster.bestNonLockMatch(candidateFace, null).first
     }
 
-    /**
-     * Best body-cosine of [candidateBody] against any stored scene-other body.
-     * Used for the no-face veto path: if body sim to a stored other exceeds
-     * body sim to the lock by [SCENE_BODY_VETO_MARGIN], reject.
-     */
+    /** Best body-cosine of [candidateBody] against any non-lock roster slot. */
     internal fun bestSceneBodyMatch(candidateBody: FloatArray): Float {
-        if (_sceneFacePairs.isEmpty()) return 0f
-        var best = 0f
-        for (p in _sceneFacePairs) {
-            val s = cosineSimilarity(p.body, candidateBody)
-            if (s > best) best = s
-        }
-        return best
+        return _roster.bestNonLockMatch(null, candidateBody).second
     }
 
     /** Prototype margin: sim(candidate, pos_centroid) - sim(candidate, neg_centroid).
@@ -531,7 +521,9 @@ class ReacquisitionEngine(
         recomputeCentroid()
         _negativeExamples.clear()
         _negativeCentroid = null
-        _sceneFacePairs.clear()
+        _roster.clear()
+        _roster.seedLock(face = faceEmbedding, body = reIdEmbedding, frameIdx = 0)
+        _observationFrame = 0
         _classifier.clear()
         _lastTrainPositives = 0
         _lastTrainNegatives = 0
@@ -597,9 +589,22 @@ class ReacquisitionEngine(
     fun addFaceEmbedding(embedding: FloatArray) {
         if (lockedFaceEmbedding == null) {
             lockedFaceEmbedding = embedding.copyOf()
+            _roster.augmentLock(face = embedding, body = null, frameIdx = ++_observationFrame)
             _liveStatsDirty = true
             dualLog(Log.INFO, "FACE_EMBED added (${embedding.size}-dim)")
         }
+    }
+
+    /** Augment the [SessionRoster]'s lock-slot body gallery with a fresh OSNet
+     *  embedding observed during VT-confirmed tracking (#108). Without this,
+     *  the lock body gallery stays at one entry from [seedLock] while non-lock
+     *  slots accumulate per-frame observations — creating an asymmetric
+     *  disadvantage at [ROSTER_REJECT] time. Doesn't touch [lockedReIdEmbedding]
+     *  (anchor for raw-cosine paths) — only the roster's lock-slot gallery. */
+    fun augmentLockReId(embedding: FloatArray) {
+        if (_roster.lockSlot == null) return
+        _roster.augmentLock(face = null, body = embedding, frameIdx = ++_observationFrame)
+        _liveStatsDirty = true
     }
 
     /** Add a new embedding to the gallery (e.g. from a confirmed visual tracker frame). */
@@ -635,7 +640,8 @@ class ReacquisitionEngine(
         _liveStatsDirty = true
         _negativeExamples.clear()
         _negativeCentroid = null
-        _sceneFacePairs.clear()
+        _roster.clear()
+        _observationFrame = 0
         _classifier.clear()
         _lastTrainPositives = 0
         _lastTrainNegatives = 0
@@ -966,36 +972,35 @@ class ReacquisitionEngine(
             }
         }
 
-        // --- GATE: Scene face-body memory veto (#83 phase 2) ---
-        // Use the paired (face, body) memory of non-lock persons observed during
-        // VT-confirmed tracking to reject candidates that look more like a known
-        // OTHER person than like the lock. Two paths:
+        // --- GATE: Roster open-set rejection (#108) ---
+        // Identity is judged by RANK among all known persons in the session.
+        // The roster holds slot 0 = lock and slots 1..N = other persons seen
+        // during the session. If a SINGLE non-lock slot's match score exceeds
+        // the lock by [ROSTER_REJECT_MARGIN], the candidate is more likely
+        // that specific person than the lock — reject.
         //
-        // (a) Face-known: candidate's face matches a stored other-person face
-        //     better than it matches the lock face. Only fires when both
-        //     candidate face and lockedFaceEmbedding exist (else lock-face
-        //     baseline is missing).
-        // (b) Body-known: candidate has no face but its body matches a stored
-        //     other-person body better than the lock body by SCENE_BODY_VETO_MARGIN.
-        //     Pays off when face was visible earlier (so the body got linked)
-        //     but isn't visible now.
-        if (lockedIsPerson && candidateIsPerson && _sceneFacePairs.isNotEmpty()) {
-            // (a) Face path
-            if (hasFaceGate) {
-                val sceneFaceMatch = bestSceneFaceMatch(candidate.faceEmbedding!!)
-                if (sceneFaceMatch >= SCENE_FACE_MATCH_FLOOR &&
-                    sceneFaceMatch > lockFaceSim + SCENE_FACE_VETO_MARGIN) {
-                    dualLog(Log.DEBUG, "  SCENE_FACE_VETO: sceneFace=${fmtF(sceneFaceMatch)} > lockFace=${fmtF(lockFaceSim)}+${fmtF(SCENE_FACE_VETO_MARGIN)} (reIdSim=${fmtF(reIdScore)})")
-                    return null
-                }
-            }
-            // (b) Body path — only when face data isn't available to drive (a)
-            if (!hasFaceGate && candidate.reIdEmbedding != null && lockedReIdEmbedding != null) {
-                val sceneBodyMatch = bestSceneBodyMatch(candidate.reIdEmbedding!!)
-                val lockBodyMatch = reIdScore  // already computed against locked re-ID
-                if (sceneBodyMatch > lockBodyMatch + SCENE_BODY_VETO_MARGIN) {
-                    dualLog(Log.DEBUG, "  SCENE_BODY_VETO: sceneBody=${fmtF(sceneBodyMatch)} > lockBody=${fmtF(lockBodyMatch)}+${fmtF(SCENE_BODY_VETO_MARGIN)}")
-                    return null
+        // We use [bestNonLockSlotMatch] (per-slot) rather than per-modality
+        // maxima across slots so the comparison reasons about ONE specific
+        // distractor, not "max-of-maxima" which can inflate when face/body
+        // maxima come from different slots.
+        //
+        // Subsumes the older SCENE_FACE_VETO + SCENE_BODY_VETO (#83 phase 2)
+        // by treating face and body uniformly within a slot: a single strong
+        // modality is sufficient evidence.
+        if (lockedIsPerson && candidateIsPerson && _roster.nonLockCount > 0) {
+            val candFace = candidate.faceEmbedding
+            val candBody = candidate.reIdEmbedding
+            if (candFace != null || candBody != null) {
+                val nonLock = _roster.bestNonLockSlotMatch(candFace, candBody)
+                if (nonLock != null) {
+                    val (lockFace, lockBody) = _roster.lockMatch(candFace, candBody)
+                    val lockScore = maxOf(lockFace, lockBody)
+                    val otherScore = maxOf(nonLock.faceSim, nonLock.bodySim)
+                    if (otherScore >= ROSTER_REJECT_FLOOR &&
+                        otherScore > lockScore + ROSTER_REJECT_MARGIN) {
+                        dualLog(Log.DEBUG, "  ROSTER_REJECT: slot=${nonLock.slotId} nonLock=${fmtF(otherScore)} (face=${fmtF(nonLock.faceSim)} body=${fmtF(nonLock.bodySim)}) > lock=${fmtF(lockScore)} (face=${fmtF(lockFace)} body=${fmtF(lockBody)}) +${fmtF(ROSTER_REJECT_MARGIN)}")
+                        return null
+                    }
                 }
             }
         }
