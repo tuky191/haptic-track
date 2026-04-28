@@ -198,6 +198,10 @@ class ObjectTracker(
         val reIdEmb: FloatArray?,
         val faceEmb: FloatArray?,
         val sceneNegatives: List<FloatArray>,
+        /** Face+body embeddings for OTHER persons visible at lock time — seeds
+         *  the [SessionRoster] (#108) so the open-set rejection has data from
+         *  frame 0 of search, not after VT-confirmed-tracking accumulation. */
+        val sceneRosterObservations: List<Pair<FloatArray?, FloatArray?>>,
         val deviceRotation: Int,
         /** Snapshot bitmap; ownership transfers to whoever applies/cancels this result. */
         val snapshotBmp: Bitmap
@@ -289,13 +293,24 @@ class ObjectTracker(
 
                 // Scene negatives: embed every other detection visible at lock time.
                 // boundingBox is screen-space; remap to rotated-image space to crop.
+                // ALSO seed the SessionRoster (#108) with face+body of any other
+                // persons in frame so open-set rejection has data from frame 0 of
+                // search rather than waiting on VT-confirmed accumulation.
                 val sceneNegs = mutableListOf<FloatArray>()
+                val rosterObservations = mutableListOf<Pair<FloatArray?, FloatArray?>>()
                 for (det in snapshotDetections) {
                     if (det.id == trackingId) continue
                     val rotBox = mapToRotated(det.boundingBox.left, det.boundingBox.top,
                         det.boundingBox.right, det.boundingBox.bottom, snapshotDevRot)
                     val negEmb = appearanceEmbedder.embed(snapshotBmp, rotBox)
                     if (negEmb != null) sceneNegs.add(negEmb)
+                    if (det.label == "person" && isPerson) {
+                        val otherFace = faceEmbedder.embedFace(snapshotBmp, rotBox)
+                        val otherBody = personReId.embed(snapshotBmp, rotBox)
+                        if (otherFace != null || otherBody != null) {
+                            rosterObservations.add(otherFace to otherBody)
+                        }
+                    }
                 }
 
                 val result = LockResult(
@@ -308,6 +323,7 @@ class ObjectTracker(
                     reIdEmb = reIdEmb,
                     faceEmb = faceEmb,
                     sceneNegatives = sceneNegs,
+                    sceneRosterObservations = rosterObservations,
                     deviceRotation = snapshotDevRot,
                     snapshotBmp = snapshotBmp
                 )
@@ -335,6 +351,9 @@ class ObjectTracker(
             vtLockedBoxArea = result.boundingBox.width() * result.boundingBox.height()
 
             for (neg in result.sceneNegatives) reacquisition.addSceneNegative(neg)
+            for ((face, body) in result.sceneRosterObservations) {
+                reacquisition.observePerson(face, body)
+            }
 
             debugCapture.startSession(result.label, result.trackingId)
             val attrStr = result.personAttrs?.summary() ?: "n/a"
@@ -535,22 +554,22 @@ class ObjectTracker(
                             }
                         }
 
-                        // Collect scene negatives every 5 confirmed frames.
-                        // tracked has screen-space boxes but bitmap is rotated,
+                        // Collect scene negatives + roster observations every 5 confirmed
+                        // frames. tracked has screen-space boxes but bitmap is rotated,
                         // so convert back to rotated-image space before cropping.
-                        // Scene negatives + paired face+body memory (#83 phase 2).
-                        // Both run on this 5-confirmed-frame cadence. We tried
-                        // slowing scene-pair collection to every 15 frames in
-                        // response to the perf review (face+body inference is
-                        // ~16-20ms per non-lock person), but on real boy_indoor
-                        // footage that cut accumulation to zero pairs across the
-                        // full clip — short multi-person lock windows didn't see
-                        // the wife enough at %15 to learn her. The mechanism
-                        // needs the data more than the hot path needs the ms;
-                        // keeping %5 and noting async batching as a follow-up
-                        // optimization once we can measure real device fps cost.
+                        //
+                        // The roster (#108) accepts partial observations — face-only or
+                        // body-only — so we no longer drop a candidate when one modality
+                        // fails. Either signal alone is sufficient evidence that someone
+                        // other than the lock is in the scene.
+                        //
+                        // Cost: face+body inference is ~16-20ms per non-lock person.
+                        // Tried 15-frame cadence earlier; real footage with short
+                        // multi-person lock windows under-observed the distractor.
+                        // Async batching is a follow-up optimization once we can
+                        // measure real device fps cost.
                         if (vtConfirmedFrames % 5 == 0) {
-                            val collectScenePair = reacquisition.lockedIsPerson
+                            val collectRoster = reacquisition.lockedIsPerson
                             for (det in tracked) {
                                 if (det.id == reacquisition.lockedId) continue
                                 val rotBox = mapToRotated(det.boundingBox.left, det.boundingBox.top,
@@ -558,11 +577,11 @@ class ObjectTracker(
                                 val negEmb = appearanceEmbedder.embed(bitmap, rotBox)
                                 if (negEmb != null) reacquisition.addSceneNegative(negEmb)
 
-                                if (collectScenePair && det.label == "person") {
+                                if (collectRoster && det.label == "person") {
                                     val faceEmb = faceEmbedder.embedFace(bitmap, rotBox)
                                     val bodyEmb = personReId.embed(bitmap, rotBox)
-                                    if (faceEmb != null && bodyEmb != null) {
-                                        reacquisition.addScenePersonPair(faceEmb, bodyEmb)
+                                    if (faceEmb != null || bodyEmb != null) {
+                                        reacquisition.observePerson(faceEmb, bodyEmb)
                                     }
                                 }
                             }
