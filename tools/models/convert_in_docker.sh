@@ -1,10 +1,20 @@
 #!/bin/bash
 # Run inside the python:3.10 docker container with /data mapped to tools/models.
+# Usage: bash /data/convert_in_docker.sh [model_name]
+#   model_name defaults to osnet_ibn_x1_0_msmt17
+#   Converts /data/onnx/<model_name>.onnx → /data/tflite/<model_name>/
 set -e
 
+MODEL_NAME="${1:-osnet_ibn_x1_0_msmt17}"
+echo "=== converting $MODEL_NAME ==="
+
 echo "=== installing deps ==="
-pip install --quiet \
-  tensorflow tf_keras "onnx<1.17" onnx2tf onnx_graphsurgeon psutil onnxsim sng4onnx ai-edge-litert 2>&1 | tail -3
+# onnxsim 0.4.x+ requires cmake at install time on Python 3.10 — install it
+# and pin onnxsim to a version known to build cleanly. Explicit numpy<2 because
+# tensorflow + onnx2tf still expect the legacy numpy API.
+apt-get update -qq && apt-get install -y -qq cmake >/dev/null
+pip install --quiet "numpy<2" \
+  tensorflow tf_keras "onnx<1.17" onnx2tf onnx_graphsurgeon psutil "onnxsim<0.5" sng4onnx ai-edge-litert 2>&1 | tail -3
 
 CFPATH=/usr/local/lib/python3.10/site-packages/onnx2tf/utils/common_functions.py
 echo "=== patching onnx2tf at $CFPATH ==="
@@ -25,7 +35,7 @@ PYEOF
 
 cd /data
 echo "=== running onnx2tf ==="
-onnx2tf -i onnx/osnet_ibn_x1_0_msmt17.onnx -o tflite/osnet_ibn_x1_0_msmt17 -cotof -n 2>&1 | tail -50
+onnx2tf -i "onnx/${MODEL_NAME}.onnx" -o "tflite/${MODEL_NAME}" -cotof -n 2>&1 | tail -50
 
 echo "=== output ==="
-ls -la tflite/osnet_ibn_x1_0_msmt17/ | head -20
+ls -la "tflite/${MODEL_NAME}/" | head -20

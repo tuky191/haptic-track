@@ -24,10 +24,12 @@ CROPS = sorted((REPO / "tools" / "crops" / "man_desk").glob("*.png"))[:6]
 MODELS = {
     "osnet_x1_0_market (working baseline)":
         REPO / "app/src/main/assets/osnet_x1_0_market.tflite",
-    "osnet_ibn_x1_0_msmt17 fp16 (shipped in #113)":
-        REPO / "app/src/main/assets/osnet_ibn_x1_0_msmt17.tflite",
-    "osnet_ibn_x1_0_msmt17 fp32 (pre-quant)":
-        REPO / "tools/models/tflite/osnet_ibn_x1_0_msmt17/osnet_ibn_x1_0_msmt17_float32.tflite",
+    "osnet_x1_0_msmt17 fp16 (NEW — base x1_0 trained on MSMT17)":
+        REPO / "tools/models/tflite/osnet_x1_0_msmt17/osnet_x1_0_msmt17_float16.tflite",
+    "osnet_x1_0_msmt17 fp32 (pre-quant)":
+        REPO / "tools/models/tflite/osnet_x1_0_msmt17/osnet_x1_0_msmt17_float32.tflite",
+    "osnet_ibn_x1_0_msmt17 fp16 (broken on Adreno GPU — #117)":
+        REPO / "tools/models/tflite/osnet_ibn_x1_0_msmt17/osnet_ibn_x1_0_msmt17_float16.tflite",
 }
 
 

@@ -38,7 +38,7 @@ class PersonReIdEmbedder(
 
     companion object {
         private const val TAG = "PersonReId"
-        private const val MODEL_ASSET = "osnet_x1_0_market.tflite"
+        private const val MODEL_ASSET = "osnet_x1_0_msmt17.tflite"
         const val INPUT_HEIGHT = 256
         const val INPUT_WIDTH = 128
         private const val EMBEDDING_DIM = 512
