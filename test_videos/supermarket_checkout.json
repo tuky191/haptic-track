@@ -1,0 +1,8 @@
+{
+  "description": "Live device session 2026-04-29 10:16 (#116). Supermarket checkout area, locked on a person at a register. Recorded at 120fps (slow-motion mode), 362 frames = 3s real-time. Live session showed 3 reacqs across 155 engine-processed frames over ~12s real-clock — the source video covers only the first portion. Diagnostic test for the same single-person cascade-scoring failure mode as walking_outdoor.",
+  "lockFrame": 180,
+  "lockBox": [0.376563, 0.257913, 0.514063, 0.514654],
+  "lockLabel": "person",
+  "analysisWidth": 640,
+  "fps": 120
+}
