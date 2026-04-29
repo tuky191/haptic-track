@@ -1043,21 +1043,17 @@ class ReacquisitionEngine(
             }
         }
 
-        // Tiered override (Phase 3 #102): z-score preferred, raw cosine as fallback.
-        // Geometric gates (position/size) admit lower z (≥1.0) because position
-        // rejection is about camera movement, not identity. Label gate uses a
-        // stricter z (≥1.5) since cross-category confusion is high-risk.
-        // [overridePasses] picks the OSNet z for person-person and the MNV3 z
-        // otherwise, mirroring [effectiveAppearanceSim].
+        // Geometric override (Phase 3 #102): z-score preferred, raw cosine as
+        // fallback. Position/size hard filters can be bypassed when the
+        // embedding evidence is strong — this is about camera movement, not
+        // identity. [overridePasses] picks the OSNet z for person-person and
+        // the MNV3 z otherwise, mirroring [effectiveAppearanceSim]. The label
+        // override (was Z_LABEL_OVERRIDE_THRESHOLD) was removed: see GATE B
+        // below — the category gate is hard, no override.
         val geometricOverride = gateActive && overridePasses(
             candidate, appearanceScore,
             zThresh = Z_GEOMETRIC_OVERRIDE_THRESHOLD,
             rawThresh = GEOMETRIC_OVERRIDE_THRESHOLD,
-        )
-        val labelOverride = gateActive && overridePasses(
-            candidate, appearanceScore,
-            zThresh = Z_LABEL_OVERRIDE_THRESHOLD,
-            rawThresh = APPEARANCE_OVERRIDE_THRESHOLD,
         )
 
         // --- GATE A: Position hard filter (with time decay) ---
@@ -1099,16 +1095,24 @@ class ReacquisitionEngine(
             dualLog(Log.DEBUG, "  OVERRIDE size: ratio=${fmtF(sizeRatio)} > thresh=${fmtF(effectiveSizeThreshold)}, but sim=${fmtF(appearanceScore)}")
         }
 
-        // --- GATE B: Person/not-person category gate ---
-        // Binary gate: a locked person only accepts person candidates, and vice versa.
-        // Specific labels don't matter — embedding handles identity within each bucket.
-        // This eliminates label flicker problems (bowl/potted plant, deer/sheep/dog).
-        // (candidateIsPerson computed earlier; reused here.)
-        if (lockedIsPerson != candidateIsPerson && !labelOverride) {
-            return null  // REJECT: person/non-person mismatch
-        }
-        if (lockedIsPerson != candidateIsPerson && labelOverride) {
-            dualLog(Log.DEBUG, "  OVERRIDE category: candidate=${if (candidateIsPerson) "person" else "non-person"}, locked=${if (lockedIsPerson) "person" else "non-person"}, sim=${fmtF(appearanceScore)}")
+        // --- GATE B: Person/not-person category gate (HARD) ---
+        // Binary gate: a locked person only accepts person candidates, and
+        // vice versa. Specific labels don't matter — embedding handles
+        // identity within each bucket. This eliminates label flicker
+        // problems (bowl/potted plant, deer/sheep/dog).
+        //
+        // No embedding override here (#102 follow-up): a person-locked +
+        // dog/remote candidate produced wrong-person reacquires through the
+        // old override path (`overridePasses` was firing on z ≥ 1.5 because
+        // a totally-different category visual is "far from impostor mean"
+        // by definition — high z, but for the wrong reason). The category
+        // gate's purpose is to prevent person↔non-person identity confusion;
+        // letting any embedding signal bypass it defeats that purpose.
+        // Label *flicker* (bowl ↔ potted plant) is a within-category
+        // problem and is handled by the embedding gate above + the
+        // ranking step below — not by overriding the category gate.
+        if (lockedIsPerson != candidateIsPerson) {
+            return null  // REJECT: person/non-person mismatch — hard, no override.
         }
 
         // --- RANKING: score survivors for selection ---
