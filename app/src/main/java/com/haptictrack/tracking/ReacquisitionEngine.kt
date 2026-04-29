@@ -2,6 +2,7 @@ package com.haptictrack.tracking
 
 import android.graphics.RectF
 import android.util.Log
+import kotlin.math.exp
 
 /**
  * Pure logic for re-acquiring a lost tracking target.
@@ -37,10 +38,14 @@ class ReacquisitionEngine(
 
     companion object {
         private const val TAG = "Reacq"
-        /** Raw-cosine fallback used when z-score is unavailable (no live or frozen cohort).
-         *  In production the frozen offline pool (~1500 entries) is loaded via
-         *  [create], so this fallback is only ever hit by unit tests with direct
-         *  construction. See [Z_LABEL_OVERRIDE_THRESHOLD] for the calibrated path. */
+        /** Raw-cosine fallback used by [overridePasses] when z-score is unavailable
+         *  (no live or frozen cohort). In production the frozen offline pool
+         *  (~1500 entries) is loaded via [create], so this fallback is only ever
+         *  hit by unit tests with direct construction. The category gate is hard
+         *  (#102 follow-up); this constant only feeds the geometric and
+         *  tentative-confirmation override paths. See
+         *  [Z_GEOMETRIC_OVERRIDE_THRESHOLD] / [Z_TENTATIVE_BYPASS_THRESHOLD] for
+         *  the calibrated counterparts. */
         const val APPEARANCE_OVERRIDE_THRESHOLD = 0.7f
         /** Raw-cosine fallback for the position/size hard-filter bypass when z-score
          *  is unavailable. See [Z_GEOMETRIC_OVERRIDE_THRESHOLD] for the calibrated path. */
@@ -53,21 +58,30 @@ class ReacquisitionEngine(
         // device showed same-person reacquires score z ≥ 1.5 reliably while
         // wrong-person reacquires cluster in [-0.5, +1.0]. Thresholds picked
         // from that distribution:
-        /** Z-score above this bypasses the label gate (cross-category protection). */
-        const val Z_LABEL_OVERRIDE_THRESHOLD = 1.5f
-        /** Z-score above this bypasses position/size hard filters. Slightly lower
-         *  than the label-override threshold because position rejection is about
-         *  camera movement, not identity confusion — z ≥ 1 is enough to say
+        /** Z-score above this bypasses position/size hard filters. Position rejection
+         *  is about camera movement, not identity confusion — z ≥ 1 is enough to say
          *  "same object, just moved." */
         const val Z_GEOMETRIC_OVERRIDE_THRESHOLD = 1.0f
-        /** Z-score above this bypasses tentative-confirmation. Same band as the
-         *  label override — skipping multi-frame consistency requires confidence. */
+        /** Z-score above this bypasses tentative-confirmation. Skipping multi-frame
+         *  consistency requires same-person-tier confidence (z ≥ 1.5). */
         const val Z_TENTATIVE_BYPASS_THRESHOLD = 1.5f
         /** Floor on impostor σ when computing z-scores. A homogeneous cohort can
          *  collapse σ → 0 which inflates z arbitrarily (man_desk hit z=9.34 in
          *  Phase 2). Cap σ at this floor so the override decision can't be
          *  driven by a degenerate cohort. */
         const val Z_SIGMA_FLOOR = 0.05f
+
+        // --- Phase 4 (#102): scoring-level z-norm constants ---
+        /** Sigmoid midpoint when mapping a z-score into [0,1] for the cascade
+         *  scoring formula. Phase 2 calibration on real reacquires showed:
+         *  same-person z ≥ +1.5, wrong-person z ≤ +0.85. The clean separator
+         *  is z ≈ +1.0, so map z=1.0 → output 0.5 (the sigmoid midpoint). */
+        const val Z_SCORE_MIDPOINT = 1.0f
+        /** Sigmoid steepness. With scale=1, z=0 → 0.27, z=1 → 0.5, z=2 → 0.73,
+         *  z=3 → 0.88. That keeps the calibration band (-1..+3) inside the
+         *  steep middle of the sigmoid where the score actually moves with
+         *  the z-score. Higher scale = sharper boundary; lower = more lenient. */
+        const val Z_SCORE_SCALE = 1.0f
         /** Minimum embedding similarity to consider a candidate at all.
          *  If the primary embedder says the candidate is a different object (sim < this),
          *  no amount of re-ID, attributes, or color can rescue it. */
@@ -353,6 +367,31 @@ class ReacquisitionEngine(
     val mnv3LiveStats: ImpostorStats? get() { recomputeLiveStatsIfNeeded(); return _mnv3LiveStats }
     val osnetLiveStats: ImpostorStats? get() { recomputeLiveStatsIfNeeded(); return _osnetLiveStats }
     val faceLiveStats: ImpostorStats? get() { recomputeLiveStatsIfNeeded(); return _faceLiveStats }
+
+    /**
+     * Phase 4 (#102): map a z-score into [0,1] for the cascade scoring formula
+     * via a sigmoid centered at [Z_SCORE_MIDPOINT]. The cascade ranks candidates
+     * with a weighted sum of [0,1]-valued signals; raw cosine is in that range
+     * naturally but isn't calibrated against the impostor distribution. A
+     * z-score IS calibrated but unbounded — the sigmoid maps it into [0,1] so
+     * "above the impostor distribution" pushes the contribution up while
+     * "inside the impostor distribution" keeps it low.
+     *
+     * With midpoint=1, scale=1: z=-1 → 0.12, z=0 → 0.27, z=1 → 0.5, z=2 → 0.73,
+     * z=3 → 0.88. Calibration band (-1..+3) sits inside the steep region.
+     */
+    private fun znormToScore(z: Float): Float =
+        1f / (1f + exp(-(z - Z_SCORE_MIDPOINT) * Z_SCORE_SCALE))
+
+    /**
+     * Phase 4 (#102): scoring-level z-norm. Returns the calibrated score for
+     * [rawCosine] — z-norm-mapped via [znormToScore] when [zScore] is available
+     * (cohort ≥ [MIN_COHORT_FOR_ZNORM]), otherwise the raw cosine itself as a
+     * cold-start fallback. Both paths return a [0,1] value so the cascade's
+     * weighted sum is unaffected.
+     */
+    private fun calibratedFromZ(rawCosine: Float, zScore: Float?): Float =
+        if (zScore != null) znormToScore(zScore) else rawCosine
 
     /**
      * Pick the appropriate z-score for [candidate] mirroring [effectiveAppearanceSim]'s
@@ -1005,21 +1044,16 @@ class ReacquisitionEngine(
             }
         }
 
-        // Tiered override (Phase 3 #102): z-score preferred, raw cosine as fallback.
-        // Geometric gates (position/size) admit lower z (≥1.0) because position
-        // rejection is about camera movement, not identity. Label gate uses a
-        // stricter z (≥1.5) since cross-category confusion is high-risk.
-        // [overridePasses] picks the OSNet z for person-person and the MNV3 z
-        // otherwise, mirroring [effectiveAppearanceSim].
+        // Geometric override (Phase 3 #102): z-score preferred, raw cosine as
+        // fallback. Position/size hard filters can be bypassed when the
+        // embedding evidence is strong — this is about camera movement, not
+        // identity. [overridePasses] picks the OSNet z for person-person and
+        // the MNV3 z otherwise, mirroring [effectiveAppearanceSim]. There is
+        // no label override: GATE B below is hard (#102 follow-up).
         val geometricOverride = gateActive && overridePasses(
             candidate, appearanceScore,
             zThresh = Z_GEOMETRIC_OVERRIDE_THRESHOLD,
             rawThresh = GEOMETRIC_OVERRIDE_THRESHOLD,
-        )
-        val labelOverride = gateActive && overridePasses(
-            candidate, appearanceScore,
-            zThresh = Z_LABEL_OVERRIDE_THRESHOLD,
-            rawThresh = APPEARANCE_OVERRIDE_THRESHOLD,
         )
 
         // --- GATE A: Position hard filter (with time decay) ---
@@ -1061,16 +1095,24 @@ class ReacquisitionEngine(
             dualLog(Log.DEBUG, "  OVERRIDE size: ratio=${fmtF(sizeRatio)} > thresh=${fmtF(effectiveSizeThreshold)}, but sim=${fmtF(appearanceScore)}")
         }
 
-        // --- GATE B: Person/not-person category gate ---
-        // Binary gate: a locked person only accepts person candidates, and vice versa.
-        // Specific labels don't matter — embedding handles identity within each bucket.
-        // This eliminates label flicker problems (bowl/potted plant, deer/sheep/dog).
-        // (candidateIsPerson computed earlier; reused here.)
-        if (lockedIsPerson != candidateIsPerson && !labelOverride) {
-            return null  // REJECT: person/non-person mismatch
-        }
-        if (lockedIsPerson != candidateIsPerson && labelOverride) {
-            dualLog(Log.DEBUG, "  OVERRIDE category: candidate=${if (candidateIsPerson) "person" else "non-person"}, locked=${if (lockedIsPerson) "person" else "non-person"}, sim=${fmtF(appearanceScore)}")
+        // --- GATE B: Person/not-person category gate (HARD) ---
+        // Binary gate: a locked person only accepts person candidates, and
+        // vice versa. Specific labels don't matter — embedding handles
+        // identity within each bucket. This eliminates label flicker
+        // problems (bowl/potted plant, deer/sheep/dog).
+        //
+        // No embedding override here (#102 follow-up): a person-locked +
+        // dog/remote candidate produced wrong-person reacquires through the
+        // old override path (`overridePasses` was firing on z ≥ 1.5 because
+        // a totally-different category visual is "far from impostor mean"
+        // by definition — high z, but for the wrong reason). The category
+        // gate's purpose is to prevent person↔non-person identity confusion;
+        // letting any embedding signal bypass it defeats that purpose.
+        // Label *flicker* (bowl ↔ potted plant) is a within-category
+        // problem and is handled by the embedding gate above + the
+        // ranking step below — not by overriding the category gate.
+        if (lockedIsPerson != candidateIsPerson) {
+            return null  // REJECT: person/non-person mismatch — hard, no override.
         }
 
         // --- RANKING: score survivors for selection ---
@@ -1093,8 +1135,25 @@ class ReacquisitionEngine(
             cosineSimilarity(lockedFaceEmbedding!!, candidate.faceEmbedding!!).coerceIn(0f, 1f)
         } else 0f
 
-        // Re-ID score (hasReId / reIdScore) computed earlier for the OSNet gate;
-        // reused here as the dominant ranking signal for person candidates.
+        // Phase 4 (#102): calibrate the identity signals via z-norm when the
+        // impostor cohort is mature. Raw cosine is what the model produces;
+        // z-norm tells us where the candidate sits in the impostor distribution
+        // — same-person reacquires consistently land at z ≥ +1.5 in Phase 2
+        // calibration, wrong-person ≤ +0.85. Cascade-scoring previously summed
+        // raw cosine, which let an impostor at reId=0.65 contribute ~0.39 to a
+        // 0.45-threshold sum (almost a pass on its own). With z-norm-mapping,
+        // an impostor at z=0 contributes ~0.16 and a same-person at z=2
+        // contributes ~0.44 — same-person dominates structurally rather than
+        // through a happen-to-be-high raw cosine.
+        val reIdCalibrated = if (hasReId) {
+            calibratedFromZ(reIdScore, znOsnetSim(candidate.reIdEmbedding!!))
+        } else 0f
+        val mnv3Calibrated = if (hasAppearance) {
+            calibratedFromZ(mobileNetScore, znMnv3Sim(candidate.embedding!!))
+        } else 0f
+        val faceCalibrated = if (hasFace) {
+            calibratedFromZ(faceScore, znFaceSim(candidate.faceEmbedding!!))
+        } else 0f
 
         // No label bonus — person/not-person gate handles category, embedding handles identity
 
@@ -1110,14 +1169,19 @@ class ReacquisitionEngine(
             val unused = (1f - baseFaceW - baseReIdW - baseEmbW - basePosW - baseColorW - baseAttrW).coerceAtLeast(0f)
             val effFaceW = baseFaceW + unused
 
-            return (faceScore * effFaceW) +
-                   (reIdScore * baseReIdW) +
-                   (appearanceScore * baseEmbW) +
+            return (faceCalibrated * effFaceW) +
+                   (reIdCalibrated * baseReIdW) +
+                   (mnv3Calibrated * baseEmbW) +
                    (positionScore * basePosW) +
                    (colorScore * baseColorW) +
                    (attrScore * baseAttrW)
         } else if (hasReId) {
-            // Re-ID available but no face: re-ID is primary, generic embedding secondary
+            // Re-ID available but no face: re-ID is primary, generic embedding secondary.
+            // Bug fix bundled here (was double-counting OSNet): the secondary
+            // embedding term now uses MNV3 (mnv3Calibrated), not OSNet again
+            // via the old `appearanceScore` alias which equalled `reIdScore`
+            // when hasReId. When hasAppearance is false (no MNV3 vector for
+            // the candidate), baseEmbW is 0 anyway so the term drops out.
             val baseReIdW = 0.40f
             val baseEmbW = if (hasAppearance) 0.20f else 0f
             val basePosW = 0.10f * positionConfidence
@@ -1127,16 +1191,25 @@ class ReacquisitionEngine(
             val unused = (1f - baseReIdW - baseEmbW - basePosW - baseSizeW - baseColorW - baseAttrW).coerceAtLeast(0f)
             val effReIdW = baseReIdW + unused
 
-            return (reIdScore * effReIdW) +
-                   (appearanceScore * baseEmbW) +
+            return (reIdCalibrated * effReIdW) +
+                   (mnv3Calibrated * baseEmbW) +
                    (positionScore * basePosW) +
                    (sizeScore * baseSizeW) +
                    (colorScore * baseColorW) +
                    (attrScore * baseAttrW)
         } else if (hasAppearance) {
-            // Generic embedding only (non-person, or person without re-ID)
+            // Generic embedding only (non-person, or person without re-ID).
+            // Phase 4 (#102) z-norm intentionally NOT applied here: the
+            // Phase 2 calibration band (z=1.0 boundary, sigmoid centered
+            // there) was derived from person-vs-person reacquires. Non-person
+            // scenes populate _negativeExamples from cross-category
+            // detections (furniture, lamps next to a locked chair) so the
+            // z-distribution is uncalibrated and a sigmoid mapping
+            // over-suppresses real same-object reacquires. Stay on raw cosine
+            // here; the centroid average and the classifier/margin terms
+            // below already provide their own discrimination.
             val centroidScore = centroidSimilarity(candidate.embedding!!).coerceIn(0f, 1f)
-            val embScore = (appearanceScore + centroidScore) / 2f
+            val embScore = (mobileNetScore + centroidScore) / 2f
 
             // Discriminative scoring: classifier > prototype margin > raw cosine.
             // The classifier learns a decision boundary from positives+negatives.

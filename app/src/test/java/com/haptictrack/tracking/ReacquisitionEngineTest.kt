@@ -513,23 +513,26 @@ class ReacquisitionEngineTest {
         assertNull("Weak embedding should NOT bypass size hard threshold", score)
     }
 
-    // --- Label flicker: strong embedding overrides wrong label ---
+    // --- Person/non-person category gate is HARD ---
 
     @Test
-    fun `strong embedding overrides person-not-person gate`() {
-        // Lock on "cup" (non-person) — detector sees same object as "person"
+    fun `strong embedding does NOT override person-not-person gate`() {
+        // Lock on "cup" (non-person). A person candidate with very high
+        // embedding similarity must STILL be rejected — the category gate
+        // is hard, no embedding override (#102 follow-up). Category swap
+        // (person ↔ non-person) is identity confusion; only label flicker
+        // *within* a category should be admissible via embedding similarity,
+        // and that's handled by the embedding gate above the category gate.
         val lockedEmb = floatArrayOf(0.8f, 0.5f, 0.2f)
         engine.lock(42, RectF(0.3f, 0.3f, 0.7f, 0.7f), "cup", lockedEmb)
 
         engine.processFrame(emptyList())
 
-        // Same object with strong embedding but person label — should override gate
         val candidate = obj(id = 55, left = 0.32f, top = 0.32f, right = 0.68f, bottom = 0.68f, label = "person")
-            .copy(embedding = floatArrayOf(0.75f, 0.55f, 0.2f))  // sim ~0.98
+            .copy(embedding = floatArrayOf(0.75f, 0.55f, 0.2f))  // sim ~0.98 — high but cross-category
 
         val result = engine.processFrame(listOf(candidate))
-        assertNotNull("Strong embedding should override person/not-person gate", result)
-        assertEquals(55, result!!.id)
+        assertNull("Cross-category candidate must be rejected even with strong embedding", result)
     }
 
     @Test
