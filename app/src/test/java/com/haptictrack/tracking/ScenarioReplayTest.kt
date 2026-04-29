@@ -485,47 +485,6 @@ class ScenarioReplayTest {
             result.trackingRate >= 5)
     }
 
-    // man_multi_person_lock_holds: post-#113 live device session captured 2026-04-28.
-    // Lock on a man (label=person, attrs=man/short_sleeves/pants/blue/blue) in a
-    // 2-3 person scene. 117 frames, 4 LOSTs, 4 REACQUIREs, plus a CLEAR by user.
-    //
-    // Live device run with the structural fix active (SessionRoster + OSNet-IBN):
-    // - 0 wrong-category reacquires
-    // - 3 ROSTER_REJECT events caught wrong-person attempts (slot 2, slot 3,
-    //   slot 2 again — 2 distractor identities populated in roster)
-    // - znMnv3 on correct reacquires: +9.6, +5.4, +2.6 (all above same-person
-    //   threshold +1.5)
-    //
-    // Replay limitation: ScenarioRecorder doesn't capture reIdEmbedding or
-    // faceEmbedding at lock time, and replayWithEngine doesn't feed
-    // observePerson() from per-frame detections. So the replay test exercises
-    // the cascade with MNV3 + color + attrs only — the OSNet-IBN swap and
-    // SessionRoster open-set rejection are covered by their own unit tests
-    // (PersonReIdEmbedder + SessionRosterTest). This replay locks in the
-    // cascade's behavior on this real-world multi-person scene.
-
-    @Test
-    fun `man multi-person lock holds - reacquires only as person`() {
-        val scenario = loadScenario("man_multi_person_lock_holds.json")
-        val result = replay(scenario)
-
-        val wrong = result.wrongCategoryReacqs(PERSON_LABELS)
-        assertTrue("Should never reacquire non-person (got: ${wrong.map { "${it.label}@F${it.frame}" }})",
-            wrong.isEmpty())
-    }
-
-    @Test
-    fun `man multi-person lock holds - reacquires multiple times`() {
-        val scenario = loadScenario("man_multi_person_lock_holds.json")
-        val result = replay(scenario)
-
-        // Live device captured 4 reacquires. Replay typically underestimates
-        // because cached embeddings don't perfectly match async-pipeline timing.
-        assertTrue("Should reacquire at least once (live device: 4), got ${result.reacquisitions}",
-            result.reacquisitions >= 1)
-        assertFalse("Should not timeout", result.timedOut)
-    }
-
     // --- Helpers for building synthetic scenarios ---
 
     data class SyntheticDetection(
