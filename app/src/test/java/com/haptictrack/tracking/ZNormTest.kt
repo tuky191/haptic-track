@@ -332,6 +332,68 @@ class ZNormTest {
             statsAfter.n == statsBefore.n) // n stays same; mean might shift
     }
 
+    // ----------------------------------------------------------- Phase 4 scoring
+
+    /**
+     * Phase 4 (#102): the headline change is that [scoreCandidate]'s `hasReId`
+     * branch multiplies by `znormToScore(z)` instead of raw OSNet cosine. With
+     * an impostor cohort whose mean cosine to lock is 0.65, a candidate at the
+     * same raw cosine sits at z=0 — the impostor mean — so its calibrated
+     * contribution collapses to `znormToScore(0) ≈ 0.27`. Cold-start (cohort
+     * below [MIN_COHORT_FOR_ZNORM]) falls back to the raw 0.65. Same engine
+     * state, same candidate — different final scores. That delta is the
+     * structural fix this PR delivers.
+     */
+    @Test
+    fun `hasReId scoring uses calibrated z-score, not raw cosine, when cohort matures`() {
+        fun runEngine(numImpostors: Int): Float? {
+            val engine = ReacquisitionEngine()
+            val lockedReId = osnetUnit(0)
+            engine.lock(1, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
+                listOf(mnv3Unit(0)), null, null, cocoLabel = "person",
+                reIdEmbedding = lockedReId)
+            // Impostor bodies: each has OSNet cosine 0.65 against the lock.
+            // Distinct second axes (1, 2, 3...) keep them mutually orthogonal
+            // (cosine to each other = 0.65² ≈ 0.42 < BODY_MERGE_THRESHOLD=0.70)
+            // so they land in separate roster slots. Faces are arbitrary —
+            // hasFace is false at score-time so they don't affect the math.
+            repeat(numImpostors) { idx ->
+                engine.addScenePersonPair(
+                    face = faceUnit(idx + 1),
+                    body = osnetMix(0, idx + 1, 0.65f),
+                )
+            }
+            // Candidate at the same box (no position/size penalty) and the
+            // same raw OSNet cosine 0.65 to the lock — sits exactly at the
+            // impostor mean → z=0 when stats are available, raw=0.65 otherwise.
+            // Axis 9 keeps the candidate body distinct from any impostor (so
+            // ROSTER_REJECT max-bodySim stays at 0.65² = 0.4225, well below
+            // ROSTER_REJECT_FLOOR=0.55).
+            val candidate = obj(
+                id = 7, label = "person",
+                embedding = mnv3Unit(0),
+                reIdEmbedding = osnetMix(0, 9, 0.65f),
+                faceEmbedding = null,
+                box = RectF(0.4f, 0.4f, 0.6f, 0.6f),
+            )
+            return engine.scoreCandidate(candidate, engine.lastKnownBox!!)
+        }
+
+        val coldScore = runEngine(numImpostors = 4) // cohort below MIN_COHORT_FOR_ZNORM
+        val calibratedScore = runEngine(numImpostors = 5) // z-norm active
+        assertNotNull("Cold-start path admits the candidate", coldScore)
+        assertNotNull("Calibrated path admits the candidate", calibratedScore)
+        // Raw path: reIdCalibrated = 0.65. Z-norm path: znormToScore(0) ≈ 0.269.
+        // The reId term carries weight ≥ 0.40 in the hasReId branch, so the
+        // gap on the final score is at least (0.65 - 0.27) * 0.40 ≈ 0.15.
+        // 0.10 leaves headroom for the unused-weight absorption math.
+        assertTrue(
+            "Calibrated score must be materially lower than raw " +
+                "(raw=$coldScore, calibrated=$calibratedScore)",
+            calibratedScore!! + 0.10f < coldScore!!
+        )
+    }
+
     @Test
     fun `clear resets live stats`() {
         val engine = ReacquisitionEngine()

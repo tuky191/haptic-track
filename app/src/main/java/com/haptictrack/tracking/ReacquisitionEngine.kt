@@ -38,10 +38,14 @@ class ReacquisitionEngine(
 
     companion object {
         private const val TAG = "Reacq"
-        /** Raw-cosine fallback used when z-score is unavailable (no live or frozen cohort).
-         *  In production the frozen offline pool (~1500 entries) is loaded via
-         *  [create], so this fallback is only ever hit by unit tests with direct
-         *  construction. See [Z_LABEL_OVERRIDE_THRESHOLD] for the calibrated path. */
+        /** Raw-cosine fallback used by [overridePasses] when z-score is unavailable
+         *  (no live or frozen cohort). In production the frozen offline pool
+         *  (~1500 entries) is loaded via [create], so this fallback is only ever
+         *  hit by unit tests with direct construction. The category gate is hard
+         *  (#102 follow-up); this constant only feeds the geometric and
+         *  tentative-confirmation override paths. See
+         *  [Z_GEOMETRIC_OVERRIDE_THRESHOLD] / [Z_TENTATIVE_BYPASS_THRESHOLD] for
+         *  the calibrated counterparts. */
         const val APPEARANCE_OVERRIDE_THRESHOLD = 0.7f
         /** Raw-cosine fallback for the position/size hard-filter bypass when z-score
          *  is unavailable. See [Z_GEOMETRIC_OVERRIDE_THRESHOLD] for the calibrated path. */
@@ -54,15 +58,12 @@ class ReacquisitionEngine(
         // device showed same-person reacquires score z ≥ 1.5 reliably while
         // wrong-person reacquires cluster in [-0.5, +1.0]. Thresholds picked
         // from that distribution:
-        /** Z-score above this bypasses the label gate (cross-category protection). */
-        const val Z_LABEL_OVERRIDE_THRESHOLD = 1.5f
-        /** Z-score above this bypasses position/size hard filters. Slightly lower
-         *  than the label-override threshold because position rejection is about
-         *  camera movement, not identity confusion — z ≥ 1 is enough to say
+        /** Z-score above this bypasses position/size hard filters. Position rejection
+         *  is about camera movement, not identity confusion — z ≥ 1 is enough to say
          *  "same object, just moved." */
         const val Z_GEOMETRIC_OVERRIDE_THRESHOLD = 1.0f
-        /** Z-score above this bypasses tentative-confirmation. Same band as the
-         *  label override — skipping multi-frame consistency requires confidence. */
+        /** Z-score above this bypasses tentative-confirmation. Skipping multi-frame
+         *  consistency requires same-person-tier confidence (z ≥ 1.5). */
         const val Z_TENTATIVE_BYPASS_THRESHOLD = 1.5f
         /** Floor on impostor σ when computing z-scores. A homogeneous cohort can
          *  collapse σ → 0 which inflates z arbitrarily (man_desk hit z=9.34 in
@@ -1047,9 +1048,8 @@ class ReacquisitionEngine(
         // fallback. Position/size hard filters can be bypassed when the
         // embedding evidence is strong — this is about camera movement, not
         // identity. [overridePasses] picks the OSNet z for person-person and
-        // the MNV3 z otherwise, mirroring [effectiveAppearanceSim]. The label
-        // override (was Z_LABEL_OVERRIDE_THRESHOLD) was removed: see GATE B
-        // below — the category gate is hard, no override.
+        // the MNV3 z otherwise, mirroring [effectiveAppearanceSim]. There is
+        // no label override: GATE B below is hard (#102 follow-up).
         val geometricOverride = gateActive && overridePasses(
             candidate, appearanceScore,
             zThresh = Z_GEOMETRIC_OVERRIDE_THRESHOLD,
