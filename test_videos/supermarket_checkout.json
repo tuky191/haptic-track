@@ -1,8 +1,8 @@
 {
-  "description": "Live device session 2026-04-29 10:16 (#116). Supermarket checkout area, locked on a person at a register. Recorded at 120fps (slow-motion mode), 362 frames = 3s real-time. Live session showed 3 reacqs across 155 engine-processed frames over ~12s real-clock — the source video covers only the first portion. Diagnostic test for the same single-person cascade-scoring failure mode as walking_outdoor.",
-  "lockFrame": 180,
-  "lockBox": [0.376563, 0.257913, 0.514063, 0.514654],
+  "description": "Live device session 2026-04-29 10:15 (#116). Supermarket checkout area, locked on a person at a register. Source recorded at 240fps (slow-motion mode); re-encoded at 30fps for playback timing. ~20.7s, 622 frames. Live session 101547_person showed 6 reacqs in 71 engine-processed frames — diagnostic test for the same single-person cascade-scoring failure mode as walking_outdoor.",
+  "lockFrame": 45,
+  "lockBox": [0.442188, 0.207503, 0.582813, 0.445487],
   "lockLabel": "person",
   "analysisWidth": 640,
-  "fps": 120
+  "fps": 30
 }
