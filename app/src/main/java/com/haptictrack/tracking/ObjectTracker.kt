@@ -769,32 +769,21 @@ class ObjectTracker(
                 } catch (e: java.util.concurrent.TimeoutException) { emptyMap() }
                 catch (e: Exception) { emptyMap() }
 
-                // Merge cached embeddings into current detections. Prefer ID match
-                // (FTFTracker preserves IDs across frames for the same physical object —
-                // trust it), fall back to greedy IoU match for re-IDed detections.
-                // Prefer-by-ID avoids throwing away async work when fast motion pushes
-                // box-to-box IoU below 0.3 between consecutive frames.
-                val cachedEntries = cachedResults.entries.toList()
-                val usedCacheKeys = mutableSetOf<Int>()
+                // Merge cached embeddings into current detections by ID match only.
+                // FTFTracker preserves IDs across frames for the same physical object,
+                // so an ID hit is identity-safe. The previous IoU>0.3 fallback was
+                // removed (#116): when the lock person left frame, their cache entry
+                // could be inherited by any new detection at IoU>0.3 with the stale
+                // cachedBox — including a totally different person who walked into
+                // the area. The candidate's reIdEmbedding became a literal copy of
+                // the lock's, producing reId=1.000 in scoring and pulling the
+                // cascade above its 0.45 admit threshold even when MNV3 sim was
+                // 0.15 (clear impostor). The sync-fallback path below (line ~836)
+                // still recovers async work for the single best same-category
+                // candidate that has no embedding, by computing fresh OSNet on its
+                // actual bbox rather than inheriting from spatial neighbors.
                 val merged = withLabels.map { obj ->
-                    val byId = if (obj.id >= 0) cachedResults[obj.id] else null
-                    val cached: EmbeddingResult? = if (byId != null) {
-                        usedCacheKeys.add(obj.id)
-                        byId
-                    } else {
-                        val bestMatch = cachedEntries
-                            .filter { (id, result) -> result.cachedBox != null && id !in usedCacheKeys }
-                            .maxByOrNull { (_, result) ->
-                                computeIou(obj.boundingBox, result.cachedBox!!)
-                            }
-                        val iou = bestMatch?.let { (_, result) ->
-                            computeIou(obj.boundingBox, result.cachedBox!!)
-                        } ?: 0f
-                        if (bestMatch != null && iou > 0.3f) {
-                            usedCacheKeys.add(bestMatch.key)
-                            bestMatch.value
-                        } else null
-                    }
+                    val cached = if (obj.id >= 0) cachedResults[obj.id] else null
                     if (cached != null) {
                         obj.copy(
                             embedding = cached.embedding,
