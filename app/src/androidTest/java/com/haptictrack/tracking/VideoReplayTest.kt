@@ -460,6 +460,30 @@ class VideoReplayTest {
             "totalFrames=${result.totalFrames}")
     }
 
+    // man_multi_person: real-world device session (2026-04-28 17:27). Man on
+    // couch in a 2-3 person scene (man + boy at table, occasional cat). 24s.
+    // Captured the on-device validation that closed #102 / #108 — the live
+    // session showed 4 LOST + 4 REACQUIRE all on the locked man, 0 wrong-person,
+    // 3 ROSTER_REJECT events filtering wrong-slot candidates. This is the
+    // VideoReplayTest counterpart to the JVM ScenarioReplayTest fixture
+    // `man_multi_person_lock_holds.json` (#114 Phase A); together they
+    // protect the SessionRoster + OSNet-IBN behavior from regression.
+
+    @Test
+    fun man_multi_person_no_wrong_person_lock() {
+        val result = replayVideo("man_multi_person")
+
+        assertFalse("Should not timeout", result.timedOut)
+
+        val wrong = result.wrongCategoryReacqs(PERSON_LABELS)
+        assertTrue("Should never reacquire non-person (got: ${wrong.map { "${it.label}@F${it.frame}" }})",
+            wrong.isEmpty())
+
+        Log.i(TAG, "man_multi_person: trackingRate=${result.trackingRate}% " +
+            "reacqs=${result.reacquisitions} losses=${result.losses} " +
+            "totalFrames=${result.totalFrames}")
+    }
+
     // crowd_street: synthetic stock-video test (Pexels 12699538, CC0). 12.2s
     // portrait shot of a busy market street — six detected persons in the lock
     // frame alone. Lock target picked via EfficientDet-Lite2 detection (the

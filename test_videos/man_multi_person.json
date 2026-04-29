@@ -1,0 +1,8 @@
+{
+  "description": "Live device session 2026-04-28 17:27. Lock on man on couch in 2-3 person scene (man + boy at table, occasional cat). 24s, 725 frames at 30fps. SessionRoster + OSNet-IBN target: 0 wrong-person reacquires; live session showed 4 LOST + 4 REACQUIRE all on the locked man, with 3 ROSTER_REJECT events catching wrong-person attempts.",
+  "lockFrame": 51,
+  "lockBox": [0.471875, 0.173505, 0.676563, 0.438453],
+  "lockLabel": "person",
+  "analysisWidth": 640,
+  "fps": 30
+}
