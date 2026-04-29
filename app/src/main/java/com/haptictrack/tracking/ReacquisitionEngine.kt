@@ -1195,12 +1195,17 @@ class ReacquisitionEngine(
                    (attrScore * baseAttrW)
         } else if (hasAppearance) {
             // Generic embedding only (non-person, or person without re-ID).
-            // Phase 4: use the z-norm-mapped MNV3 score (mnv3Calibrated) when
-            // the cohort is mature, raw cosine otherwise. Centroid stays raw
-            // — it's a measure of how close the candidate is to the gallery
-            // centroid, not against the impostor distribution.
+            // Phase 4 (#102) z-norm intentionally NOT applied here: the
+            // Phase 2 calibration band (z=1.0 boundary, sigmoid centered
+            // there) was derived from person-vs-person reacquires. Non-person
+            // scenes populate _negativeExamples from cross-category
+            // detections (furniture, lamps next to a locked chair) so the
+            // z-distribution is uncalibrated and a sigmoid mapping
+            // over-suppresses real same-object reacquires. Stay on raw cosine
+            // here; the centroid average and the classifier/margin terms
+            // below already provide their own discrimination.
             val centroidScore = centroidSimilarity(candidate.embedding!!).coerceIn(0f, 1f)
-            val embScore = (mnv3Calibrated + centroidScore) / 2f
+            val embScore = (mobileNetScore + centroidScore) / 2f
 
             // Discriminative scoring: classifier > prototype margin > raw cosine.
             // The classifier learns a decision boundary from positives+negatives.
