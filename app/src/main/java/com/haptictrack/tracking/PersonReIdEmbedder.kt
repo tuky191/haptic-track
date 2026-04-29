@@ -98,6 +98,14 @@ class PersonReIdEmbedder(
         // poison the cascade. Real crops are required because the IBN failure
         // mode is input-distribution-dependent — synthetic stripes pass but
         // real photos collapse to a near-constant vector.
+        //
+        // Cost: 3× OSNet inferences (~3×30ms = ~100ms on Adreno GPU at first
+        // use, when the delegate is also warming up). Runs synchronously on
+        // the same loading path as model construction, so the 100ms is folded
+        // into the existing model-load spinner rather than visible to the
+        // user. If startup latency tightens further, this can move to a
+        // background coroutine with `disabled` defaulting to true and being
+        // cleared once the test passes.
         val maxCos = selfTestMaxPairwiseCosine(context)
         if (maxCos == null) {
             disabled = true
@@ -195,6 +203,14 @@ class PersonReIdEmbedder(
         }
     }
 
+    /**
+     * Synchronized to share the lock with [embed] — the shared `inputBuffer`
+     * and `outputArray` would race if this were ever called concurrently with
+     * production embed calls. In current usage [selfTestMaxPairwiseCosine]
+     * only fires from `init` (before any tracking thread starts), but the
+     * lock costs nothing at init and prevents future-misuse hazards.
+     */
+    @Synchronized
     private fun embedRawBitmap(bitmap: Bitmap): FloatArray? {
         return try {
             fillInputBuffer(bitmap)
