@@ -111,12 +111,12 @@ def _resize_letterbox(img: Image.Image, target_w: int, target_h: int,
 
 
 def build_osnet_embedder(model_path: str | None = None):
-    """OSNet via TFLite. Defaults to the bundled osnet_x1_0_market shipping
+    """OSNet via TFLite. Defaults to the bundled osnet_x1_0_msmt17 shipping
     model. Pass `model_path` to benchmark a different TFLite variant."""
     import tensorflow as tf
     if model_path is None:
         model_path = str(
-            Path(__file__).parent.parent / "app/src/main/assets/osnet_x1_0_market.tflite"
+            Path(__file__).parent.parent / "app/src/main/assets/osnet_x1_0_msmt17.tflite"
         )
     interpreter = tf.lite.Interpreter(model_path=model_path)
     interpreter.allocate_tensors()
@@ -211,12 +211,17 @@ def _osnet_pair(label: str, arch: str, ckpt_name: str) -> dict:
 _TFLITE_DIR = Path(__file__).parent / "models/tflite/osnet_ibn_x1_0_msmt17"
 
 
+_X1_TFLITE_DIR = Path(__file__).parent / "models/tflite/osnet_x1_0_msmt17"
+
+
 MODELS: dict[str, Callable[[], Callable[[Path], np.ndarray]]] = {
     "mobilenet_v3_large":   build_mobilenet_embedder,
-    "osnet_x1_0_market":    build_osnet_embedder,
+    "osnet_x1_0_msmt17_tflite":  build_osnet_embedder,
     **_osnet_pair("osnet_x1_0_msmt17",     "osnet_x1_0",     "osnet_x1_0_msmt17_combineall.pth"),
     **_osnet_pair("osnet_ain_x1_0_msmt17", "osnet_ain_x1_0", "osnet_ain_x1_0_msmt17.pth"),
     **_osnet_pair("osnet_ibn_x1_0_msmt17", "osnet_ibn_x1_0", "osnet_ibn_x1_0_msmt17_combineall.pth"),
+    "osnet_x1_0_msmt17_tflite_fp32":
+        lambda: build_osnet_embedder(str(_X1_TFLITE_DIR / "osnet_x1_0_msmt17_float32.tflite")),
     "osnet_ibn_x1_0_msmt17_tflite_fp32":
         lambda: build_osnet_embedder(str(_TFLITE_DIR / "osnet_ibn_x1_0_msmt17_float32.tflite")),
     "osnet_ibn_x1_0_msmt17_tflite_fp16":

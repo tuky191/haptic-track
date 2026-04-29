@@ -1,0 +1,8 @@
+{
+  "description": "Live device session 2026-04-29 09:41 (#116). Outdoor walking with phone, locked on a person in dark/blue clothing on a sidewalk. ~57s, 1700 frames at 29.97fps. Live session showed 12 reacqs across 433 engine-processed frames with multiple impostor admissions (sim<0.5 + znMnv3 negative + reId=1.000). Multiple REACQUIRE_raw frames saved upside-down — this replay tests whether the engine processes upside-down bitmaps (production bug) or just saves them that way (cosmetic).",
+  "lockFrame": 45,
+  "lockBox": [0.310937, 0.044549, 0.540625, 0.672919],
+  "lockLabel": "person",
+  "analysisWidth": 640,
+  "fps": 30
+}

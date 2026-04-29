@@ -484,6 +484,42 @@ class VideoReplayTest {
             "totalFrames=${result.totalFrames}")
     }
 
+    // walking_outdoor + supermarket_checkout: real-world device sessions
+    // captured 2026-04-29 to investigate the failure mode in #116. The live
+    // sessions showed:
+    //   - walking_outdoor: 12 reacqs in ~14s of engine time, multiple reacquires
+    //     with sim<0.5 + reId=1.000 + znMnv3 negative
+    //   - supermarket_checkout: 3 reacqs in ~155 frames at the same store
+    //     where the person is mostly stationary at a checkout
+    // Multiple *_REACQUIRE_raw.png frames in the live sessions were saved
+    // upside-down. These tests replay the source recordings end-to-end so we
+    // can compare what the engine ACTUALLY processes (the test's saved frames
+    // come from `bitmap.copy()` inside `DebugFrameCapture` — exactly what the
+    // engine sees) against what the live session captured. If the test's
+    // REACQUIRE frames are upright but the live ones were upside-down, the
+    // bug is in `DeviceOrientationListener` mid-recording. If the test's are
+    // also upside-down, it's a deeper image-pipeline issue.
+    //
+    // No hard assertions — diagnostic only.
+
+    @Test
+    fun walking_outdoor_diagnostic() {
+        val result = replayVideo("walking_outdoor")
+        Log.i(TAG, "[#116] walking_outdoor: trackingRate=${result.trackingRate}% " +
+            "reacqs=${result.reacquisitions} losses=${result.losses} " +
+            "totalFrames=${result.totalFrames} timedOut=${result.timedOut}")
+        Log.i(TAG, "[#116] walking_outdoor events: ${result.events}")
+    }
+
+    @Test
+    fun supermarket_checkout_diagnostic() {
+        val result = replayVideo("supermarket_checkout")
+        Log.i(TAG, "[#116] supermarket_checkout: trackingRate=${result.trackingRate}% " +
+            "reacqs=${result.reacquisitions} losses=${result.losses} " +
+            "totalFrames=${result.totalFrames} timedOut=${result.timedOut}")
+        Log.i(TAG, "[#116] supermarket_checkout events: ${result.events}")
+    }
+
     // crowd_street: synthetic stock-video test (Pexels 12699538, CC0). 12.2s
     // portrait shot of a busy market street — six detected persons in the lock
     // frame alone. Lock target picked via EfficientDet-Lite2 detection (the
