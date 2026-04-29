@@ -485,6 +485,50 @@ class ScenarioReplayTest {
             result.trackingRate >= 5)
     }
 
+    // man_multi_person_lock_holds: live device session captured 2026-04-28 17:27
+    // with the post-#113 structural fix active (SessionRoster + OSNet-IBN).
+    // Lock on a man (label=person, attrs=man/short_sleeves/pants/blue/blue) in
+    // a 2-3 person indoor scene. 117 frames, 4 LOST + 4 REACQUIRE events plus
+    // a CLEAR by user.
+    //
+    // Live device signals (NOT all reproducible in this replay — see below):
+    // - 0 wrong-category reacquires
+    // - 3 ROSTER_REJECT events caught wrong-person attempts (slot 2, slot 3,
+    //   slot 2 again — 2 distinct distractor identities populated in roster)
+    // - znMnv3 on correct reacquires: +9.6, +5.4, +2.6 (all ≥ same-person +1.5)
+    //
+    // Replay limitations (#114 Phase B):
+    // - ScenarioRecorder doesn't capture reIdEmbedding or faceEmbedding at
+    //   lock time — replay exercises the cascade with MNV3 + color + attrs.
+    // - replayWithEngine doesn't feed observePerson() from per-frame detections
+    //   so SessionRoster open-set rejection isn't fired here.
+    //
+    // Both axes are covered by their own dedicated unit tests
+    // (SessionRosterTest, ZNormTest). What this scenario locks in is the
+    // CASCADE-SCORING behavior on real-world multi-person data.
+
+    @Test
+    fun `man multi-person lock holds - reacquires only as person`() {
+        val scenario = loadScenario("man_multi_person_lock_holds.json")
+        val result = replay(scenario)
+
+        val wrong = result.wrongCategoryReacqs(PERSON_LABELS)
+        assertTrue("Should never reacquire non-person (got: ${wrong.map { "${it.label}@F${it.frame}" }})",
+            wrong.isEmpty())
+    }
+
+    @Test
+    fun `man multi-person lock holds - reacquires multiple times`() {
+        val scenario = loadScenario("man_multi_person_lock_holds.json")
+        val result = replay(scenario)
+
+        // Live device captured 4 reacquires. Replay typically underestimates
+        // because cached embeddings don't perfectly match async-pipeline timing.
+        assertTrue("Should reacquire at least once (live device: 4), got ${result.reacquisitions}",
+            result.reacquisitions >= 1)
+        assertFalse("Should not timeout", result.timedOut)
+    }
+
     // --- Helpers for building synthetic scenarios ---
 
     data class SyntheticDetection(
