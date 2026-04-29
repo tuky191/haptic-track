@@ -2,6 +2,7 @@ package com.haptictrack.tracking
 
 import android.graphics.RectF
 import android.util.Log
+import kotlin.math.exp
 
 /**
  * Pure logic for re-acquiring a lost tracking target.
@@ -68,6 +69,18 @@ class ReacquisitionEngine(
          *  Phase 2). Cap σ at this floor so the override decision can't be
          *  driven by a degenerate cohort. */
         const val Z_SIGMA_FLOOR = 0.05f
+
+        // --- Phase 4 (#102): scoring-level z-norm constants ---
+        /** Sigmoid midpoint when mapping a z-score into [0,1] for the cascade
+         *  scoring formula. Phase 2 calibration on real reacquires showed:
+         *  same-person z ≥ +1.5, wrong-person z ≤ +0.85. The clean separator
+         *  is z ≈ +1.0, so map z=1.0 → output 0.5 (the sigmoid midpoint). */
+        const val Z_SCORE_MIDPOINT = 1.0f
+        /** Sigmoid steepness. With scale=1, z=0 → 0.27, z=1 → 0.5, z=2 → 0.73,
+         *  z=3 → 0.88. That keeps the calibration band (-1..+3) inside the
+         *  steep middle of the sigmoid where the score actually moves with
+         *  the z-score. Higher scale = sharper boundary; lower = more lenient. */
+        const val Z_SCORE_SCALE = 1.0f
         /** Minimum embedding similarity to consider a candidate at all.
          *  If the primary embedder says the candidate is a different object (sim < this),
          *  no amount of re-ID, attributes, or color can rescue it. */
@@ -353,6 +366,31 @@ class ReacquisitionEngine(
     val mnv3LiveStats: ImpostorStats? get() { recomputeLiveStatsIfNeeded(); return _mnv3LiveStats }
     val osnetLiveStats: ImpostorStats? get() { recomputeLiveStatsIfNeeded(); return _osnetLiveStats }
     val faceLiveStats: ImpostorStats? get() { recomputeLiveStatsIfNeeded(); return _faceLiveStats }
+
+    /**
+     * Phase 4 (#102): map a z-score into [0,1] for the cascade scoring formula
+     * via a sigmoid centered at [Z_SCORE_MIDPOINT]. The cascade ranks candidates
+     * with a weighted sum of [0,1]-valued signals; raw cosine is in that range
+     * naturally but isn't calibrated against the impostor distribution. A
+     * z-score IS calibrated but unbounded — the sigmoid maps it into [0,1] so
+     * "above the impostor distribution" pushes the contribution up while
+     * "inside the impostor distribution" keeps it low.
+     *
+     * With midpoint=1, scale=1: z=-1 → 0.12, z=0 → 0.27, z=1 → 0.5, z=2 → 0.73,
+     * z=3 → 0.88. Calibration band (-1..+3) sits inside the steep region.
+     */
+    private fun znormToScore(z: Float): Float =
+        1f / (1f + exp(-(z - Z_SCORE_MIDPOINT) * Z_SCORE_SCALE))
+
+    /**
+     * Phase 4 (#102): scoring-level z-norm. Returns the calibrated score for
+     * [rawCosine] — z-norm-mapped via [znormToScore] when [zScore] is available
+     * (cohort ≥ [MIN_COHORT_FOR_ZNORM]), otherwise the raw cosine itself as a
+     * cold-start fallback. Both paths return a [0,1] value so the cascade's
+     * weighted sum is unaffected.
+     */
+    private fun calibratedFromZ(rawCosine: Float, zScore: Float?): Float =
+        if (zScore != null) znormToScore(zScore) else rawCosine
 
     /**
      * Pick the appropriate z-score for [candidate] mirroring [effectiveAppearanceSim]'s
@@ -1093,8 +1131,25 @@ class ReacquisitionEngine(
             cosineSimilarity(lockedFaceEmbedding!!, candidate.faceEmbedding!!).coerceIn(0f, 1f)
         } else 0f
 
-        // Re-ID score (hasReId / reIdScore) computed earlier for the OSNet gate;
-        // reused here as the dominant ranking signal for person candidates.
+        // Phase 4 (#102): calibrate the identity signals via z-norm when the
+        // impostor cohort is mature. Raw cosine is what the model produces;
+        // z-norm tells us where the candidate sits in the impostor distribution
+        // — same-person reacquires consistently land at z ≥ +1.5 in Phase 2
+        // calibration, wrong-person ≤ +0.85. Cascade-scoring previously summed
+        // raw cosine, which let an impostor at reId=0.65 contribute ~0.39 to a
+        // 0.45-threshold sum (almost a pass on its own). With z-norm-mapping,
+        // an impostor at z=0 contributes ~0.16 and a same-person at z=2
+        // contributes ~0.44 — same-person dominates structurally rather than
+        // through a happen-to-be-high raw cosine.
+        val reIdCalibrated = if (hasReId) {
+            calibratedFromZ(reIdScore, znOsnetSim(candidate.reIdEmbedding!!))
+        } else 0f
+        val mnv3Calibrated = if (hasAppearance) {
+            calibratedFromZ(mobileNetScore, znMnv3Sim(candidate.embedding!!))
+        } else 0f
+        val faceCalibrated = if (hasFace) {
+            calibratedFromZ(faceScore, znFaceSim(candidate.faceEmbedding!!))
+        } else 0f
 
         // No label bonus — person/not-person gate handles category, embedding handles identity
 
@@ -1110,14 +1165,19 @@ class ReacquisitionEngine(
             val unused = (1f - baseFaceW - baseReIdW - baseEmbW - basePosW - baseColorW - baseAttrW).coerceAtLeast(0f)
             val effFaceW = baseFaceW + unused
 
-            return (faceScore * effFaceW) +
-                   (reIdScore * baseReIdW) +
-                   (appearanceScore * baseEmbW) +
+            return (faceCalibrated * effFaceW) +
+                   (reIdCalibrated * baseReIdW) +
+                   (mnv3Calibrated * baseEmbW) +
                    (positionScore * basePosW) +
                    (colorScore * baseColorW) +
                    (attrScore * baseAttrW)
         } else if (hasReId) {
-            // Re-ID available but no face: re-ID is primary, generic embedding secondary
+            // Re-ID available but no face: re-ID is primary, generic embedding secondary.
+            // Bug fix bundled here (was double-counting OSNet): the secondary
+            // embedding term now uses MNV3 (mnv3Calibrated), not OSNet again
+            // via the old `appearanceScore` alias which equalled `reIdScore`
+            // when hasReId. When hasAppearance is false (no MNV3 vector for
+            // the candidate), baseEmbW is 0 anyway so the term drops out.
             val baseReIdW = 0.40f
             val baseEmbW = if (hasAppearance) 0.20f else 0f
             val basePosW = 0.10f * positionConfidence
@@ -1127,16 +1187,20 @@ class ReacquisitionEngine(
             val unused = (1f - baseReIdW - baseEmbW - basePosW - baseSizeW - baseColorW - baseAttrW).coerceAtLeast(0f)
             val effReIdW = baseReIdW + unused
 
-            return (reIdScore * effReIdW) +
-                   (appearanceScore * baseEmbW) +
+            return (reIdCalibrated * effReIdW) +
+                   (mnv3Calibrated * baseEmbW) +
                    (positionScore * basePosW) +
                    (sizeScore * baseSizeW) +
                    (colorScore * baseColorW) +
                    (attrScore * baseAttrW)
         } else if (hasAppearance) {
-            // Generic embedding only (non-person, or person without re-ID)
+            // Generic embedding only (non-person, or person without re-ID).
+            // Phase 4: use the z-norm-mapped MNV3 score (mnv3Calibrated) when
+            // the cohort is mature, raw cosine otherwise. Centroid stays raw
+            // — it's a measure of how close the candidate is to the gallery
+            // centroid, not against the impostor distribution.
             val centroidScore = centroidSimilarity(candidate.embedding!!).coerceIn(0f, 1f)
-            val embScore = (appearanceScore + centroidScore) / 2f
+            val embScore = (mnv3Calibrated + centroidScore) / 2f
 
             // Discriminative scoring: classifier > prototype margin > raw cosine.
             // The classifier learns a decision boundary from positives+negatives.
