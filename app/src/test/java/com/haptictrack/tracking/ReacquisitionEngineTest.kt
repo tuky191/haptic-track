@@ -961,60 +961,6 @@ class ReacquisitionEngineTest {
         assertEquals(0f, corr, 0.001f)
     }
 
-    // --- Person attribute scoring ---
-
-    @Test
-    fun `matching person attributes boost score over mismatching`() {
-        val emb = floatArrayOf(1f, 0f, 0f, 0f)
-        val refAttrs = PersonAttributes(
-            isMale = true, hasBag = false, hasBackpack = true, hasHat = true,
-            hasLongSleeves = false, hasLongPants = true, hasLongHair = false, hasCoatJacket = false,
-            rawProbabilities = floatArrayOf(0.9f, 0.1f, 0.9f, 0.9f, 0.1f, 0.9f, 0.1f, 0.1f)
-        )
-        engine.lock(1, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
-            listOf(emb), null, refAttrs)
-        repeat(2) { engine.processFrame(emptyList()) }
-
-        val matchAttrs = PersonAttributes(
-            isMale = true, hasBag = false, hasBackpack = true, hasHat = true,
-            hasLongSleeves = false, hasLongPants = true, hasLongHair = false, hasCoatJacket = false,
-            rawProbabilities = floatArrayOf(0.9f, 0.1f, 0.9f, 0.9f, 0.1f, 0.9f, 0.1f, 0.1f)
-        )
-        val mismatchAttrs = PersonAttributes(
-            isMale = false, hasBag = true, hasBackpack = false, hasHat = false,
-            hasLongSleeves = true, hasLongPants = false, hasLongHair = true, hasCoatJacket = true,
-            rawProbabilities = floatArrayOf(0.1f, 0.9f, 0.1f, 0.1f, 0.9f, 0.1f, 0.9f, 0.9f)
-        )
-
-        val matchCandidate = obj(id = 10, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
-            label = "person", embedding = emb, personAttributes = matchAttrs)
-        val mismatchCandidate = obj(id = 11, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
-            label = "person", embedding = emb, personAttributes = mismatchAttrs)
-
-        val matchScore = engine.scoreCandidate(matchCandidate, engine.lastKnownBox!!)
-        val mismatchScore = engine.scoreCandidate(mismatchCandidate, engine.lastKnownBox!!)
-
-        assertNotNull(matchScore)
-        assertNotNull(mismatchScore)
-        assertTrue("Matching attrs ($matchScore) should beat mismatching ($mismatchScore)",
-            matchScore!! > mismatchScore!!)
-    }
-
-    @Test
-    fun `no person attributes does not crash and redistributes weight`() {
-        val emb = floatArrayOf(1f, 0f, 0f, 0f)
-        engine.lock(1, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
-            listOf(emb), null, null)
-        repeat(2) { engine.processFrame(emptyList()) }
-
-        val candidate = obj(id = 10, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
-            label = "person", embedding = emb, personAttributes = null)
-
-        val score = engine.scoreCandidate(candidate, engine.lastKnownBox!!)
-        assertNotNull(score)
-        assertTrue("Score without attrs should be reasonable: $score", score!! > 0.4f)
-    }
-
     // --- Person/not-person gate with COCO label ---
 
     @Test
@@ -1022,7 +968,7 @@ class ReacquisitionEngineTest {
         val emb = floatArrayOf(0.5f, 0.5f, 0.5f, 0.5f)
         // Enriched to "flowerpot", COCO parent is "potted plant" — both non-person
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "flowerpot",
-            listOf(emb), null, null, cocoLabel = "potted plant")
+            listOf(emb), null, cocoLabel = "potted plant")
         engine.processFrame(emptyList())
 
         val cocoCandidate = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
@@ -1047,7 +993,7 @@ class ReacquisitionEngineTest {
     fun `person candidate rejected when locked on non-person with weak embedding`() {
         val emb = floatArrayOf(0.5f, 0.5f, 0.5f, 0.5f)
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "chair",
-            listOf(emb), null, null, cocoLabel = null)
+            listOf(emb), null, cocoLabel = null)
         engine.processFrame(emptyList())
 
         val nonPerson = obj(id = 55, left = 0.42f, top = 0.42f, right = 0.62f, bottom = 0.62f,
@@ -1192,7 +1138,7 @@ class ReacquisitionEngineTest {
     fun `person-not-person gate passes non-person candidate when locked on non-person`() {
         val emb = floatArrayOf(0.5f, 0.5f, 0.5f)
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "flowerpot",
-            listOf(emb), null, null, cocoLabel = "potted plant")
+            listOf(emb), null, cocoLabel = "potted plant")
         engine.processFrame(emptyList())
 
         // Non-person candidate passes gate regardless of specific label
@@ -1213,7 +1159,7 @@ class ReacquisitionEngineTest {
         val faceEmb = floatArrayOf(0.9f, 0.3f, 0.1f)
         val reIdEmb = floatArrayOf(0.5f, 0.5f, 0.5f, 0.5f)
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
-            listOf(emb), null, null, cocoLabel = "person",
+            listOf(emb), null, cocoLabel = "person",
             reIdEmbedding = reIdEmb, faceEmbedding = faceEmb)
         engine.processFrame(emptyList())
 
@@ -1239,7 +1185,7 @@ class ReacquisitionEngineTest {
         val emb = floatArrayOf(0.5f, 0.5f)
         val reIdEmb = floatArrayOf(0.9f, 0.3f, 0.1f, 0.2f)
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
-            listOf(emb), null, null, cocoLabel = "person",
+            listOf(emb), null, cocoLabel = "person",
             reIdEmbedding = reIdEmb)
         engine.processFrame(emptyList())
 
@@ -1266,7 +1212,7 @@ class ReacquisitionEngineTest {
         val reIdEmb = floatArrayOf(0.5f, 0.5f, 0.5f, 0.5f)
         val faceEmb = floatArrayOf(0.9f, 0.3f, 0.1f)
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
-            listOf(emb), null, null, cocoLabel = "person",
+            listOf(emb), null, cocoLabel = "person",
             reIdEmbedding = reIdEmb, faceEmbedding = faceEmb)
         engine.processFrame(emptyList())
 
@@ -1299,7 +1245,7 @@ class ReacquisitionEngineTest {
         val lockFace = floatArrayOf(0.9f, 0.3f, 0.1f)
         val lockReId = floatArrayOf(0.9f, 0.3f, 0.1f, 0.2f)
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
-            listOf(emb), null, null, cocoLabel = "person",
+            listOf(emb), null, cocoLabel = "person",
             reIdEmbedding = lockReId, faceEmbedding = lockFace)
         engine.processFrame(emptyList())
 
@@ -1329,7 +1275,7 @@ class ReacquisitionEngineTest {
         val lockFace = floatArrayOf(1.0f, 0.0f, 0.0f)
         val lockReId = floatArrayOf(0.9f, 0.3f, 0.1f, 0.2f)
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
-            listOf(emb), null, null, cocoLabel = "person",
+            listOf(emb), null, cocoLabel = "person",
             reIdEmbedding = lockReId, faceEmbedding = lockFace)
         engine.processFrame(emptyList())
 
@@ -1354,7 +1300,7 @@ class ReacquisitionEngineTest {
         val lockFace = floatArrayOf(0.9f, 0.3f, 0.1f)
         val lockReId = floatArrayOf(0.9f, 0.3f, 0.1f, 0.2f)
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
-            listOf(emb), null, null, cocoLabel = "person",
+            listOf(emb), null, cocoLabel = "person",
             reIdEmbedding = lockReId, faceEmbedding = lockFace)
         engine.processFrame(emptyList())
 
@@ -1382,7 +1328,7 @@ class ReacquisitionEngineTest {
         val lockFace = floatArrayOf(0.9f, 0.3f, 0.1f)
         val lockReId = floatArrayOf(0.9f, 0.3f, 0.1f, 0.2f)
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
-            listOf(emb), null, null, cocoLabel = "person",
+            listOf(emb), null, cocoLabel = "person",
             reIdEmbedding = lockReId, faceEmbedding = lockFace)
         engine.processFrame(emptyList())
 
@@ -1411,7 +1357,7 @@ class ReacquisitionEngineTest {
         // hand-tractable cosine math).
         val lockReId = floatArrayOf(0.9f, 0.3f, 0.1f, 0.2f)
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
-            listOf(emb), null, null, cocoLabel = "person",
+            listOf(emb), null, cocoLabel = "person",
             reIdEmbedding = lockReId, faceEmbedding = lockFace)
 
         // Try to add a pair whose body is essentially the lock — duplicate
@@ -1436,7 +1382,7 @@ class ReacquisitionEngineTest {
         val lockFace = floatArrayOf(0.9f, 0.3f, 0.1f)
         val lockReId = floatArrayOf(0.9f, 0.3f, 0.1f, 0.2f)
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
-            listOf(emb), null, null, cocoLabel = "person",
+            listOf(emb), null, cocoLabel = "person",
             reIdEmbedding = lockReId, faceEmbedding = lockFace)
 
         // Face nearly matches lock face — must be filtered.
@@ -1458,7 +1404,7 @@ class ReacquisitionEngineTest {
         fun unit(axis: Int): FloatArray = FloatArray(n).also { it[axis] = 1f }
 
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
-            listOf(floatArrayOf(1f, 0f)), null, null, cocoLabel = "person",
+            listOf(floatArrayOf(1f, 0f)), null, cocoLabel = "person",
             reIdEmbedding = unit(0), faceEmbedding = unit(0))
 
         // Add (MAX_SLOTS + 4) distinct identities — should cap at MAX_SLOTS - 1
@@ -1842,7 +1788,6 @@ class ReacquisitionEngineTest {
         confidence: Float = 0.8f,
         embedding: FloatArray? = null,
         colorHistogram: FloatArray? = null,
-        personAttributes: PersonAttributes? = null,
         reIdEmbedding: FloatArray? = null,
         faceEmbedding: FloatArray? = null
     ) = TrackedObject(
@@ -1852,7 +1797,6 @@ class ReacquisitionEngineTest {
         confidence = confidence,
         embedding = embedding,
         colorHistogram = colorHistogram,
-        personAttributes = personAttributes,
         reIdEmbedding = reIdEmbedding,
         faceEmbedding = faceEmbedding
     )
