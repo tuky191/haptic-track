@@ -31,7 +31,6 @@ class ObjectTracker(
 
     private val detector: ObjectDetector
     private val appearanceEmbedder: AppearanceEmbedder
-    private val personClassifier: PersonAttributeClassifier
     private val faceEmbedder: FaceEmbedder
     private val personReId: PersonReIdEmbedder
     private val scenarioRecorder = ScenarioRecorder()
@@ -248,9 +247,6 @@ class ObjectTracker(
         onLoadingStatus?.invoke("Loading embedder (GPU)...")
         appearanceEmbedder = AppearanceEmbedder(context)
 
-        onLoadingStatus?.invoke("Loading person classifier (GPU)...")
-        personClassifier = PersonAttributeClassifier(context)
-
         onLoadingStatus?.invoke("Loading detector (GPU)...")
         val baseOptions = BaseOptions.builder()
             .setModelAssetPath("efficientdet-lite2-fp16.tflite")
@@ -266,7 +262,7 @@ class ObjectTracker(
         detector = ObjectDetector.createFromOptions(context, options)
 
         onLoadingStatus?.invoke("Loading face models (GPU)...")
-        faceEmbedder = FaceEmbedder(context, personClassifier.faceDetector)
+        faceEmbedder = FaceEmbedder(context)
         personReId = PersonReIdEmbedder(context)
 
         cropDebugCapture = CropDebugCapture(appearanceEmbedder, personReId, faceEmbedder, auditExecutor)
@@ -1342,7 +1338,6 @@ class ObjectTracker(
         detector.close()
         faceEmbedder.close()
         personReId.close()
-        personClassifier.shutdown()
         appearanceEmbedder.shutdown()
         visualTracker.stop()
         synchronized(lastFrameLock) {
