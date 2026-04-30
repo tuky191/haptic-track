@@ -14,11 +14,11 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 /**
- * Face identity embedder using MobileFaceNet (192-dim).
+ * Face identity embedder using EdgeFace-XS (512-dim, IJCB 2023).
  *
  * Detects faces with BlazeFace inside a [CanonicalCrop] of the person, crops
  * the face from canonical pixel space, letterboxes the face to 112×112,
- * and computes a 192-dim L2-normalized embedding.
+ * and computes a 512-dim L2-normalized embedding.
  *
  * Canonical input flow (#100):
  *  - Person canonical: square [PERSON_CANONICAL_SIZE]² letterbox of the person bbox.
@@ -28,7 +28,7 @@ import java.nio.ByteOrder
  *    canonical. No 5-point similarity transform yet — that's #93. The
  *    keypoints are surfaced via [debugFaceCrop] so #93 has them ready.
  *
- * Preprocessing: (pixel - 127.5) / 128.0 → range [-1, +1] (InsightFace convention).
+ * Preprocessing: (pixel - 127.5) / 127.5 → range [-1, +1].
  */
 class FaceEmbedder(
     context: Context,
@@ -38,10 +38,10 @@ class FaceEmbedder(
 
     companion object {
         private const val TAG = "FaceEmbed"
-        private const val MODEL_ASSET = "mobilefacenet.tflite"
+        private const val MODEL_ASSET = "edgeface_xs_gamma_06.tflite"
         private const val FACE_MODEL_ASSET = "blaze_face_short_range.tflite"
         const val INPUT_SIZE = 112
-        private const val EMBEDDING_DIM = 192
+        const val EMBEDDING_DIM = 512
         private const val FACE_MIN_CONFIDENCE = 0.5f
 
         /**
@@ -60,15 +60,14 @@ class FaceEmbedder(
     private val faceDetector: FaceDetector
     private val ownsFaceDetector: Boolean
 
-    // Pre-allocated buffers — this MobileFaceNet variant has fixed batch=2
-    private val inputBuffer: ByteBuffer = ByteBuffer.allocateDirect(4 * 2 * INPUT_SIZE * INPUT_SIZE * 3).apply {
+    private val inputBuffer: ByteBuffer = ByteBuffer.allocateDirect(4 * INPUT_SIZE * INPUT_SIZE * 3).apply {
         order(ByteOrder.nativeOrder())
     }
-    private val outputArray = Array(2) { FloatArray(EMBEDDING_DIM) }
+    private val outputArray = Array(1) { FloatArray(EMBEDDING_DIM) }
 
     init {
         val model = loadTfliteModel(context, MODEL_ASSET)
-        gpu = createGpuInterpreter(model, modelName = "MobileFaceNet", cpuThreads = 2)
+        gpu = createGpuInterpreter(model, modelName = "EdgeFace-XS", cpuThreads = 2)
 
         if (sharedFaceDetector != null) {
             faceDetector = sharedFaceDetector
@@ -82,7 +81,7 @@ class FaceEmbedder(
             ownsFaceDetector = true
         }
 
-        Log.i(TAG, "Loaded MobileFaceNet (${EMBEDDING_DIM}-dim)${if (ownsFaceDetector) " + BlazeFace" else " (shared BlazeFace)"}")
+        Log.i(TAG, "Loaded EdgeFace-XS (${EMBEDDING_DIM}-dim)${if (ownsFaceDetector) " + BlazeFace" else " (shared BlazeFace)"}")
     }
 
     /**
@@ -106,7 +105,7 @@ class FaceEmbedder(
     /**
      * Compute face embedding from a prepared person [CanonicalCrop]. Runs
      * BlazeFace on the canonical, picks the largest face, builds a face
-     * sub-canonical, runs MobileFaceNet. Caller owns [personCanonical] and
+     * sub-canonical, runs EdgeFace-XS. Caller owns [personCanonical] and
      * is responsible for recycling.
      */
     @Synchronized
@@ -130,7 +129,7 @@ class FaceEmbedder(
                 personCrop, faceNormBox,
                 targetWidth = INPUT_SIZE, targetHeight = INPUT_SIZE,
                 paddingFraction = 0f,    // BlazeFace bbox already includes some context
-                minSourcePixels = 16,    // faces can be small; let MobileFaceNet decide
+                minSourcePixels = 16,    // faces can be small; let EdgeFace-XS decide
             ) ?: return null
 
             try {
@@ -158,7 +157,7 @@ class FaceEmbedder(
 
     /**
      * Audit/debug only — runs BlazeFace on a person canonical and returns
-     * the 112×112 face canonical fed to MobileFaceNet plus the face bbox
+     * the 112×112 face canonical fed to EdgeFace-XS plus the face bbox
      * and keypoints in person-canonical pixel coordinates. The current
      * pipeline ignores the keypoints, so visualizing them is the whole
      * point — we can see what alignment we're throwing away (#93 will use them).
@@ -171,7 +170,7 @@ class FaceEmbedder(
         val faceBoxOnPerson: RectF?,
         /** BlazeFace keypoints in personCrop pixel space (typically 6: 2 eyes, nose, mouth, 2 ears). */
         val keypoints: List<PointF>,
-        /** The 112×112 face canonical fed to MobileFaceNet, or null if no face. Caller recycles. */
+        /** The 112×112 face canonical fed to EdgeFace-XS, or null if no face. Caller recycles. */
         val faceCrop: Bitmap?
     )
 
@@ -221,19 +220,16 @@ class FaceEmbedder(
         return RectF(l, t, r, b)
     }
 
-    /** InsightFace preprocessing: (pixel - 127.5) / 128.0 → [-1, +1]. Fills both batch slots. */
+    /** EdgeFace preprocessing: (pixel / 255 - 0.5) / 0.5 = (pixel - 127.5) / 127.5 → [-1, +1]. */
     private fun fillInputBuffer(bitmap: Bitmap) {
         inputBuffer.rewind()
         val pixels = IntArray(INPUT_SIZE * INPUT_SIZE)
         bitmap.getPixels(pixels, 0, INPUT_SIZE, 0, 0, INPUT_SIZE, INPUT_SIZE)
-        // Batch slot 0: actual face
         for (pixel in pixels) {
-            inputBuffer.putFloat((Color.red(pixel) - 127.5f) / 128f)
-            inputBuffer.putFloat((Color.green(pixel) - 127.5f) / 128f)
-            inputBuffer.putFloat((Color.blue(pixel) - 127.5f) / 128f)
+            inputBuffer.putFloat((Color.red(pixel) - 127.5f) / 127.5f)
+            inputBuffer.putFloat((Color.green(pixel) - 127.5f) / 127.5f)
+            inputBuffer.putFloat((Color.blue(pixel) - 127.5f) / 127.5f)
         }
-        // Batch slot 1: zeros (unused, required by fixed batch=2 model)
-        repeat(INPUT_SIZE * INPUT_SIZE * 3) { inputBuffer.putFloat(0f) }
         inputBuffer.rewind()
     }
 

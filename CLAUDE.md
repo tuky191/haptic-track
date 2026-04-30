@@ -71,7 +71,7 @@ CameraViewModel
 │   ├── MediaPipe Detector     (EfficientDet-Lite2: object detection, 80 COCO classes, every frame)
 │   ├── FrameToFrameTracker    (IoU-based ID assignment for detections)
 │   ├── AppearanceEmbedder     (MobileNetV3: generic visual identity fingerprint)
-│   ├── FaceEmbedder           (MobileFaceNet: face identity for person path)
+│   ├── FaceEmbedder           (EdgeFace-XS: face identity for person path)
 │   ├── PersonReIdEmbedder     (OSNet x1.0 MSMT17: body re-ID for person path)
 │   ├── PersonAttributeClassifier (BlazeFace + age-gender: person attributes)
 │   ├── SessionRoster          (per-session non-lock person memory → ROSTER_REJECT margin gate)
@@ -300,8 +300,8 @@ Setup: `cd tools && python3.13 -m venv .venv && .venv/bin/pip install -r require
 | BlazeFace | `blaze_face_short_range.tflite` | 0.2MB | FP32 | GPU (MediaPipe) | Face detection within person crops |
 | age-gender-retail-0013 | `age_gender_retail_0013.tflite` | 4.1MB | FP32 | GPU (fallback CPU) | Face-based gender + age |
 | OSNet x1.0 MSMT17 | `osnet_x1_0_msmt17.tflite` | 4.2MB | FP32 | GPU (fallback CPU) | Person re-ID embedding (512-dim) — MSMT17 weights, swapped from Market in #113 |
-| MobileFaceNet | `mobilefacenet.tflite` | 5.0MB | FP32 | GPU (fallback CPU) | Face embedding (192-dim) |
-| **Total** | | **~42MB** | | |
+| EdgeFace-XS | `edgeface_xs_gamma_06.tflite` | 3.8MB | FP16 | GPU (fallback CPU) | Face embedding (512-dim, IJCB 2023) — replaced MobileFaceNet in #127 |
+| **Total** | | **~41MB** | | |
 
 ## Tunable Parameters
 

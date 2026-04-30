@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Same-vs-different person face cosine benchmark.
 
-Compares MobileFaceNet (current) vs EdgeFace-XS (candidate, IJCB 2023 winner)
+Compares EdgeFace-XS TFLite (shipped) vs EdgeFace-XS PyTorch (reference)
 on track-tagged person crops. Uses MediaPipe FaceDetection (BlazeFace, same as
 on-device) to localize the face inside each person crop, applies a 5-keypoint
 similarity transform alignment, and feeds both models 112×112 aligned faces.
@@ -122,36 +122,31 @@ def align_face(img_bgr: np.ndarray, kp: np.ndarray, size: int = 112):
 # --------------------------------------------------------------------- models
 
 
-def build_mobilefacenet():
-    """The bundled MobileFaceNet TFLite has a fixed batch=2 input. The on-device
-    code fills slot 0 with the face and slot 1 with zeros (FaceEmbedder.kt
-    fillInputBuffer). We mirror that here and read output[0]."""
+def build_edgeface_xs_tflite():
+    """The bundled EdgeFace-XS TFLite (batch=1, 512-dim). Mirrors on-device
+    FaceEmbedder.kt preprocessing: (pixel - 127.5) / 127.5."""
     import tensorflow as tf
     model_path = str(
-        Path(__file__).parent.parent / "app/src/main/assets/mobilefacenet.tflite"
+        Path(__file__).parent.parent / "app/src/main/assets/edgeface_xs_gamma_06.tflite"
     )
     interp = tf.lite.Interpreter(model_path=model_path)
     interp.allocate_tensors()
     inp = interp.get_input_details()[0]
     out = interp.get_output_details()[0]
-    in_shape = inp["shape"]   # [2, H, W, 3]
-    h, w = int(in_shape[1]), int(in_shape[2])
 
     def embed(face_bgr_112: np.ndarray) -> np.ndarray:
         rgb = cv2.cvtColor(face_bgr_112, cv2.COLOR_BGR2RGB)
-        if (rgb.shape[0], rgb.shape[1]) != (h, w):
-            rgb = cv2.resize(rgb, (w, h), interpolation=cv2.INTER_LINEAR)
-        face_arr = (rgb.astype(np.float32) - 127.5) / 128.0
-        # Stack [face, zeros] to match the fixed batch=2 model.
-        zeros = np.zeros_like(face_arr)
-        batch = np.stack([face_arr, zeros], axis=0)
-        interp.set_tensor(inp["index"], batch.astype(np.float32))
+        if rgb.shape[0] != 112 or rgb.shape[1] != 112:
+            rgb = cv2.resize(rgb, (112, 112), interpolation=cv2.INTER_LINEAR)
+        face_arr = (rgb.astype(np.float32) - 127.5) / 127.5
+        batch = face_arr[None, ...]
+        interp.set_tensor(inp["index"], batch)
         interp.invoke()
         feat = interp.get_tensor(out["index"])[0].reshape(-1)
         n = np.linalg.norm(feat)
         return (feat / n).astype(np.float32) if n > 0 else feat.astype(np.float32)
 
-    return embed, (h, w)
+    return embed, (112, 112)
 
 
 def build_edgeface_xs():
@@ -178,8 +173,8 @@ def build_edgeface_xs():
 
 
 MODELS = {
-    "mobilefacenet":   build_mobilefacenet,
-    "edgeface_xs":     build_edgeface_xs,
+    "edgeface_xs_tflite": build_edgeface_xs_tflite,
+    "edgeface_xs_torch":  build_edgeface_xs,
 }
 
 

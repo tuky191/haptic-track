@@ -28,7 +28,7 @@ import java.util.concurrent.RejectedExecutionException
  *   - MNV3 input (224×224 stretched, what MediaPipe ImageEmbedder receives)
  *   - OSNet input (256×128 stretched, what PersonReIdEmbedder feeds in)
  *   - person crop with BlazeFace box + 6 keypoints overlaid
- *   - face crop fed to MobileFaceNet (112×112 stretched)
+ *   - face crop fed to EdgeFace-XS (112×112 stretched)
  *
  * Files land under the active DebugFrameCapture session at:
  *   session_TIMESTAMP/crops/NNN_event.jpg

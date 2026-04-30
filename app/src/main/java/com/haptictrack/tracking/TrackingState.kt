@@ -24,7 +24,7 @@ data class TrackedObject(
     val colorHistogram: FloatArray? = null,
     /** OSNet person re-ID embedding (512-dim). Only computed for person candidates. */
     val reIdEmbedding: FloatArray? = null,
-    /** MobileFaceNet face embedding (192-dim). Only computed when face is visible. */
+    /** EdgeFace-XS face embedding (512-dim). Only computed when face is visible. */
     val faceEmbedding: FloatArray? = null
 ) {
     // INVARIANT: embedding, colorHistogram, reIdEmbedding, and faceEmbedding are

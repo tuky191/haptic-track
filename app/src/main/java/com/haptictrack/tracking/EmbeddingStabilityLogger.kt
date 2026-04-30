@@ -12,7 +12,7 @@ import java.io.File
  * (aspect distortion, segmenter flicker, lighting, micro-movement) — bounds
  * how cleanly any model can separate same-object from different-object.
  *
- * For each embedder (MNV3, OSNet, MobileFaceNet), we keep a ring of the most
+ * For each embedder (MNV3, OSNet, EdgeFace-XS), we keep a ring of the most
  * recent audit-sample embeddings of the locked object. Each new sample is
  * compared against samples 1, 5, and 30 entries back. At session end we dump
  * percentile stats and the raw history to JSON for offline plotting.

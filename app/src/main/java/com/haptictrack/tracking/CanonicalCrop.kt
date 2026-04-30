@@ -43,7 +43,7 @@ data class CanonicalCrop(
  * Builds canonical crops — one source-of-truth crop preparation feeding all
  * embedders. Replaces the previous per-embedder `cropNormalized` +
  * stretch-resize idiom that produced differently-distorted views of the
- * same subject across MNV3/OSNet/MobileFaceNet/segmenter (#91 audit).
+ * same subject across MNV3/OSNet/EdgeFace-XS/segmenter (#91 audit).
  *
  * Defaults agreed in #100:
  *  - Neutral-gray letterbox fill (0x7F7F7F) — channel-balanced, less mean

@@ -55,8 +55,8 @@ class ZNormTest {
     private fun osnetUnit(axis: Int): FloatArray = unit(axis, n = 512)
     private fun osnetMix(a: Int, b: Int, alpha: Float): FloatArray = mix(a, b, alpha, n = 512)
 
-    /** A 192-dim face-shaped embedding. */
-    private fun faceUnit(axis: Int): FloatArray = unit(axis, n = 192)
+    /** A 512-dim face-shaped embedding. */
+    private fun faceUnit(axis: Int): FloatArray = unit(axis, n = 512)
 
     private fun obj(id: Int, label: String = "person",
                     embedding: FloatArray? = null,

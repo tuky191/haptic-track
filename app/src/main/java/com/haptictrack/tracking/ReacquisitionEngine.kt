@@ -91,7 +91,7 @@ class ReacquisitionEngine(
          *  different-person sim in [0.2, 0.4]. 0.45 sits in the gap. Tuned from a live
          *  capture where same-person reId hit 0.836 while MobileNetV3 sim was 0.558. */
         const val PERSON_REID_FLOOR = 0.45f
-        /** Face embedding (MobileFaceNet, ArcFace-style) cosine floor for person identity.
+        /** Face embedding (EdgeFace-XS) cosine floor for person identity.
          *  Same-person face sim typically >= 0.5; different-person face sim typically
          *  <= 0.3. 0.4 sits in the gap. When both lock and candidate have face
          *  embeddings, face VETOES OSNet — even a high reId sim gets rejected if face
@@ -115,7 +115,7 @@ class ReacquisitionEngine(
          *  before the face veto fires. Without a margin a candidate whose face
          *  scores 0.42 against the scene memory and 0.41 against the lock would
          *  be rejected — that's measurement noise, not a real identity signal.
-         *  0.05f is roughly the stddev of MobileFaceNet scores on near-duplicate
+         *  0.05f is roughly the stddev of face embedding scores on near-duplicate
          *  crops in our captures. */
         const val SCENE_FACE_VETO_MARGIN = 0.05f
         /** Margin by which a candidate's body must match a stored scene-other
@@ -568,7 +568,7 @@ class ReacquisitionEngine(
     /** OSNet person re-ID embedding from lock time. */
     var lockedReIdEmbedding: FloatArray? = null
         private set
-    /** MobileFaceNet face embedding — added progressively when face first appears. */
+    /** EdgeFace-XS face embedding — added progressively when face first appears. */
     var lockedFaceEmbedding: FloatArray? = null
         private set
     var lastKnownBox: RectF? = null
@@ -1043,7 +1043,7 @@ class ReacquisitionEngine(
 
         // --- GATE: Face identity (#83) ---
         // When both lock and candidate have face embeddings (person-person only),
-        // face vetoes OSNet. MobileFaceNet has cleaner same/different-person
+        // face vetoes OSNet. EdgeFace-XS has cleaner same/different-person
         // separation than OSNet's whole-body re-ID — a face sim < FACE_FLOOR is
         // strong evidence of a different person, regardless of body match.
         // Doesn't affect candidates without face data (rejection path goes
