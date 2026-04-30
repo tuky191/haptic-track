@@ -392,6 +392,86 @@ class ReacquisitionEngineTest {
         assertTrue(engine.embeddingGallery.isEmpty())
     }
 
+    // --- Adaptive accumulator floor (#110) ---
+    //
+    // The accumulator gate in ObjectTracker uses [ReacquisitionEngine.lockSelfFloor]
+    // to decide whether a VT-confirmed crop is identity-preserving enough to admit
+    // into the gallery. The floor is derived from the gallery's own self-recall
+    // distribution at lock time. These tests verify the floor lands in the right
+    // band for tight (person/OSNet-like) vs loose (chair/MNV3-like) galleries.
+
+    @Test
+    fun `lockSelfFloor defaults when gallery has fewer than 2 entries`() {
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "cup",
+            embeddings = listOf(floatArrayOf(1f, 0f, 0f, 0f)))
+        assertEquals("Single-embedding gallery falls back to default floor",
+            ReacquisitionEngine.LOCK_SELF_FLOOR_DEFAULT, engine.lockSelfFloor, 1e-6f)
+    }
+
+    @Test
+    fun `lockSelfFloor clamps high for tight self-recall galleries`() {
+        // 5 augmentations near-aligned (mutual cosine ≥ 0.6) — the OSNet/
+        // person regime. MIN pairwise sim is the closest pair to orthogonal,
+        // here ~0.6+. Scaled to ~0.42+, clamped to LOCK_SELF_FLOOR_MAX (0.40).
+        val tight = listOf(
+            floatArrayOf(1.00f, 0.00f, 0.00f, 0.00f),
+            floatArrayOf(0.80f, 0.60f, 0.00f, 0.00f),
+            floatArrayOf(0.80f, 0.00f, 0.60f, 0.00f),
+            floatArrayOf(0.80f, 0.00f, 0.00f, 0.60f),
+            floatArrayOf(0.80f, 0.35f, 0.35f, 0.35f),
+        )
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person", embeddings = tight)
+        assertEquals("Tight gallery clamps at upper bound — preserves prior gate strength",
+            ReacquisitionEngine.LOCK_SELF_FLOOR_MAX, engine.lockSelfFloor, 1e-6f)
+    }
+
+    @Test
+    fun `lockSelfFloor lands in adaptive band for loose galleries`() {
+        // Gallery with controlled MIN-pairwise sim of exactly 0.5: 4 entries
+        // along the same axis at cosine 1.0, plus a 5th entry whose closest
+        // neighbour (any of the other 4) sits at cosine 0.5. MIN = 0.5,
+        // scaled to 0.5 × 0.7 = 0.35 — inside the [0.25, 0.40] adaptive band.
+        val partial = listOf(
+            floatArrayOf(1.0f, 0.0f, 0.0f),
+            floatArrayOf(1.0f, 0.0f, 0.0f),
+            floatArrayOf(1.0f, 0.0f, 0.0f),
+            floatArrayOf(1.0f, 0.0f, 0.0f),
+            floatArrayOf(0.5f, kotlin.math.sqrt(0.75f), 0.0f),
+        )
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "chair", embeddings = partial)
+        assertEquals("Loose gallery → adaptive floor inside the [MIN, MAX] band",
+            0.35f, engine.lockSelfFloor, 1e-3f)
+    }
+
+    @Test
+    fun `lockSelfFloor clamps low at 0_25 floor`() {
+        // Pathological gallery — all 5 entries mutually orthogonal. MIN
+        // pairwise sim = 0, scaled = 0, clamped up to LOCK_SELF_FLOOR_MIN (0.25).
+        val orthogonal = listOf(
+            floatArrayOf(1f, 0f, 0f, 0f, 0f),
+            floatArrayOf(0f, 1f, 0f, 0f, 0f),
+            floatArrayOf(0f, 0f, 1f, 0f, 0f),
+            floatArrayOf(0f, 0f, 0f, 1f, 0f),
+            floatArrayOf(0f, 0f, 0f, 0f, 1f),
+        )
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "weird", embeddings = orthogonal)
+        assertEquals("Orthogonal gallery clamps at lower bound — never below noise floor",
+            ReacquisitionEngine.LOCK_SELF_FLOOR_MIN, engine.lockSelfFloor, 1e-6f)
+    }
+
+    @Test
+    fun `lockSelfFloor resets to default on clear`() {
+        val tight = listOf(
+            floatArrayOf(1.0f, 0.0f, 0.0f),
+            floatArrayOf(0.99f, 0.14f, 0.0f),
+        )
+        engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person", embeddings = tight)
+        assertEquals(ReacquisitionEngine.LOCK_SELF_FLOOR_MAX, engine.lockSelfFloor, 1e-6f)
+        engine.clear()
+        assertEquals("clear() restores default floor",
+            ReacquisitionEngine.LOCK_SELF_FLOOR_DEFAULT, engine.lockSelfFloor, 1e-6f)
+    }
+
     @Test
     fun `appearance score boosts visually similar candidate`() {
         val lockedEmb = floatArrayOf(1f, 0f, 0f)  // unit vector

@@ -163,6 +163,33 @@ class ReacquisitionEngine(
         /** Lowe's ratio test: reject when secondBestSim / bestSim exceeds this (SIFT-style). */
         const val RATIO_TEST_THRESHOLD = 0.85f
 
+        // --- Gallery accumulator floor (#110) ---
+        /** Default accumulator floor when no lock-time augmentations are
+         *  available (legacy single-embedding lock path). Matches the prior
+         *  fixed 0.5 gate so behavior is unchanged for that case. */
+        const val LOCK_SELF_FLOOR_DEFAULT = 0.5f
+        /** Scale applied to the gallery's MIN pairwise self-recall before
+         *  clamping. The MIN represents the gallery's "weakest internal pair"
+         *  — for chair augmentations, upright-vs-rot180 (different MNV3
+         *  feature space) lands here. A live crop sim above this threshold is
+         *  at least as similar to the lock identity as the gallery's own
+         *  most-divergent pair. 0.7 leaves a small margin below that band. */
+        const val LOCK_SELF_FLOOR_SCALE = 0.7f
+        /** Hard lower bound on the accumulator floor. Below this, the gate is
+         *  no longer discriminating real same-object crops from random scene
+         *  noise — generic MNV3 cross-class sim hits ~0.20 in our captures. */
+        const val LOCK_SELF_FLOOR_MIN = 0.25f
+        /** Hard upper bound on the accumulator floor. The prior fixed 0.5 was
+         *  too tight for non-person classes (chair's live-vs-gallery band sits
+         *  at 0.30-0.50). 0.40 keeps person/OSNet locks well-protected (their
+         *  live sim is 0.6+) while leaving headroom for generic classes. */
+        const val LOCK_SELF_FLOOR_MAX = 0.40f
+        /** [TEMPLATE_SIM_LOW] (drift-suspicion threshold) is derived from the
+         *  per-lock floor. Below this fraction of lockSelfFloor → counter
+         *  increments → 3 in a row kills VT. Static 0.4 was killing legitimate
+         *  chair tracking whose live band is 0.30-0.50. */
+        const val TEMPLATE_SIM_LOW_RATIO = 0.75f
+
         /** MobileNetV3-Large embedding dimension for frozen-negatives asset validation. */
         const val MOBILENET_EMBED_DIM = 1280
         /** OSNet x1.0 embedding dimension for frozen-negatives asset validation. */
@@ -198,6 +225,23 @@ class ReacquisitionEngine(
 
     /** Convenience: true if we have any reference embeddings. */
     val hasEmbeddings: Boolean get() = _embeddingGallery.isNotEmpty()
+
+    /** Adaptive floor for the gallery accumulator (#110). At lock time we
+     *  measure how well the lock-time augmentations recall each other and
+     *  scale that down for live-crop noise tolerance. The accumulator gate
+     *  in ObjectTracker compares an incoming VT-confirmed crop's lockSim
+     *  against this floor: above → admit to gallery, below → reject.
+     *
+     *  Why adaptive: a fixed 0.5 floor (the prior behavior, #103) cuts
+     *  through the same-object cosine band of generic-MNV3 classes (chair,
+     *  bowl, etc.) whose live-vs-gallery sim sits at 0.3-0.5 even on the
+     *  same pose. The gallery never grew past the initial 5 augmentations,
+     *  reacquire candidates scored below the embedding floor, tracking
+     *  rate fell from 76% to 25-42%. Person/OSNet sits at 0.6-0.85 so the
+     *  prior 0.5 floor was fine; the adaptive floor recovers the same
+     *  behavior for that path via the upper clamp. */
+    var lockSelfFloor: Float = LOCK_SELF_FLOOR_DEFAULT
+        private set
     /** Centroid (L2-normalized mean) of the gallery — stable identity representation. */
     private var _embeddingCentroid: FloatArray? = null
     private fun recomputeCentroid() {
@@ -558,6 +602,7 @@ class ReacquisitionEngine(
         lockedIsPerson = (cocoLabel ?: label) == "person"
         _embeddingGallery = embeddings.map { it.copyOf() }.toMutableList()
         recomputeCentroid()
+        lockSelfFloor = computeLockSelfFloor(_embeddingGallery)
         _negativeExamples.clear()
         _negativeCentroid = null
         _roster.clear()
@@ -620,6 +665,7 @@ class ReacquisitionEngine(
         val floorStr = buildString {
             _adaptiveMobileNetFloor?.let { append(" mnv3Floor=${fmtF(it)}") }
             _adaptiveOsnetFloor?.let { append(" osnetFloor=${fmtF(it)}") }
+            append(" lockSelfFloor=${fmtF(lockSelfFloor)}")
         }
         dualLog(Log.INFO, "LOCK id=$trackingId label=\"$label\" box=${fmtBox(boundingBox)} size=${fmtF(lastKnownSize)} gallery=${embeddingGallery.size} colorHist=${colorHist != null} attrs=\"$attrStr\"$floorStr")
     }
@@ -671,6 +717,7 @@ class ReacquisitionEngine(
         _embeddingGallery.clear()
         _embeddingCentroid = null
         _minGallerySim = 1f
+        lockSelfFloor = LOCK_SELF_FLOOR_DEFAULT
         _adaptiveMobileNetFloor = null
         _adaptiveOsnetFloor = null
         _mnv3LiveStats = null
@@ -1268,6 +1315,34 @@ class ReacquisitionEngine(
         if (_embeddingGallery.isEmpty()) return 0f
         val lockEntries = _embeddingGallery.take(LOCK_AUGMENTATION_COUNT)
         return bestGallerySimilarity(candidateEmbedding, lockEntries)
+    }
+
+    /**
+     * Compute the per-lock accumulator floor (#110) from the gallery's own
+     * augmentations. We use the MINIMUM pairwise cosine within the lock
+     * gallery — the "weakest internal pair." A live VT crop should be at
+     * least this similar to the lock identity to count as the same object;
+     * anything lower is more divergent from the lock than the gallery's own
+     * most-different augmentation pair, which is the natural "below-noise"
+     * band. Scale down for live-crop tolerance and clamp to
+     * [LOCK_SELF_FLOOR_MIN, LOCK_SELF_FLOOR_MAX].
+     *
+     * Why MIN, not MAX: MAX (best-self-recall) for chair lands ~0.7+
+     * (upright vs flipped, mirror-symmetric), which clamps the floor at the
+     * upper bound and gives no help to the actual problem class. The MIN
+     * captures the structural diversity introduced by 90/180/270 rotations
+     * of asymmetric objects — for chair, MIN ≈ 0.05; for person, MIN ≈
+     * 0.4-0.5. The clamp range pushes both into the same admit band, which
+     * is appropriate: drift entries (sim ~0.05-0.20) are below 0.25, real
+     * same-object entries (chair 0.30-0.50, person 0.6+) are above.
+     */
+    private fun computeLockSelfFloor(gallery: List<FloatArray>): Float {
+        if (gallery.size < 2) return LOCK_SELF_FLOOR_DEFAULT
+        val lockEntries = gallery.take(LOCK_AUGMENTATION_COUNT)
+        if (lockEntries.size < 2) return LOCK_SELF_FLOOR_DEFAULT
+        val minSelfRecall = minPairwiseSimilarity(lockEntries)
+        return (minSelfRecall * LOCK_SELF_FLOOR_SCALE)
+            .coerceIn(LOCK_SELF_FLOOR_MIN, LOCK_SELF_FLOOR_MAX)
     }
 
     /**

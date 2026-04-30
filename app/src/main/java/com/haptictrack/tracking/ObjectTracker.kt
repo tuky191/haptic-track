@@ -115,21 +115,15 @@ class ObjectTracker(
      * 0.3 and 0.5.
      */
     private val TEMPLATE_CHECK_INTERVAL = 5    // embed VT crop every N frames
-    private val TEMPLATE_SIM_LOW = 0.4f        // below this = drift suspicion (increment)
-    private val TEMPLATE_SIM_OK = 0.5f         // above this = safe (decrement, floored at 0)
+    // TEMPLATE_SIM_LOW / TEMPLATE_SIM_OK are dynamic per-lock (#110): derived
+    // from [ReacquisitionEngine.lockSelfFloor] so the drift-detection band
+    // adapts to the embedder's same-object cosine band for THIS lock. Static
+    // 0.4 / 0.5 (the prior values) sat above the chair's live-vs-gallery
+    // band (0.3-0.5), killing VT before the accumulator could grow the
+    // gallery and dropping chair tracking from 76% to 25-42%. Person/OSNet
+    // sits at 0.6+ and the upper clamp keeps the gate well-protected there.
     private val TEMPLATE_MISMATCH_MAX = 3      // mismatches → kill (≈0.5s)
     private var templateMismatchCount = 0
-
-    /**
-     * Floor on `bestLockGallerySimilarity(emb)` for accumulating a new
-     * embedding into the gallery during VT tracking. New entries below this
-     * are drifting away from the lock identity and would poison the gallery
-     * — letting later wrong-person candidates score artificially high. Set
-     * inside the lock-gallery's own internal pairwise distribution
-     * (mean across augmentations ≈ 0.79; min ≈ 0.66) — anything substantially
-     * below that is no longer the same identity.
-     */
-    private val GALLERY_ADD_LOCK_SIM_FLOOR = 0.5f
 
     /**
      * VT box size sanity check: the tracker's output box shouldn't grow
@@ -139,6 +133,35 @@ class ObjectTracker(
      * the whole screen) instead of the locked object.
      */
     private val VT_BOX_AREA_MAX_RATIO = 5f
+    /**
+     * Detector-anchor reseat thresholds (#110). When the detector confirms VT
+     * but two conditions hold, VT has latched onto background texture and we
+     * reseat the tracker with the detector's box:
+     *
+     *   1. VT has GROWN since its init (`vtArea / vtLockedBoxArea > GROWTH`)
+     *   2. VT is also larger than the detector reports for the same object
+     *      (`vtArea / detArea > DISAGREEMENT`)
+     *
+     * Both conditions are needed because the two fail differently:
+     *   - Condition 1 alone fires on legitimate zoom (subject approaches
+     *     camera, both VT and detector grow in lockstep — detector match
+     *     stays close to VT, no runaway).
+     *   - Condition 2 alone fires on sizing-convention mismatch (e.g. person
+     *     detector outputs head+torso but VT tracks the full body lock box
+     *     — natural disagreement at every frame, not a runaway).
+     *
+     * Their intersection captures only the runaway case: VT grew AND the
+     * detector says we should be smaller. Empirically: chair box expands
+     * 1x → 5x while detector stays at small chair-only box → both fire.
+     * Person tracking: VT stays close to its init size → condition 1 stays
+     * below 1.5x → no reseat.
+     *
+     * Doesn't fire when detector misses for the frame (no reference box).
+     * The existing 5x [VT_BOX_AREA_MAX_RATIO] remains the catch-all for
+     * sustained detector-missing windows.
+     */
+    private val VT_RESEAT_GROWTH_RATIO = 1.3f       // condition 1
+    private val VT_RESEAT_DISAGREEMENT_RATIO = 1.3f // condition 2
     private var vtLockedBoxArea = 0f  // area of VT's init box (normalized 0..1)
 
     /** Async embedding pipeline: compute embeddings on background thread, use results next frame. */
@@ -454,10 +477,12 @@ class ObjectTracker(
             if (visualTracker.isActive && reacquisition.isLocked && reacquisition.framesLost == 0) {
                 val vtResult = visualTracker.update(bitmap)
                 if (vtResult != null) {
-                    // VT returns coords in rotated-image space; unmap to screen space
+                    // VT returns coords in rotated-image space; unmap to screen space.
+                    // Mutable so the detector-anchor reseat (#110) can swap them to
+                    // the detector's box when VT runs away onto background texture.
                     val deviceRot = deviceRotation
-                    val rawBox = vtResult.boundingBox
-                    val vtBox = unmapRotation(rawBox.left, rawBox.top, rawBox.right, rawBox.bottom, deviceRot)
+                    var rawBox = vtResult.boundingBox
+                    var vtBox = unmapRotation(rawBox.left, rawBox.top, rawBox.right, rawBox.bottom, deviceRot)
 
                     // Feed position to velocity estimator for adaptive drift detection
                     velocityEstimator.update(vtBox.centerX(), vtBox.centerY())
@@ -484,20 +509,27 @@ class ObjectTracker(
                         frameTracker.assignIds(detections)
                     }
 
-                    val confirmed = if (skipDetector) {
-                        true  // trust VT on skipped frames
-                    } else {
+                    val lockedIsPerson = reacquisition.lockedIsPerson
+                    val matchedDet: TrackedObject? = if (skipDetector) null else {
                         // Confirmation = detection overlaps VT's position.
                         // Accept same-category at low IoU (0.15) or any category at high IoU (0.4).
                         // High IoU means it's the same object regardless of label.
                         // Low IoU with different category (e.g. person walking past a cup) doesn't confirm.
-                        val lockedIsPerson = reacquisition.lockedIsPerson
-                        tracked.any { det ->
-                            val iou = FrameToFrameTracker.computeIou(det.boundingBox, vtBox)
-                            val sameCategory = (det.label == "person") == lockedIsPerson
-                            (sameCategory && iou > 0.15f) || iou > 0.4f
-                        }
+                        //
+                        // Among multiple matches we pick the SMALLEST-area detection (#110): when
+                        // VT is running away onto background texture, both a tight chair box and
+                        // an inflated envelope box may match VT's IoU range. The tight box is the
+                        // truer ground-truth size for the runaway-vs-detector size comparison
+                        // below, and is also the better reseat target.
+                        tracked
+                            .filter { det ->
+                                val iou = FrameToFrameTracker.computeIou(det.boundingBox, vtBox)
+                                val sameCategory = (det.label == "person") == lockedIsPerson
+                                (sameCategory && iou > 0.15f) || iou > 0.4f
+                            }
+                            .minByOrNull { it.boundingBox.width() * it.boundingBox.height() }
                     }
+                    val confirmed = skipDetector || matchedDet != null
                     // Distinguish non-confirmation from contradiction:
                     // If detector found nothing at all, that's not evidence of drift —
                     // it's poor detection conditions. Only count unconfirmed when
@@ -506,6 +538,43 @@ class ObjectTracker(
 
                     if (confirmed) {
                         vtUnconfirmedFrames = 0
+
+                        // Detector-anchor reseat (#110): when the detector confirms VT
+                        // but reports a much smaller box for the same object, VT is
+                        // running away onto background texture. Reseat the tracker so
+                        // subsequent updates start from the detector's ground-truth size.
+                        // No-op when:
+                        //   - detector skipped this frame (matchedDet null)
+                        //   - VT and detector agree on size (legitimate zoom)
+                        //   - detector reports LARGER box (some other path; not our concern)
+                        if (matchedDet != null) {
+                            val detBox = matchedDet.boundingBox
+                            val detArea = detBox.width() * detBox.height()
+                            val vtArea = vtBox.width() * vtBox.height()
+                            val growthRatio = if (vtLockedBoxArea > 0f) vtArea / vtLockedBoxArea else 1f
+                            val disagreementRatio = if (detArea > 0f) vtArea / detArea else 1f
+                            // Both conditions: VT has grown since init AND VT is
+                            // larger than detector. Either alone is a false positive
+                            // (legitimate zoom or sizing-convention mismatch).
+                            if (growthRatio > VT_RESEAT_GROWTH_RATIO &&
+                                disagreementRatio > VT_RESEAT_DISAGREEMENT_RATIO) {
+                                visualTracker.init(bitmap, detBox)
+                                vtLockedBoxArea = detArea
+                                templateMismatchCount = 0
+                                // Reset the confirmed-frame counter so accumulation
+                                // doesn't immediately fire on this frame's drifted
+                                // crop (rotated-coord rawBox is the inflated VT box).
+                                vtConfirmedFrames = 0
+                                // Swap working boxes for downstream embedding/sync so
+                                // this frame's accumulator and template-check operate
+                                // on detector-confirmed pixels, not the runaway crop.
+                                vtBox = detBox
+                                rawBox = mapToRotated(detBox.left, detBox.top, detBox.right, detBox.bottom, deviceRot)
+                                debugCapture.log("VT_RESEAT vtArea=${"%.3f".format(vtArea)} detArea=${"%.3f".format(detArea)} growth=${"%.2fx".format(growthRatio)} disagreement=${"%.2fx".format(disagreementRatio)} → reinit on detBox=[${"%.2f,%.2f,%.2f,%.2f".format(detBox.left, detBox.top, detBox.right, detBox.bottom)}]")
+                                android.util.Log.d("VisualTracker", "VT_RESEAT growth=${"%.2fx".format(growthRatio)} disagreement=${"%.2fx".format(disagreementRatio)}")
+                            }
+                        }
+
                         // Sync lastKnownBox and velocity in screen coords when detector confirms
                         reacquisition.updateFromVisualTracker(vtBox)
                         reacquisition.updateVelocity(velocityEstimator.velocityX, velocityEstimator.velocityY)
@@ -534,16 +603,23 @@ class ObjectTracker(
                                 // camera panned, lockSim≈0.06 entries were waved through and
                                 // a different person scored sim=0.864 against the polluted
                                 // gallery vs 0.541 against the raw lock-only embeddings.
+                                //
+                                // The lockSim threshold is per-lock adaptive (#110): tight-
+                                // distribution embedders (OSNet/persons) clamp at 0.50,
+                                // loose ones (MNV3/chair) drop to ~0.32-0.42. Fixed 0.5
+                                // was cutting through the same-object band of generic
+                                // classes — gallery never grew past 5, tracking 76% → 25%.
                                 val centroidSim = reacquisition.centroidSimilarity(emb)
                                 val lockSim = reacquisition.bestLockGallerySimilarity(emb)
+                                val lockSimFloor = reacquisition.lockSelfFloor
                                 val boxStr = "%.2f,%.2f,%.2f,%.2f".format(rawBox.left, rawBox.top, rawBox.right, rawBox.bottom)
-                                if (centroidSim < 0.92f && lockSim > GALLERY_ADD_LOCK_SIM_FLOOR) {
+                                if (centroidSim < 0.92f && lockSim > lockSimFloor) {
                                     reacquisition.addEmbedding(emb)
-                                    android.util.Log.d("AppearEmbed", "Gallery +1 → ${reacquisition.embeddingGallery.size} (centroidSim=${"%.3f".format(centroidSim)}, lockSim=${"%.3f".format(lockSim)})")
-                                    debugCapture.log("ACCUM +1 vtFrame=$vtConfirmedFrames gallery=${reacquisition.embeddingGallery.size} lockSim=${"%.3f".format(lockSim)} centroidSim=${"%.3f".format(centroidSim)} box=[$boxStr]")
+                                    android.util.Log.d("AppearEmbed", "Gallery +1 → ${reacquisition.embeddingGallery.size} (centroidSim=${"%.3f".format(centroidSim)}, lockSim=${"%.3f".format(lockSim)}, floor=${"%.3f".format(lockSimFloor)})")
+                                    debugCapture.log("ACCUM +1 vtFrame=$vtConfirmedFrames gallery=${reacquisition.embeddingGallery.size} lockSim=${"%.3f".format(lockSim)} floor=${"%.3f".format(lockSimFloor)} centroidSim=${"%.3f".format(centroidSim)} box=[$boxStr]")
                                 } else {
-                                    val why = if (lockSim <= GALLERY_ADD_LOCK_SIM_FLOOR) "lockSim<=$GALLERY_ADD_LOCK_SIM_FLOOR" else "centroidSim>=0.92"
-                                    debugCapture.log("ACCUM skip vtFrame=$vtConfirmedFrames gallery=${reacquisition.embeddingGallery.size} lockSim=${"%.3f".format(lockSim)} centroidSim=${"%.3f".format(centroidSim)} box=[$boxStr] ($why)")
+                                    val why = if (lockSim <= lockSimFloor) "lockSim<=floor(${"%.3f".format(lockSimFloor)})" else "centroidSim>=0.92"
+                                    debugCapture.log("ACCUM skip vtFrame=$vtConfirmedFrames gallery=${reacquisition.embeddingGallery.size} lockSim=${"%.3f".format(lockSim)} floor=${"%.3f".format(lockSimFloor)} centroidSim=${"%.3f".format(centroidSim)} box=[$boxStr] ($why)")
                                 }
                             }
                             // Progressive face embedding: try to capture face during tracking
@@ -644,17 +720,23 @@ class ObjectTracker(
                             // can include drifted VT crops that mask the drift
                             // signal at sim=1.0. (#80)
                             val sim = reacquisition.bestLockGallerySimilarity(curEmb)
+                            // Dynamic thresholds (#110): track LOW/OK to the
+                            // per-lock floor so the dead zone sits inside the
+                            // class's live-vs-gallery band. Hysteresis still
+                            // requires LOW < OK; the ratio constant guarantees this.
+                            val templateOk = reacquisition.lockSelfFloor
+                            val templateLow = templateOk * ReacquisitionEngine.TEMPLATE_SIM_LOW_RATIO
                             when {
-                                sim < TEMPLATE_SIM_LOW -> {
+                                sim < templateLow -> {
                                     templateMismatchCount++
-                                    android.util.Log.d("VisualTracker", "Template mismatch $templateMismatchCount/$TEMPLATE_MISMATCH_MAX (sim=${"%.3f".format(sim)})")
-                                    debugCapture.log("TEMPLATE mismatch vtFrame=$vtConfirmedFrames count=$templateMismatchCount/$TEMPLATE_MISMATCH_MAX lockSim=${"%.3f".format(sim)}")
+                                    android.util.Log.d("VisualTracker", "Template mismatch $templateMismatchCount/$TEMPLATE_MISMATCH_MAX (sim=${"%.3f".format(sim)} low=${"%.3f".format(templateLow)})")
+                                    debugCapture.log("TEMPLATE mismatch vtFrame=$vtConfirmedFrames count=$templateMismatchCount/$TEMPLATE_MISMATCH_MAX lockSim=${"%.3f".format(sim)} low=${"%.3f".format(templateLow)}")
                                 }
-                                sim > TEMPLATE_SIM_OK -> {
+                                sim > templateOk -> {
                                     if (templateMismatchCount > 0) {
                                         templateMismatchCount--
-                                        android.util.Log.d("VisualTracker", "Template recovery $templateMismatchCount/$TEMPLATE_MISMATCH_MAX (sim=${"%.3f".format(sim)})")
-                                        debugCapture.log("TEMPLATE recovery vtFrame=$vtConfirmedFrames count=$templateMismatchCount/$TEMPLATE_MISMATCH_MAX lockSim=${"%.3f".format(sim)}")
+                                        android.util.Log.d("VisualTracker", "Template recovery $templateMismatchCount/$TEMPLATE_MISMATCH_MAX (sim=${"%.3f".format(sim)} ok=${"%.3f".format(templateOk)})")
+                                        debugCapture.log("TEMPLATE recovery vtFrame=$vtConfirmedFrames count=$templateMismatchCount/$TEMPLATE_MISMATCH_MAX lockSim=${"%.3f".format(sim)} ok=${"%.3f".format(templateOk)}")
                                     }
                                 }
                                 else -> { /* dead zone — hold the counter */ }
