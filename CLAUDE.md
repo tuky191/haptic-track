@@ -42,11 +42,11 @@ app/src/main/java/com/haptictrack/
 │   ├── SessionRoster.kt                   # Per-session non-lock person memory (#113)
 │   ├── AppearanceEmbedder.kt              # MobileNetV3 generic embedding + gallery
 │   ├── FaceEmbedder.kt, PersonReIdEmbedder.kt   # Person path (face + body)
-│   ├── PersonAttributeClassifier.kt       # Crossroad-0230 + BlazeFace + age-gender
+│   ├── PersonAttributeClassifier.kt       # BlazeFace + age-gender
 │   ├── VisualTracker.kt                   # OpenCV VitTracker wrapper
 │   ├── FrameToFrameTracker.kt             # IoU-based detection ID assignment
 │   ├── DetectionFilter.kt, ObjectSegmenter.kt, ScenarioRecorder.kt, DebugFrameCapture.kt
-│   ├── CanonicalCrop.kt, CropClassifier.kt, FrozenNegatives.kt
+│   ├── CanonicalCrop.kt, FrozenNegatives.kt
 │   ├── VelocityEstimator.kt, EmbeddingStabilityLogger.kt, CropDebugCapture.kt
 │   ├── EmbeddingUtils.kt                  # Shared helpers (IoU, cosine, histogram, z-norm)
 │   └── TrackingState.kt                   # Data classes
@@ -73,7 +73,7 @@ CameraViewModel
 │   ├── AppearanceEmbedder     (MobileNetV3: generic visual identity fingerprint)
 │   ├── FaceEmbedder           (MobileFaceNet: face identity for person path)
 │   ├── PersonReIdEmbedder     (OSNet x1.0 MSMT17: body re-ID for person path)
-│   ├── PersonAttributeClassifier (Crossroad-0230 + BlazeFace + age-gender: person attributes)
+│   ├── PersonAttributeClassifier (BlazeFace + age-gender: person attributes)
 │   ├── SessionRoster          (per-session non-lock person memory → ROSTER_REJECT margin gate)
 │   ├── ReacquisitionEngine    (cascade scoring: hard category gate + z-norm calibration + ranking)
 │   ├── ScenarioRecorder       (captures processFrame inputs as JSON for replay testing)
@@ -233,7 +233,7 @@ Always 2-stream (SurfaceTexture + VideoCapture). Recording toggles VideoCapture 
 Opaque black Compose `Box` overlays the SurfaceTexture preview — purely UI. SurfaceTexture keeps producing frames regardless of visibility. Volume-down: idle → lock center → start recording → stop+clear.
 
 ### GPU delegate for all models
-All 11 models run on GPU. EfficientDet-Lite2 is FP16 (was INT8 CPU) — fewer spurious detections. TFLite models use `createGpuInterpreter()` with `Throwable` catch for CPU fallback. MediaPipe models use `Delegate.GPU` via `BaseOptions`. InteractiveSegmenter GPU is capped — Adreno 740 returns empty masks above ~100K pixels, so segment crops are downscaled to ~300x300 (`MAX_SEGMENT_PIXELS = 90000`).
+All 8 models run on GPU. EfficientDet-Lite2 is FP16 (was INT8 CPU) — fewer spurious detections. TFLite models use `createGpuInterpreter()` with `Throwable` catch for CPU fallback. MediaPipe models use `Delegate.GPU` via `BaseOptions`. InteractiveSegmenter GPU is capped — Adreno 740 returns empty masks above ~100K pixels, so segment crops are downscaled to ~300x300 (`MAX_SEGMENT_PIXELS = 90000`).
 
 ### Adaptive frame skipping during VT
 Two-tier. Base (confidence >0.6, confirmed ≥5): every 2nd frame (50% skip). Stable (confidence >0.7, confirmed ≥10): every 3rd frame (67% skip). VT alone is ~5ms vs ~35ms for the detector. Resets on drift, lock clear, or VT stop.
@@ -295,16 +295,13 @@ Setup: `cd tools && python3.13 -m venv .venv && .venv/bin/pip install -r require
 |---|---|---|---|---|---|
 | EfficientDet-Lite2 | `efficientdet-lite2-fp16.tflite` | 11.6MB | FP16 | GPU (MediaPipe) | Primary detector (80 COCO classes, every frame) |
 | MobileNetV3 Large | `mobilenet_v3_large_embedder.tflite` | 10.4MB | FP32 | GPU (MediaPipe) | Generic visual embedding (1280-dim) |
-| MobileViTv2-0.75 (embedder) | `mobilevitv2_075_embedder.tflite` | 9.8MB | FP32 | GPU (TFLite) | Alternative generic embedder (canonical-crop work, #91) |
-| MobileViTv2-0.75 (classifier) | `mobilevitv2_075_classifier.tflite` | 11.3MB | FP32 | GPU (TFLite) | Online classifier for tentative confirmation |
 | VitTracker | `object_tracking_vittrack_2023sep.onnx` | 0.7MB | FP32 | CPU (OpenCV DNN) | Visual frame-to-frame tracker |
 | magic_touch | `magic_touch.tflite` | 5.9MB | FP32 | GPU (MediaPipe) | Segmentation for masked crops |
-| Crossroad-0230 | `person_attributes_crossroad_0230.tflite` | 2.8MB | FP32 | GPU (fallback CPU) | Person body attributes (8 binary) |
 | BlazeFace | `blaze_face_short_range.tflite` | 0.2MB | FP32 | GPU (MediaPipe) | Face detection within person crops |
 | age-gender-retail-0013 | `age_gender_retail_0013.tflite` | 4.1MB | FP32 | GPU (fallback CPU) | Face-based gender + age |
 | OSNet x1.0 MSMT17 | `osnet_x1_0_msmt17.tflite` | 4.2MB | FP32 | GPU (fallback CPU) | Person re-ID embedding (512-dim) — MSMT17 weights, swapped from Market in #113 |
 | MobileFaceNet | `mobilefacenet.tflite` | 5.0MB | FP32 | GPU (fallback CPU) | Face embedding (192-dim) |
-| **Total** | | **~66MB** | | |
+| **Total** | | **~42MB** | | |
 
 ## Tunable Parameters
 
