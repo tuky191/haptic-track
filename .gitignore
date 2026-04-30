@@ -25,6 +25,8 @@ pulled_frames/
 docs/issues/*/slow_7s_case/
 docs/issues/*/fast_3s_case/
 tools/crops/*/
+test_videos/recordings/
+test_videos/debug_frames/
 # Model artifacts: keep recipe + small TFLite outputs, ignore large intermediates
 tools/models/osnet_hf/
 tools/models/onnx/
