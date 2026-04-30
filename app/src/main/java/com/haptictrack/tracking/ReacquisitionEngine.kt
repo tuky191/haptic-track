@@ -33,7 +33,9 @@ class ReacquisitionEngine(
      */
     private val frozenNegativesMobileNet: List<FloatArray> = emptyList(),
     /** Pre-computed background OSNet embeddings; same role for the person-reId path. */
-    private val frozenNegativesOsnet: List<FloatArray> = emptyList()
+    private val frozenNegativesOsnet: List<FloatArray> = emptyList(),
+    /** When true, person-attribute scores are zeroed in [scoreCandidate]. Ablation flag (#123). */
+    val disableAttributes: Boolean = false
 ) {
 
     companion object {
@@ -1182,7 +1184,7 @@ class ReacquisitionEngine(
             histogramCorrelation(lockedColorHistogram!!, candidate.colorHistogram!!).coerceIn(0f, 1f)
         } else 0f
 
-        val hasAttrs = lockedPersonAttributes != null && candidate.personAttributes != null
+        val hasAttrs = !disableAttributes && lockedPersonAttributes != null && candidate.personAttributes != null
         val attrScore = if (hasAttrs) {
             lockedPersonAttributes!!.similarity(candidate.personAttributes!!)
         } else 0f
