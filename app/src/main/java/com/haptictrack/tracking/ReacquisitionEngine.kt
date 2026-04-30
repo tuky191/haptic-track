@@ -2,7 +2,6 @@ package com.haptictrack.tracking
 
 import android.graphics.RectF
 import android.util.Log
-import androidx.annotation.VisibleForTesting
 import kotlin.math.exp
 
 /**
@@ -34,9 +33,7 @@ class ReacquisitionEngine(
      */
     private val frozenNegativesMobileNet: List<FloatArray> = emptyList(),
     /** Pre-computed background OSNet embeddings; same role for the person-reId path. */
-    private val frozenNegativesOsnet: List<FloatArray> = emptyList(),
-    /** When true, person-attribute scores are zeroed in [scoreCandidate]. Ablation flag (#123). */
-    @VisibleForTesting val disableAttributes: Boolean = false
+    private val frozenNegativesOsnet: List<FloatArray> = emptyList()
 ) {
 
     companion object {
@@ -568,9 +565,6 @@ class ReacquisitionEngine(
     /** Reference color histogram from lock time. */
     var lockedColorHistogram: FloatArray? = null
         private set
-    /** Reference person attributes from lock time. */
-    var lockedPersonAttributes: PersonAttributes? = null
-        private set
     /** OSNet person re-ID embedding from lock time. */
     var lockedReIdEmbedding: FloatArray? = null
         private set
@@ -607,7 +601,7 @@ class ReacquisitionEngine(
     }
 
     fun lock(trackingId: Int, boundingBox: RectF, label: String?, embeddings: List<FloatArray>,
-             colorHist: FloatArray? = null, personAttrs: PersonAttributes? = null,
+             colorHist: FloatArray? = null,
              cocoLabel: String? = null, reIdEmbedding: FloatArray? = null,
              faceEmbedding: FloatArray? = null) {
         lockedId = trackingId
@@ -626,7 +620,6 @@ class ReacquisitionEngine(
         _lastTrainPositives = 0
         _lastTrainNegatives = 0
         lockedColorHistogram = colorHist?.copyOf()
-        lockedPersonAttributes = personAttrs
         lockedReIdEmbedding = reIdEmbedding?.copyOf()
         lockedFaceEmbedding = faceEmbedding?.copyOf()
         _mnv3LiveStats = null
@@ -675,13 +668,12 @@ class ReacquisitionEngine(
             }
         }
 
-        val attrStr = personAttrs?.summary() ?: "n/a"
         val floorStr = buildString {
             _adaptiveMobileNetFloor?.let { append(" mnv3Floor=${fmtF(it)}") }
             _adaptiveOsnetFloor?.let { append(" osnetFloor=${fmtF(it)}") }
             append(" lockSelfFloor=${fmtF(lockSelfFloor)}")
         }
-        dualLog(Log.INFO, "LOCK id=$trackingId label=\"$label\" box=${fmtBox(boundingBox)} size=${fmtF(lastKnownSize)} gallery=${embeddingGallery.size} colorHist=${colorHist != null} attrs=\"$attrStr\"$floorStr")
+        dualLog(Log.INFO, "LOCK id=$trackingId label=\"$label\" box=${fmtBox(boundingBox)} size=${fmtF(lastKnownSize)} gallery=${embeddingGallery.size} colorHist=${colorHist != null}$floorStr")
     }
 
     /** Add a face embedding progressively (e.g. when face first appears during tracking). */
@@ -746,7 +738,6 @@ class ReacquisitionEngine(
         _lastTrainPositives = 0
         _lastTrainNegatives = 0
         lockedColorHistogram = null
-        lockedPersonAttributes = null
         lockedReIdEmbedding = null
         lockedFaceEmbedding = null
         lastKnownBox = null
@@ -921,9 +912,6 @@ class ReacquisitionEngine(
             } else null
             if (score != null) {
                 if (logThis) {
-                    val attrStr = if (lockedPersonAttributes != null && candidate.personAttributes != null) {
-                        " attrs=${fmtF(lockedPersonAttributes!!.similarity(candidate.personAttributes!!))}"
-                    } else ""
                     val reIdStr = if (lockedReIdEmbedding != null && candidate.reIdEmbedding != null) {
                         " reId=${fmtF(cosineSimilarity(lockedReIdEmbedding!!, candidate.reIdEmbedding!!))}"
                     } else ""
@@ -945,7 +933,7 @@ class ReacquisitionEngine(
                         znOsnet?.let { append(" znOsnet=${fmtF(it)}") }
                         znFace?.let { append(" znFace=${fmtF(it)}") }
                     }
-                    dualLog(Log.DEBUG, "  scored id=${candidate.id} label=\"${candidate.label}\" score=${fmtF(score)} sim=${sim?.let { fmtF(it) } ?: "n/a"} color=${colorSim?.let { fmtF(it) } ?: "n/a"}$attrStr$reIdStr$faceStr$marginStr$clsStr$znStr (min=${fmtF(minScoreThreshold)})")
+                    dualLog(Log.DEBUG, "  scored id=${candidate.id} label=\"${candidate.label}\" score=${fmtF(score)} sim=${sim?.let { fmtF(it) } ?: "n/a"} color=${colorSim?.let { fmtF(it) } ?: "n/a"}$reIdStr$faceStr$marginStr$clsStr$znStr (min=${fmtF(minScoreThreshold)})")
                 }
                 Pair(candidate, score)
             } else {
@@ -1185,11 +1173,6 @@ class ReacquisitionEngine(
             histogramCorrelation(lockedColorHistogram!!, candidate.colorHistogram!!).coerceIn(0f, 1f)
         } else 0f
 
-        val hasAttrs = !disableAttributes && lockedPersonAttributes != null && candidate.personAttributes != null
-        val attrScore = if (hasAttrs) {
-            lockedPersonAttributes!!.similarity(candidate.personAttributes!!)
-        } else 0f
-
         // Face embedding: strongest identity signal for persons (when available)
         val hasFace = lockedFaceEmbedding != null && candidate.faceEmbedding != null
         val faceScore = if (hasFace) {
@@ -1226,16 +1209,14 @@ class ReacquisitionEngine(
             val baseEmbW = if (hasAppearance) 0.10f else 0f
             val basePosW = 0.05f * positionConfidence
             val baseColorW = if (hasColor) 0.10f else 0f
-            val baseAttrW = if (hasAttrs) 0.05f else 0f
-            val unused = (1f - baseFaceW - baseReIdW - baseEmbW - basePosW - baseColorW - baseAttrW).coerceAtLeast(0f)
+            val unused = (1f - baseFaceW - baseReIdW - baseEmbW - basePosW - baseColorW).coerceAtLeast(0f)
             val effFaceW = baseFaceW + unused
 
             return (faceCalibrated * effFaceW) +
                    (reIdCalibrated * baseReIdW) +
                    (mnv3Calibrated * baseEmbW) +
                    (positionScore * basePosW) +
-                   (colorScore * baseColorW) +
-                   (attrScore * baseAttrW)
+                   (colorScore * baseColorW)
         } else if (hasReId) {
             // Re-ID available but no face: re-ID is primary, generic embedding secondary.
             // Bug fix bundled here (was double-counting OSNet): the secondary
@@ -1248,16 +1229,14 @@ class ReacquisitionEngine(
             val basePosW = 0.10f * positionConfidence
             val baseSizeW = 0.05f
             val baseColorW = if (hasColor) 0.15f else 0f
-            val baseAttrW = if (hasAttrs) 0.10f else 0f
-            val unused = (1f - baseReIdW - baseEmbW - basePosW - baseSizeW - baseColorW - baseAttrW).coerceAtLeast(0f)
+            val unused = (1f - baseReIdW - baseEmbW - basePosW - baseSizeW - baseColorW).coerceAtLeast(0f)
             val effReIdW = baseReIdW + unused
 
             return (reIdCalibrated * effReIdW) +
                    (mnv3Calibrated * baseEmbW) +
                    (positionScore * basePosW) +
                    (sizeScore * baseSizeW) +
-                   (colorScore * baseColorW) +
-                   (attrScore * baseAttrW)
+                   (colorScore * baseColorW)
         } else if (hasAppearance) {
             // Generic embedding only (non-person, or person without re-ID).
             // Phase 4 (#102) z-norm intentionally NOT applied here: the
@@ -1285,8 +1264,7 @@ class ReacquisitionEngine(
             val basePosW = 0.10f * positionConfidence
             val baseSizeW = 0.10f
             val baseColorW = if (hasColor) 0.10f else 0f
-            val baseAttrW = if (hasAttrs) 0.05f else 0f
-            val unused = (1f - baseEmbW - baseClsW - baseMarginW - basePosW - baseSizeW - baseColorW - baseAttrW).coerceAtLeast(0f)
+            val unused = (1f - baseEmbW - baseClsW - baseMarginW - basePosW - baseSizeW - baseColorW).coerceAtLeast(0f)
             val effEmbW = baseEmbW + unused
 
             val marginScore = ((margin + 1f) / 2f).coerceIn(0f, 1f)
@@ -1295,8 +1273,7 @@ class ReacquisitionEngine(
                    (marginScore * baseMarginW) +
                    (positionScore * basePosW) +
                    (sizeScore * baseSizeW) +
-                   (colorScore * baseColorW) +
-                   (attrScore * baseAttrW)
+                   (colorScore * baseColorW)
         } else {
             // No embedding fallback: position + size only
             val basePosW = 0.50f * positionConfidence
