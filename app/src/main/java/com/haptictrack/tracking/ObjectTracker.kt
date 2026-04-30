@@ -172,7 +172,6 @@ class ObjectTracker(
     data class EmbeddingResult(
         val embedding: FloatArray? = null,
         val colorHistogram: FloatArray? = null,
-        val personAttributes: PersonAttributes? = null,
         val reIdEmbedding: FloatArray? = null,
         val faceEmbedding: FloatArray? = null,
         /** Bounding box at computation time, for IoU-based matching to next frame. */
@@ -217,7 +216,6 @@ class ObjectTracker(
         val label: String?,
         val gallery: List<FloatArray>,
         val colorHist: FloatArray?,
-        val personAttrs: PersonAttributes?,
         val reIdEmb: FloatArray?,
         val faceEmb: FloatArray?,
         val sceneNegatives: List<FloatArray>,
@@ -309,7 +307,6 @@ class ObjectTracker(
                     val fullBox = RectF(0f, 0f, 1f, 1f)
                     computeColorHistogram(augResult.maskedCrop, fullBox).also { augResult.maskedCrop.recycle() }
                 } else computeColorHistogram(snapshotBmp, boundingBox)
-                val personAttrs = personClassifier.classify(snapshotBmp, boundingBox, label)
                 val isPerson = label == "person"
                 val reIdEmb = if (isPerson) personReId.embed(snapshotBmp, boundingBox) else null
                 val faceEmb = if (isPerson) faceEmbedder.embedFace(snapshotBmp, boundingBox) else null
@@ -342,7 +339,6 @@ class ObjectTracker(
                     label = label,
                     gallery = augResult.embeddings,
                     colorHist = colorHist,
-                    personAttrs = personAttrs,
                     reIdEmb = reIdEmb,
                     faceEmb = faceEmb,
                     sceneNegatives = sceneNegs,
@@ -368,7 +364,7 @@ class ObjectTracker(
         val result = pendingLockResult.getAndSet(null) ?: return
         try {
             reacquisition.lock(result.trackingId, result.boundingBox, result.label,
-                result.gallery, result.colorHist, result.personAttrs,
+                result.gallery, result.colorHist,
                 cocoLabel = result.label, reIdEmbedding = result.reIdEmb, faceEmbedding = result.faceEmb)
             visualTracker.init(result.snapshotBmp, result.boundingBox)
             vtLockedBoxArea = result.boundingBox.width() * result.boundingBox.height()
@@ -379,12 +375,11 @@ class ObjectTracker(
             }
 
             debugCapture.startSession(result.label, result.trackingId)
-            val attrStr = result.personAttrs?.summary() ?: "n/a"
-            debugCapture.log("LOCK id=${result.trackingId} label=${result.label} box=${result.boundingBox} gallery=${result.gallery.size} colorHist=${result.colorHist != null} attrs=\"$attrStr\"")
+            debugCapture.log("LOCK id=${result.trackingId} label=${result.label} box=${result.boundingBox} gallery=${result.gallery.size} colorHist=${result.colorHist != null}")
 
             debugCapture.sessionDir?.let { dir ->
                 scenarioRecorder.start(dir, result.trackingId, result.label, result.label,
-                    result.boundingBox, result.gallery, result.colorHist, result.personAttrs)
+                    result.boundingBox, result.gallery, result.colorHist)
             }
 
             val locked = TrackedObject(result.trackingId, result.boundingBox, result.label)
@@ -875,7 +870,6 @@ class ObjectTracker(
                         obj.copy(
                             embedding = cached.embedding,
                             colorHistogram = cached.colorHistogram,
-                            personAttributes = cached.personAttributes,
                             reIdEmbedding = cached.reIdEmbedding,
                             faceEmbedding = cached.faceEmbedding
                         )
@@ -1228,13 +1222,12 @@ class ObjectTracker(
             .map { it.id }
         for (id in personIds) {
             val obj = detections.find { it.id == id } ?: continue
-            val attrs = personClassifier.classify(bitmap, obj.boundingBox, obj.label)
             val reIdEmb = personReId.embed(bitmap, obj.boundingBox)
             val faceEmb = if (reacquisition.lockedFaceEmbedding != null) {
                 faceEmbedder.embedFace(bitmap, obj.boundingBox)
             } else null
             val existing = results[id] ?: EmbeddingResult(cachedBox = RectF(obj.boundingBox))
-            results[id] = existing.copy(personAttributes = attrs, reIdEmbedding = reIdEmb, faceEmbedding = faceEmb)
+            results[id] = existing.copy(reIdEmbedding = reIdEmb, faceEmbedding = faceEmb)
         }
         return results
     }

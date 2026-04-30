@@ -559,7 +559,6 @@ class ScenarioReplayTest {
                 if (embedding != null) arr.put(floatArrayToBase64(embedding))
             })
             put("colorHistogram", JSONObject.NULL)
-            put("personAttributes", JSONObject.NULL)
         }
 
         val framesJson = JSONArray()
@@ -575,7 +574,6 @@ class ScenarioReplayTest {
                     put("boundingBox", boxArr)
                     put("embedding", d.embedding?.let { floatArrayToBase64(it) } ?: JSONObject.NULL)
                     put("colorHistogram", d.colorHistogram?.let { floatArrayToBase64(it) } ?: JSONObject.NULL)
-                    put("personAttributes", JSONObject.NULL)
                 })
             }
             framesJson.put(JSONObject().apply {
@@ -603,8 +601,6 @@ class ScenarioReplayTest {
         }
         val colorHist = if (!lockJson.isNull("colorHistogram"))
             base64ToFloatArray(lockJson.getString("colorHistogram")) else null
-        val personAttrs = if (!lockJson.isNull("personAttributes"))
-            jsonToPersonAttributes(lockJson.getJSONObject("personAttributes")) else null
         val cocoLabel = if (!lockJson.isNull("cocoLabel"))
             lockJson.getString("cocoLabel") else null
 
@@ -614,7 +610,6 @@ class ScenarioReplayTest {
             label = if (!lockJson.isNull("label")) lockJson.getString("label") else null,
             embeddings = embeddings,
             colorHist = colorHist,
-            personAttrs = personAttrs,
             cocoLabel = cocoLabel
         )
 
