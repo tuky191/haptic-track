@@ -604,11 +604,16 @@ class ObjectTracker(
                                 // a different person scored sim=0.864 against the polluted
                                 // gallery vs 0.541 against the raw lock-only embeddings.
                                 //
-                                // The lockSim threshold is per-lock adaptive (#110): tight-
-                                // distribution embedders (OSNet/persons) clamp at 0.50,
-                                // loose ones (MNV3/chair) drop to ~0.32-0.42. Fixed 0.5
-                                // was cutting through the same-object band of generic
-                                // classes — gallery never grew past 5, tracking 76% → 25%.
+                                // The lockSim threshold is per-lock adaptive (#110):
+                                // tight-distribution embedders (OSNet/persons) clamp at
+                                // LOCK_SELF_FLOOR_MAX (0.40); loose ones (MNV3/chair)
+                                // drop to ~0.32-0.40. Person live sims are 0.6+ so the
+                                // 0.40 cap is effectively a no-op for legitimate person
+                                // tracking — the gate fires the same as the prior fixed
+                                // 0.5 floor in that regime. The fixed 0.5 was the
+                                // problem for non-person classes whose same-object band
+                                // sits at 0.3-0.5 — gallery never grew past 5, tracking
+                                // 76% → 25%.
                                 val centroidSim = reacquisition.centroidSimilarity(emb)
                                 val lockSim = reacquisition.bestLockGallerySimilarity(emb)
                                 val lockSimFloor = reacquisition.lockSelfFloor

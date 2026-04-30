@@ -421,7 +421,7 @@ class ReacquisitionEngineTest {
             floatArrayOf(0.80f, 0.35f, 0.35f, 0.35f),
         )
         engine.lock(42, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person", embeddings = tight)
-        assertEquals("Tight gallery clamps at upper bound — preserves prior gate strength",
+        assertEquals("Tight gallery clamps at upper bound — effectively no-op vs prior fixed gate (person live sims are 0.6+, well above the 0.40 cap)",
             ReacquisitionEngine.LOCK_SELF_FLOOR_MAX, engine.lockSelfFloor, 1e-6f)
     }
 

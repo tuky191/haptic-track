@@ -181,8 +181,18 @@ class ReacquisitionEngine(
         const val LOCK_SELF_FLOOR_MIN = 0.25f
         /** Hard upper bound on the accumulator floor. The prior fixed 0.5 was
          *  too tight for non-person classes (chair's live-vs-gallery band sits
-         *  at 0.30-0.50). 0.40 keeps person/OSNet locks well-protected (their
-         *  live sim is 0.6+) while leaving headroom for generic classes. */
+         *  at 0.30-0.50). Person/OSNet live sim is 0.6+ so any cap in [0.40,
+         *  0.50] is effectively a no-op for legitimate person tracking — both
+         *  are well below the live band. We pick 0.40 (slightly looser than
+         *  the prior 0.5) so generic classes whose self-recall lands just
+         *  above 0.50 (~0.55-0.65) get a usable floor in [0.35, 0.40] rather
+         *  than being clamped to the prior 0.5 again.
+         *
+         *  Practical impact for person path: a drifted person VT crop at
+         *  lockSim=0.45 would now admit where it was rejected pre-PR. In
+         *  practice this only happens when VT has substantially mistracked,
+         *  and the same crop will trip the centroidSim<0.92 condition or
+         *  the existing geometric/category gates downstream. */
         const val LOCK_SELF_FLOOR_MAX = 0.40f
         /** [TEMPLATE_SIM_LOW] (drift-suspicion threshold) is derived from the
          *  per-lock floor. Below this fraction of lockSelfFloor → counter
@@ -238,8 +248,9 @@ class ReacquisitionEngine(
      *  same pose. The gallery never grew past the initial 5 augmentations,
      *  reacquire candidates scored below the embedding floor, tracking
      *  rate fell from 76% to 25-42%. Person/OSNet sits at 0.6-0.85 so the
-     *  prior 0.5 floor was fine; the adaptive floor recovers the same
-     *  behavior for that path via the upper clamp. */
+     *  prior 0.5 floor was effectively a no-op there; the adaptive floor
+     *  caps at [LOCK_SELF_FLOOR_MAX] = 0.40 which is also well below 0.6
+     *  — practical behavior unchanged for legitimate person tracking. */
     var lockSelfFloor: Float = LOCK_SELF_FLOOR_DEFAULT
         private set
     /** Centroid (L2-normalized mean) of the gallery — stable identity representation. */
