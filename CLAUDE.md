@@ -17,7 +17,7 @@ All changes follow this flow — never commit directly to master:
 
 ```bash
 ./gradlew assembleDebug          # Build debug APK
-./gradlew testDebugUnitTest      # Run unit tests (~3s, 184 tests)
+./gradlew testDebugUnitTest      # Run unit tests (~3s, 301 tests)
 adb install -r app/build/outputs/apk/debug/app-debug.apk  # Deploy to device
 
 adb logcat -d -s "Reacq" -s "VisualTracker" -s "FTFTracker"  # Pull tracking logs
@@ -40,16 +40,25 @@ app/src/main/java/com/haptictrack/
 │   └── DeviceOrientationListener.kt         # Accelerometer-based rotation detection
 ├── tracking/                                 # ← most of the complexity lives here
 │   ├── ObjectTracker.kt                     # Orchestrator: wires detector, VT, embedder, reacq
-│   ├── ReacquisitionEngine.kt               # Scoring logic (6 weighted signals + overrides)
-│   ├── AppearanceEmbedder.kt                # MobileNetV3 embedding + gallery augmentation
+│   ├── ReacquisitionEngine.kt               # Cascade scoring: hard category gate, z-norm calibration, ROSTER_REJECT
+│   ├── AppearanceEmbedder.kt                # MobileNetV3 embedding + gallery augmentation (generic ID)
+│   ├── FaceEmbedder.kt                      # MobileFaceNet (face identity, person path)
+│   ├── PersonReIdEmbedder.kt                # OSNet x1.0 MSMT17 (body re-ID, person path)
 │   ├── PersonAttributeClassifier.kt         # Crossroad-0230 + BlazeFace + age-gender
+│   ├── SessionRoster.kt                     # Per-session non-lock person memory (#108) for ROSTER_REJECT
 │   ├── VisualTracker.kt                     # OpenCV VitTracker wrapper
 │   ├── FrameToFrameTracker.kt               # IoU-based detection ID assignment
+│   ├── VelocityEstimator.kt                 # Per-track velocity from box centers
+│   ├── CanonicalCrop.kt                     # Aspect-preserving crop helper for embedders (#100)
 │   ├── DetectionFilter.kt                   # Noise removal (confidence, size, aspect ratio; applied before scoring)
 │   ├── ScenarioRecorder.kt                  # JSON capture for replay testing + serialization helpers
 │   ├── DebugFrameCapture.kt                 # Annotated PNGs + session.log on tracking events
+│   ├── CropDebugCapture.kt                  # Per-embedder canonical-crop dump for audit (#92)
+│   ├── EmbeddingStabilityLogger.kt          # Diagnostic: tracks per-track sim drift over time
+│   ├── FrozenNegatives.kt                   # Cold-start negative pool for the online classifier
+│   ├── CropClassifier.kt                    # MobileViTv2 light classifier (online tentative-confirmation)
 │   ├── ObjectSegmenter.kt                   # magic_touch segmentation for masked crops
-│   ├── EmbeddingUtils.kt                    # Shared: IoU, cosine sim, histogram, model loading
+│   ├── EmbeddingUtils.kt                    # Shared: IoU, cosine sim, histogram, model loading, z-norm helpers
 │   └── TrackingState.kt                     # Data classes: TrackedObject, PersonAttributes, TrackingUiState
 ├── ui/
 │   ├── CameraScreen.kt                      # Compose UI: viewfinder, bounding boxes, controls
@@ -75,9 +84,12 @@ CameraViewModel
 │   ├── VisualTracker          (OpenCV VitTracker: primary frame-to-frame pixel tracking)
 │   ├── MediaPipe Detector     (EfficientDet-Lite2: object detection, 80 COCO classes, every frame)
 │   ├── FrameToFrameTracker    (IoU-based ID assignment for detections)
-│   ├── AppearanceEmbedder     (MobileNetV3: visual identity fingerprint)
+│   ├── AppearanceEmbedder     (MobileNetV3: generic visual identity fingerprint)
+│   ├── FaceEmbedder           (MobileFaceNet: face identity for person path)
+│   ├── PersonReIdEmbedder     (OSNet x1.0 MSMT17: body re-ID for person path)
 │   ├── PersonAttributeClassifier (Crossroad-0230 + BlazeFace + age-gender: person attributes)
-│   ├── ReacquisitionEngine    (scoring: position + size + label + appearance + color + attrs)
+│   ├── SessionRoster          (per-session non-lock person memory → ROSTER_REJECT margin gate)
+│   ├── ReacquisitionEngine    (cascade scoring: hard category gate + z-norm calibration + ranking)
 │   ├── ScenarioRecorder       (captures processFrame inputs as JSON for replay testing)
 │   ├── DetectionFilter        (noise removal)
 │   └── DebugFrameCapture      (saves annotated frames + session logs on tracking events)
@@ -92,22 +104,24 @@ CameraViewModel
 2. `DeviceOrientationListener` provides physical rotation → bitmap rotated to upright
 3. `VisualTracker` (VitTracker) updates the locked object's position by pixel correlation
 4. Detector runs in parallel to cross-check — if detector confirms the label at the tracker's box, tracking continues
-5. Every 5 frames, the current VT crop is embedded and compared against the lock gallery — primary drift signal (catches drift even when the detector can't see the target)
-6. 3 consecutive template mismatches (sim < 0.4) OR 10 frames without detector confirmation → drift detected, visual tracker stopped
+5. Every 5 frames, the current VT crop is embedded and compared against the lock gallery — primary drift signal (catches drift even when the detector can't see the target). The mismatch threshold (`templateLow`) is per-lock, derived from gallery self-recall (`lockSelfFloor × 0.75`)
+6. 3 consecutive template mismatches OR 10 frames without detector confirmation → drift detected. If a same-category detector box covers VT but the VT box has both grown ≥1.3× since lock and is ≥1.3× the detector box, VT is reseated on the smallest matched detection instead of killed (handles VT runaway during legitimate zoom)
 
 **Re-acquisition (object lost):**
 1. Detector runs, `FrameToFrameTracker` assigns stable IDs via IoU matching
-2. `AppearanceEmbedder` computes visual fingerprints for all candidates (async pipeline; synchronous fallback for the closest same-category candidate when the async cache can't bridge across frames during rotation)
+2. `AppearanceEmbedder` computes generic embeddings; for person candidates, `FaceEmbedder` and `PersonReIdEmbedder` add face + body re-ID embeddings (async pipeline; synchronous fallback for the closest same-category candidate when the async cache can't bridge across frames during rotation)
 3. `DetectionFilter` runs before scoring to strip truly full-frame detections (area > 0.85) — tentative confirmation handles flickering phantoms structurally
-4. `ReacquisitionEngine` gates candidates on person/not-person binary category, then ranks on embedding similarity + color histogram + position + size + person attributes
-5. Strong embedding match (>0.7 cosine similarity) overrides position/size hard thresholds
-6. Best candidate above `minScoreThreshold` becomes the new lock; visual tracker re-initializes
-7. `ScenarioRecorder` captures every frame's detections and events as JSON for replay testing
+4. `ReacquisitionEngine` applies a **hard person/not-person category gate** (no override — cross-category candidates are rejected outright), then ranks survivors using z-score-calibrated embedding similarities (Phase 4: raw cosine is mapped through a sigmoid against the live impostor distribution once the cohort matures)
+5. `SessionRoster` checks each non-lock person slot — if a non-lock body+face score beats the lock by `ROSTER_REJECT_MARGIN`, the candidate is rejected as "more likely a known impostor"
+6. Strong embedding match (raw > 0.7 or z-score > 1.0) overrides position/size hard thresholds (geometric override only; never the category gate)
+7. Best candidate above `minScoreThreshold` becomes the new lock; visual tracker re-initializes
+8. `ScenarioRecorder` captures every frame's detections and events as JSON for replay testing
 
 **Recording (4K mode):**
 1. Recording toggles VideoCapture on/off — no rebind or mode switching needed
 2. Frames always come from the SurfaceTexture GL pipeline, same as normal tracking
 3. 4K recording is always available since the pipeline uses only 2 streams (preview + video)
+4. Tap-to-lock auto-starts recording (PR #111) — the first lock in a session begins capture so users don't miss the moment
 
 **Stealth mode:**
 - Black overlay covers the preview — purely a UI layer (opaque black Box in Compose)
@@ -219,71 +233,118 @@ FloatArrays are encoded as base64 little-endian IEEE 754 (compact: ~1KB for 256-
 
 `ReacquisitionEngine.scoreCandidate()` uses DeepSORT-style cascade gates instead of a weighted average. Wrong-category candidates are rejected outright — no amount of color or position similarity can rescue them.
 
-### Gate A: Geometric hard filters
+### Gate A: Hard person/not-person category gate
+
+The first check, with **no override**. If the locked object is a person and the candidate isn't (or vice versa), the candidate is rejected unconditionally — even a perfect embedding match cannot pass. This replaced the old soft `labelOverride` (PR #119) and structurally eliminates cross-category leaks like the kid-to-wife / boy-to-chair cases.
+
+### Gate B: Geometric hard filters
 
 Candidates are rejected if they fail position/size checks (unless embedding override):
 
 - **Position**: center distance > `effectivePositionThreshold` → reject (threshold expands from 0.25 to 1.5 over 30 frames)
 - **Size**: size ratio > `effectiveSizeRatioThreshold` → reject (threshold expands over time)
-- **Override**: if embedding similarity > 0.7, both position and size filters are bypassed
+- **Override**: if raw embedding similarity > `APPEARANCE_OVERRIDE_THRESHOLD` (0.7) **or** the z-score exceeds `Z_GEOMETRIC_OVERRIDE_THRESHOLD` (1.0), both position and size filters are bypassed
 
-### Gate B: Label gate
+### Gate C: Within-category label gate
 
-Wrong-label candidates are hard-rejected:
+Within the same category, EfficientDet labels still flicker (chair↔couch, bowl↔potted plant). The label gate handles this softly:
 
 | Condition | Result |
 |---|---|
 | `lockedLabel == null` | Pass (no label constraint) |
 | Label matches `lockedLabel` or `lockedCocoLabel` | Pass |
-| Embedding similarity > 0.7 | Pass (label flicker override) |
+| Raw embedding similarity > 0.7 | Pass (label flicker override) |
 | Otherwise | **Reject** |
 
-This is the key behavioral difference from the old weighted average: a person with high color similarity to a locked chair is always rejected (unless embedding says it's actually the same object).
+### Gate D: SessionRoster reject
 
-### Ranking (among gate survivors)
+`SessionRoster` (PR #113) maintains per-session memory of non-lock persons. If a candidate's combined face+body score against a known non-lock slot exceeds `ROSTER_REJECT_FLOOR` (0.55) **and** beats the lock by `ROSTER_REJECT_MARGIN` (0.07), the candidate is rejected — the model thinks this is a known impostor, not the locked person.
 
-Survivors are ranked with embedding as the primary signal:
+### Ranking (among gate survivors): Phase 4 z-norm
 
-**With embeddings:**
-| Signal | Weight | Notes |
+Embedding similarities are **calibrated to z-scores** against the live impostor distribution before scoring (PR #119). The cascade ranks on z-mapped scores, not raw cosine:
+
+```
+z = (rawCosine - mean) / max(stddev, Z_SIGMA_FLOOR)
+calibratedScore = sigmoid((z - 1) × 1)   // Z_SCORE_MIDPOINT=1.0, Z_SCORE_SCALE=1.0
+```
+
+| z | calibratedScore | meaning |
 |---|---|---|
-| Embedding similarity | 50% (+ unused weight) | Primary identity signal |
-| Position distance | 15% (decays to 0) | Tiebreaker, meaningless after camera moves |
-| Size similarity | 10% | Tiebreaker |
-| Color histogram | 15% (when available) | Same-category discrimination |
-| Person attributes | 10% (when available) | Same-person discrimination |
-| Label bonus | +0.05 | Exact match preferred over embedding-override pass |
+| -1 | 0.12 | weak impostor |
+| 0 | 0.27 | impostor mean |
+| 1 | 0.50 | boundary |
+| 2 | 0.73 | typical same-person |
+| 3 | 0.88 | strong same-person |
 
-**Without embeddings (fallback):**
-Position (50%, decays) + size (25%) + base bonus (25%). All survivors already passed the label gate.
+z-norm activates per-modality once that modality's cohort has ≥ `MIN_COHORT_FOR_ZNORM` (5) negative samples. Below the threshold, the cascade falls back to raw cosine — typical for single-person scenes that never accumulate enough impostors.
+
+**With z-norm active (multi-person scenes):**
+- `hasFace` and `hasReId` person paths use `calibratedFromZ()` for face + body re-ID
+- `hasAppearance` (non-person) path stays on raw cosine — the Phase 2 calibration was person-vs-person, the non-person cohort isn't calibrated
+- Position (decays), size, color histogram, person attributes contribute at smaller weights
+- Label-bonus (+0.05) still rewards exact label matches over the embedding-override pass
+
+**Without embeddings (fallback):** Position (50%, decays) + size (25%) + base bonus (25%). All survivors already passed the gates above.
 
 ### Where the code lives
 
-- `ReacquisitionEngine.scoreCandidate()` — cascade gates + ranking (~line 259)
-- `ReacquisitionEngine.findBestCandidate()` — scoring loop, picks highest-ranking survivor (~line 206)
-- `ReacquisitionEngine.processFrame()` — top-level: direct match → lost → search → reacquire (~line 124)
+- `ReacquisitionEngine.scoreCandidate()` — cascade gates + ranking (~line 950)
+- `ReacquisitionEngine.findBestCandidate()` — scoring loop, picks highest-ranking survivor
+- `ReacquisitionEngine.processFrame()` — top-level: direct match → lost → search → reacquire
+- `znormToScore()` / `calibratedFromZ()` — sigmoid mapping (~line 430)
+- `SessionRoster` — non-lock person memory and roster-reject gate
 
 ## Current Work (may be stale — verify with git/GitHub)
 
-**Recently merged to master:**
-- PR #54 — Unify on SurfaceTexture pipeline, remove 3-stream mode (#48)
-- PR #52 — Identity: tentative confirmation, ratio test, gallery-relative threshold, online classifier (#50)
-- PR #44 — Velocity estimation + async embeddings + SurfaceTexture recording
-- PR #42 — GPU delegate for all models, FP16 detector, adaptive frame skip, stealth mode, dependency bumps
-- PR #40 — Regression baseline scenarios with quantitative thresholds
-- PR #37 — Manual camera controls: pinch zoom, 4K recording, stealth mode, volume-down hands-free cycle
-- PR #36 — Person identity: face embedding (MobileFaceNet) + body re-ID (OSNet x1.0)
-- PR #31 — Cascade scoring refactor (#30 phases 1+2), scenario recorder + replay harness
-- PR #29 — Two-stage detection (EfficientDet-Lite2 + YOLOv8n-oiv7 label enrichment)
+**Recently merged to master (newest first):**
+- PR #120 — Partial fix for chair tracking regression (#110): adaptive `lockSelfFloor` + dynamic template thresholds + detector-anchor VT reseat
+- PR #119 — Phase 4 (#102): cascade scoring-level z-norm + hard person/not-person category gate
+- PR #118 — OSNet GPU miscompile + cache pollution fixes (#116, #117)
+- PR #115 — `man_multi_person` scenario tests (#114 phases A + C)
+- PR #113 — SessionRoster + OSNet-IBN MSMT17 (Phase 4 of #102, closes #108)
+- PR #112 — Re-id score normalization (Z-norm phases 1+3) (#102)
+- PR #111 — Tap-to-track auto-starts recording
+- PR #105 — Re-id noise floor diagnostics: session.log capture + OSNet gray-bias harness (#102)
+- PR #104 — Gallery accumulator: gate on lockSim, drop the size<8 escape hatch (#103)
+- PR #101 — Canonical-crop preparation: aspect-preserving inputs across all embedders (#100)
+- PR #99 — Audit validation: same-vs-different + crop review (#92 follow-up)
+- PR #97 — Embedding-input audit: instrumentation + visible crops (#92)
+- PR #89 — Scene face-body memory for asymmetric identity gating (#83 phase 2)
+- PR #88 — Ground-truth identity validation for VideoReplayTest
+- PR #87 — Synthetic stock-video tests for person identity (#62)
+- PR #86 — On-device replay tests via production GL pipeline (#85)
+- PR #84 — Identity: face embedding as a gate (#83 phase 1)
+- PR #82 — Drift detection: faster template path via decay + lock-only gallery (#80)
+- PR #79 — Identity: per-lock adaptive embedding floor + classifier cold-start (#68)
+- PR #72 — Identity: gate persons on OSNet, fix self-poisoning negatives (#67)
+- PR #61 / #60 — Pipeline perf: bitmap pool, retention, async PNG, PBO readback (#49)
+- PR #57 / #55 — Drift detection rewrite (#45): template self-verification primary
+- PR #54 — Unified SurfaceTexture pipeline (#48)
 
 **Open issues:**
-- **#43** — Tracking responsiveness for fast-moving subjects (kids, pets)
+- **#117** — OSNet-IBN MSMT17 TFLite conversion produces degenerate output (TFLite GPU InstanceNorm miscompile upstream)
+- **#116** — Walking session: 12 reacqs in 14s, REACQUIRE frames saved upside-down (rotation pipeline half)
+- **#114** — Add real-world multi-person scenario test (post-#113 device session)
+- **#110** — chair_living_room tracking rate regressed 76% → 25% (partially closed by #120, residual on threshold floor)
+- **#109** — Evaluate EdgeFace-XS as MobileFaceNet replacement
+- **#107** — person_playground LOCK records gallery=0 — embedWithAugmentations returning empty
+- **#106** — Evaluate OSNet replacement (SOLIDER / MobileCLIP / OSNet-AIN) — gated on #102 residual
+- **#98** — Min-bbox-size guard at lock time (#92 follow-up)
+- **#94** — Phase 1B (#91): thread masked crop through OSNet (single segmentation pass)
+- **#93** — Phase 1A (#91): face alignment via BlazeFace keypoints
+- **#90** — Detector label-flicker (person→bed) drops lock on unusual postures
+- **#76** — VT init on processing thread (~30-50ms on lock apply)
+- **#75** — Camera-switch leaks ~6MB transient viewfinder bitmaps
+- **#69** — Identity PR3: replace MobileNetV3-Large with MobileCLIP-S2 / DINOv2-small
+- **#65** — FTFTracker ID instability during person search
+- **#59** — Small-object rotation tracking (mouse_desk_rotation 31-36%)
+- **#51** — Better embedding model + supplementary identity signals
 - **#38** — Photo capture + recording speed control
-- **#35** — Auto-lock on predefined criteria (label + attributes)
-- **#30** — Phase 3: more scenario captures
-- **#20** — Upside-down tracking
+- **#35** — Auto-lock on predefined criteria
+- **#27** — Clothing color detection accuracy
 - **#21** — Image stabilization
-- **#27** — Clothing color accuracy
+- **#20** — Tracking when phone held upside down (180° rotation)
 
 ## Key Design Decisions
 
@@ -301,7 +362,28 @@ VitTracker (OpenCV) follows the locked object by pixel correlation — no classi
 The old approach (detector cross-check only) had a structural flaw: "detector found something elsewhere in the frame but not at VT position" was counted as drift evidence, even when the detector simply missed our object (common for small/uniform objects like a yellow bowl). This caused false drift kills on correctly-tracking VT. Research (TLD PAMI 2012, Stark ICCV 2021, DaSiamRPN ECCV 2018) consistently treats the tracker's own self-assessment as the primary drift signal, with the detector as a peer rather than a judge. Template self-verification directly measures "does this crop still look like the locked object" — the right question.
 
 ### Cascade scoring: label as gate, not weight (decided 2026-04-17)
-Replaced the 6-signal weighted average with DeepSORT-style cascade gates. Wrong-label candidates are hard-rejected at the label gate (no amount of color/position can rescue them). Only a strong embedding (>0.7) overrides the label gate, handling genuine label flicker. Survivors are ranked with embedding as the primary signal (50%+), not a balanced weight across all signals. This eliminates the chair→person cross-category leakage that plagued the weighted average.
+Replaced the 6-signal weighted average with DeepSORT-style cascade gates. Wrong-label candidates are hard-rejected at the label gate (no amount of color/position can rescue them). Within a category, a strong embedding (>0.7) overrides the label gate to handle genuine label flicker. Survivors are ranked with embedding as the primary signal (50%+), not a balanced weight across all signals. This eliminated the chair→person cross-category leakage that plagued the weighted average.
+
+### Hard person/not-person category gate (decided 2026-04-29, PR #119)
+Replaced the soft `labelOverride` with a hard person/not-person binary gate. No embedding similarity, no z-score, no position match can rescue a cross-category candidate. The gate fires before any scoring. This was the structural fix for the kid-to-wife / boy-to-chair cases that Phase 1+3 (PR #112) and SessionRoster (PR #113) couldn't close on their own.
+
+### Phase 4 z-norm cascade scoring (decided 2026-04-29, PR #119)
+Re-id scores are calibrated per-modality against the live impostor distribution before the cascade ranks them. Raw cosine → z-score → sigmoid. `Z_SCORE_MIDPOINT=1.0`, `Z_SCORE_SCALE=1.0`. A z-score of 1.0 maps to 0.50; z=2.0 → 0.73; z=3.0 → 0.88. Active in `hasFace` and `hasReId` paths once the impostor cohort matures (`MIN_COHORT_FOR_ZNORM=5`). `hasAppearance` (non-person) stays on raw cosine — calibration is person-vs-person. Single-person scenes never mature the cohort, so they fall back to raw cosine.
+
+### SessionRoster: per-session non-lock person memory (decided 2026-04-28, PR #113)
+For multi-person scenes, the engine maintains memory of non-lock persons (their face + body embeddings, slot IDs). When a candidate's combined non-lock-slot score beats the lock by `ROSTER_REJECT_MARGIN` (0.07) and exceeds `ROSTER_REJECT_FLOOR` (0.55), the candidate is rejected as a known impostor. Closed #108 — the structural fix needed when no fixed cosine threshold separates same-person from different-person on Adreno 740 (OSNet `same_p10 ≈ diff_p99`).
+
+### Scene face-body memory (decided 2026-04-26, PR #89)
+`SessionRoster` is paired memory: each non-lock slot holds both face and body embeddings. When one modality is missing (e.g. detected face but no body crop, or vice versa), the asymmetric veto fires from whichever modality is present, instead of the candidate sneaking through on the missing-modality side.
+
+### Adaptive `lockSelfFloor` (decided 2026-04-30, PR #120)
+Replaced the fixed `GALLERY_ADD_LOCK_SIM_FLOOR=0.5` (introduced in PR #103) with a per-lock adaptive floor: `MIN(pairwise self-recall in lock gallery) × 0.7`, clamped to `[0.25, 0.40]`. The fixed 0.5 sat above the chair's 0.30-0.50 cosine band, so the accumulator never grew the gallery past the initial 5 augmentations. Adaptive floor lets weak-embedder classes (chair, mouse) accumulate while still rejecting clearly-different impostors. The same `lockSelfFloor` drives the dynamic `TEMPLATE_SIM_OK` / `TEMPLATE_SIM_LOW` (`× 0.75`) thresholds — drift detection becomes per-lock instead of one-size-fits-all.
+
+### Detector-anchor VT reseat (decided 2026-04-30, PR #120)
+VitTracker's regression head can let the box grow over time even when tracking is otherwise correct. When the VT box has both grown ≥1.3× since lock **and** is ≥1.3× the matched detector box, VT is reinitialized on the smallest matched same-category detection instead of being killed. Two conditions are required so that legitimate zoom (subject approaches camera, box grows but detector agrees) doesn't trigger reseat.
+
+### Tap-to-track auto-recording (decided 2026-04-29, PR #111)
+The first lock in a session auto-starts video recording so users don't miss the moment between "I see it" and "now I'm pressing record". Volume-down still cycles idle → lock → start recording → stop+clear; tap just starts at step 2 directly.
 
 ### Embedding gallery: augmented + accumulated (decided 2026-04-14)
 At lock time, `AppearanceEmbedder` generates 5 embeddings (original + rotated 90/180/270 + horizontal flip) for immediate multi-angle coverage. During confirmed visual tracking, a new real-world embedding is captured every ~1s. Gallery holds up to 12 embeddings. Re-acquisition compares candidates against the best match in the gallery.
@@ -342,8 +424,8 @@ Always uses 2-stream mode (SurfaceTexture + VideoCapture). Frames for tracking c
 ### Stealth mode: black overlay over SurfaceTexture preview (decided 2026-04-17, updated 2026-04-23)
 Opaque black Box overlays the preview in Compose. SurfaceTexture pipeline provides frames regardless of UI visibility, so stealth is purely a UI concern. User sees black screen with controls.
 
-### Volume-down hands-free cycle (decided 2026-04-17)
-Three-stage cycle on volume-down: idle → lock on center object, tracking → start recording, recording → stop recording + clear. Enables fully hands-free operation: point camera, press volume-down three times.
+### Volume-down hands-free cycle (decided 2026-04-17, simplified 2026-04-29)
+Three-stage cycle on volume-down: idle → lock on center object, tracking → start recording, recording → stop recording + clear. Enables fully hands-free operation: point camera, press volume-down three times. Tap-to-lock now also auto-starts recording on the first lock (PR #111), so the volume-down "lock then start recording" two-press becomes a single press for tap users.
 
 ### GPU delegate for all models (decided 2026-04-18, updated 2026-04-19)
 All 9 ML models run on GPU. EfficientDet-Lite2 switched from INT8 (CPU) to FP16 (GPU) — downloaded from MediaPipe model zoo, same structure (448x448, 90 classes), fewer spurious detections. TFLite models use `createGpuInterpreter()` which returns `GpuInterpreter` (interpreter + delegate pair) with `Throwable` catch for CPU fallback. MediaPipe models use `Delegate.GPU` via `BaseOptions.setDelegate()`. InteractiveSegmenter GPU has a crop size limit — Adreno 740 returns empty masks above ~100K pixels, so large crops are downscaled to ~300x300 before segmenting (MAX_SEGMENT_PIXELS = 90000).
@@ -357,11 +439,13 @@ Two-tier skip interval. **Base regime** (confidence >0.6, confirmed ≥5, 0 unco
 
 | Tag | What it logs |
 |---|---|
-| `Reacq` | LOCK, LOST, SEARCH (with candidate scores + similarity), REACQUIRE (with hop count + sim), TIMEOUT, CLEAR, GIVE_UP, OVERRIDE (when embedding bypasses geometric filters) |
-| `VisualTracker` | INIT (tracker started), LOST (confidence dropped), DRIFT (template mismatch OR unconfirmed frames exceeded), Template mismatch (per-check log when sim below threshold) |
+| `Reacq` | LOCK (with `lockSelfFloor=...`), LOST, SEARCH (candidate scores, raw + z-mapped sims), REACQUIRE (with hop count + sim), TIMEOUT, CLEAR, GIVE_UP, OVERRIDE (geometric override fires), ROSTER_REJECT (non-lock slot beat lock), CATEGORY_REJECT (hard person/not-person gate) |
+| `VisualTracker` | INIT (tracker started), LOST (confidence dropped), DRIFT (template mismatch OR unconfirmed frames exceeded), VT_RESEAT (detector-anchor reinit), Template mismatch (per-check log when sim below threshold) |
+| `SessionRoster` | Slot creation, paired face/body memory updates, asymmetric vetoes |
 | `FTFTracker` | NEW (fresh ID assigned), MATCH (IoU match to previous frame) |
 | `ScenarioRec` | Recording started/stopped, frame count |
 | `AppearEmbed` | Embedding failures, gallery additions |
+| `FaceEmbed` / `ReidEmbed` | Per-modality embedding failures |
 | `EmbedSync` | Synchronous embedding fallback fired for a candidate that missed the async cache |
 | `TFLiteGPU` | GPU delegate activation or CPU fallback per model |
 | `DebugCapture` | Saved debug frame filenames |
@@ -395,18 +479,27 @@ Auto-prunes to 10 sessions max.
 
 ## Test Suite
 
-183 unit tests, all run via Robolectric (no device needed):
+301 unit tests, all run via Robolectric (no device needed):
 
 | Class | Tests | What it covers |
 |---|---|---|
-| `ReacquisitionEngineTest` | 74 | Lock/clear, direct match, cascade gate tests (label gate reject/pass/override, wrong label even with perfect color, embedding ranking, no-embedding fallback, COCO label gate), position decay, size threshold decay, timeout, frame counters, appearance embedding (store/clear, similarity scoring, same-label discrimination, fallback without embeddings, weight after decay), appearance override of geometric filters (size, position, weak embedding), two-truck discrimination, visual tracker handoff, label flicker (strong/weak embedding with mislabeled objects), color histogram scoring, person attribute scoring, face/re-ID tier tests |
-| `ScenarioReplayTest` | 15 | Replay harness validation, real captured scenarios (cup, mouse reacquisition, wrong-category rejection), regression baselines with quantitative thresholds (boy label flicker 67% tracking, person recovery 89% tracking, person↔boy flicker, chair no false-reacquire) |
-| `DetectionFilterTest` | 15 | Confidence cutoff, label requirement, box area limits, aspect ratio limits, negative IDs, edge cases |
+| `ReacquisitionEngineTest` | 101 | Lock/clear, direct match, cascade gate tests (hard category gate, label gate reject/pass/override, wrong label even with perfect color, embedding ranking, no-embedding fallback, COCO label gate), Phase 4 z-norm scoring, position decay, size threshold decay, timeout, frame counters, appearance embedding (store/clear, similarity scoring, same-label discrimination, fallback without embeddings, weight after decay), appearance override of geometric filters (size, position, weak embedding), two-truck discrimination, visual tracker handoff, label flicker, color histogram scoring, person attribute scoring, face/re-ID tier tests, adaptive `lockSelfFloor` clamping/defaults/reset |
+| `ScenarioReplayTest` | 31 | Replay harness validation, real captured scenarios (cup, mouse reacquisition, wrong-category rejection, kid-to-wife panning, man_multi_person, supermarket_checkout), regression baselines with quantitative thresholds |
+| `SessionRosterTest` | 22 | Roster slot creation, paired face+body memory, ROSTER_REJECT margin gate, slot pruning, asymmetric veto |
+| `ZNormTest` | 16 | Z-norm sigmoid mapping, cohort maturation, calibrated-vs-raw selection, hasReId scoring path uses calibrated z-score |
+| `CanonicalCropperTest` | 17 | Aspect-preserving canonical-crop helper for embedders (#100) |
+| `RotationRemapTest` | 18 | Coordinate remapping for all orientations (0/90/180/270), center invariance, round-trip correctness |
+| `DetectionFilterTest` | 16 | Confidence cutoff, label requirement, box area limits, aspect ratio limits, negative IDs, edge cases |
+| `VelocityEstimatorTest` | 14 | Per-track velocity from box centers, decay, reset |
 | `OrientationHysteresisTest` | 13 | Hysteresis dead zones, cardinal stability, rapid oscillation, deliberate transitions |
 | `FrameToFrameTrackerTest` | 10 | IoU computation, ID assignment, persistence across frames, new object detection, disappearance, reset |
-| `RotationRemapTest` | 11 | Coordinate remapping for all orientations (0, 90, 180, 270), center invariance, round-trip correctness |
-| `PersonAttributesTest` | 30 | Attribute similarity scoring, color matching, raw probability comparison |
-| `ZoomControllerTest` | 20 | Zoom in/out/steady, min/max limits, gradual steps, reset, edge proximity, manual zoom (set/clamp/pause/reset) |
+| `PersonAttributesTest` | 19 | Attribute similarity scoring, color matching, raw probability comparison |
+| `ZoomControllerTest` | 24 | Zoom in/out/steady, min/max limits, gradual steps, reset, edge proximity, manual zoom (set/clamp/pause/reset) |
+
+On-device instrumentation tests live in `app/src/androidTest/java/`:
+- `VideoReplayTest` — video-fed end-to-end runs against captured fixtures, tracking-rate thresholds per scenario
+- `OsnetGrayBiasTest` — OSNet output sanity (was the diagnostic harness for #102 noise floor)
+- `VideoGLDecoder` — shared helper for piping mp4 through the production GL pipeline
 
 ### Python model quality tests
 
@@ -433,9 +526,12 @@ Top-level functions used across multiple classes — avoids duplication:
 | Function | Used by |
 |---|---|
 | `computeIou(a, b)` | `FrameToFrameTracker` (delegates), `ObjectTracker` |
-| `loadTfliteModel(context, asset)` | `PersonAttributeClassifier` |
+| `loadTfliteModel(context, asset)` | `PersonAttributeClassifier`, `FaceEmbedder`, `PersonReIdEmbedder`, `CropClassifier` |
 | `cosineSimilarity(a, b)` | `ReacquisitionEngine`, `AppearanceEmbedder` |
 | `bestGallerySimilarity(candidate, gallery)` | `ReacquisitionEngine` |
+| `minPairwiseSimilarity(gallery)` | `ReacquisitionEngine.computeLockSelfFloor()` (#120) |
+| `computeCentroid(gallery)` | `ReacquisitionEngine` (gallery accumulator gate) |
+| `l2Normalize(arr)` | Embedders (post-inference normalization) |
 | `computeColorHistogram(bitmap, box)` | `ObjectTracker` |
 | `histogramCorrelation(a, b)` | `ReacquisitionEngine` |
 | `floatArrayToBase64()` / `base64ToFloatArray()` | `ScenarioRecorder`, `ScenarioReplayTest` |
@@ -445,15 +541,17 @@ Top-level functions used across multiple classes — avoids duplication:
 | Model | File | Size | Precision | Delegate | Purpose |
 |---|---|---|---|---|---|
 | EfficientDet-Lite2 | `efficientdet-lite2-fp16.tflite` | 11.6MB | FP16 | GPU (MediaPipe) | Primary detector (80 COCO classes, every frame) |
-| MobileNetV3 Large | `mobilenet_v3_large_embedder.tflite` | 10MB | FP32 | GPU (MediaPipe) | Visual embedding (1280-dim) |
-| VitTracker | `vitTracker.onnx` | 0.7MB | FP32 | CPU (OpenCV DNN) | Visual frame-to-frame tracker |
+| MobileNetV3 Large | `mobilenet_v3_large_embedder.tflite` | 10.4MB | FP32 | GPU (MediaPipe) | Generic visual embedding (1280-dim) |
+| MobileViTv2-0.75 (embedder) | `mobilevitv2_075_embedder.tflite` | 9.8MB | FP32 | GPU (TFLite) | Alternative generic embedder (canonical-crop work, #91) |
+| MobileViTv2-0.75 (classifier) | `mobilevitv2_075_classifier.tflite` | 11.3MB | FP32 | GPU (TFLite) | Online classifier for tentative confirmation |
+| VitTracker | `object_tracking_vittrack_2023sep.onnx` | 0.7MB | FP32 | CPU (OpenCV DNN) | Visual frame-to-frame tracker |
 | magic_touch | `magic_touch.tflite` | 5.9MB | FP32 | GPU (MediaPipe) | Segmentation for masked crops |
 | Crossroad-0230 | `person_attributes_crossroad_0230.tflite` | 2.8MB | FP32 | GPU (fallback CPU) | Person body attributes (8 binary) |
 | BlazeFace | `blaze_face_short_range.tflite` | 0.2MB | FP32 | GPU (MediaPipe) | Face detection within person crops |
 | age-gender-retail-0013 | `age_gender_retail_0013.tflite` | 4.1MB | FP32 | GPU (fallback CPU) | Face-based gender + age |
-| OSNet x1.0 | `osnet_x1_0_market.tflite` | 4.2MB | FP32 | GPU (fallback CPU) | Person re-ID embedding (512-dim) |
+| OSNet x1.0 MSMT17 | `osnet_x1_0_msmt17.tflite` | 4.2MB | FP32 | GPU (fallback CPU) | Person re-ID embedding (512-dim) — MSMT17 weights, swapped from Market in #113 |
 | MobileFaceNet | `mobilefacenet.tflite` | 5.0MB | FP32 | GPU (fallback CPU) | Face embedding (192-dim) |
-| **Total** | | **~40MB** | | |
+| **Total** | | **~66MB** | | |
 
 ## Dependencies
 
@@ -477,24 +575,52 @@ All in constructor defaults — no settings UI yet:
 | `positionDecayFrames` | ReacquisitionEngine | 30 | Frames for position weight to reach zero |
 | `sizeRatioThreshold` | ReacquisitionEngine | 2.0 | Initial max size difference for candidates |
 | `minScoreThreshold` | ReacquisitionEngine | 0.45 | Minimum score to accept a candidate |
-| `APPEARANCE_OVERRIDE_THRESHOLD` | ReacquisitionEngine | 0.7 | Embedding similarity to bypass geometric filters + smart hop threshold |
+| `APPEARANCE_OVERRIDE_THRESHOLD` | ReacquisitionEngine | 0.7 | Raw cosine to bypass geometric filters + smart hop threshold |
+| `GEOMETRIC_OVERRIDE_THRESHOLD` | ReacquisitionEngine | 0.55 | Lower raw-cosine geometric override (with corroborating signals) |
+| `TENTATIVE_BYPASS_THRESHOLD` | ReacquisitionEngine | 0.65 | Raw cosine to bypass tentative-confirmation N-frame wait |
+| `Z_GEOMETRIC_OVERRIDE_THRESHOLD` | ReacquisitionEngine | 1.0 | Z-score geometric override (alternative to raw 0.7) |
+| `Z_TENTATIVE_BYPASS_THRESHOLD` | ReacquisitionEngine | 1.5 | Z-score tentative bypass |
+| `Z_SCORE_MIDPOINT` | ReacquisitionEngine | 1.0 | Sigmoid midpoint for z→[0,1] mapping (#119) |
+| `Z_SCORE_SCALE` | ReacquisitionEngine | 1.0 | Sigmoid sharpness for z→[0,1] mapping |
+| `Z_SIGMA_FLOOR` | ReacquisitionEngine | 0.05 | Min stddev to avoid divide-by-zero in z-norm |
+| `MIN_COHORT_FOR_ZNORM` | ReacquisitionEngine | 5 | Negative samples per modality before z-norm activates |
+| `PERSON_REID_FLOOR` | ReacquisitionEngine | 0.45 | Raw OSNet floor on person path |
+| `FACE_FLOOR` | ReacquisitionEngine | 0.40 | Raw face floor on person path |
+| `ROSTER_REJECT_FLOOR` | ReacquisitionEngine | 0.55 | Min non-lock slot score for roster reject (#113) |
+| `ROSTER_REJECT_MARGIN` | ReacquisitionEngine | 0.07 | Margin non-lock slot must beat lock by |
+| `SCENE_FACE_MATCH_FLOOR` | ReacquisitionEngine | 0.40 | Scene-face memory match floor (#89) |
+| `SCENE_FACE_VETO_MARGIN` | ReacquisitionEngine | 0.05 | Face-only asymmetric veto margin |
+| `SCENE_BODY_VETO_MARGIN` | ReacquisitionEngine | 0.10 | Body-only asymmetric veto margin |
+| `LOCK_SELF_FLOOR_DEFAULT` | ReacquisitionEngine | 0.5 | Fallback when gallery has < 2 entries (#120) |
+| `LOCK_SELF_FLOOR_SCALE` | ReacquisitionEngine | 0.7 | Scale factor on min pairwise self-recall |
+| `LOCK_SELF_FLOOR_MIN` | ReacquisitionEngine | 0.25 | Lower clamp on adaptive floor |
+| `LOCK_SELF_FLOOR_MAX` | ReacquisitionEngine | 0.40 | Upper clamp on adaptive floor |
+| `TEMPLATE_SIM_LOW_RATIO` | ReacquisitionEngine | 0.75 | `templateLow = lockSelfFloor × 0.75` |
 | `MAX_GALLERY_SIZE` | ReacquisitionEngine | 12 | Maximum embeddings in the reference gallery |
+| `MAX_NEGATIVE_EXAMPLES` | ReacquisitionEngine | 10 | Cap on stored negative impostor embeddings per modality |
+| `MAX_SCENE_FACE_PAIRS` | ReacquisitionEngine | 16 | Cap on per-session face/body pair memory |
+| `RATIO_TEST_THRESHOLD` | ReacquisitionEngine | 0.85 | Lowe's ratio test threshold (top-1 vs top-2 similarity) |
+| `TENTATIVE_MIN_FRAMES` | ReacquisitionEngine | 3 | Frames a candidate must persist before being accepted as a re-lock |
+| `TENTATIVE_IOU_THRESHOLD` | ReacquisitionEngine | 0.3 | IoU between tentative frames to count as same candidate |
 | `minConfidence` | DetectionFilter | 0.5 | Minimum ML confidence to show detection |
 | `maxBoxArea` | DetectionFilter | 0.85 | Reject full-frame detections only; tentative confirmation catches flickering phantoms |
 | `minIou` | FrameToFrameTracker | 0.2 | Minimum IoU to match across frames |
 | `MIN_CONFIDENCE` | VisualTracker | 0.5 | VitTracker confidence floor |
 | `VT_MAX_UNCONFIRMED` | ObjectTracker | 10 | Frames without detector confirmation → drift (secondary signal) |
 | `TEMPLATE_CHECK_INTERVAL` | ObjectTracker | 5 | Embed VT crop every N frames for self-verification |
-| `TEMPLATE_SIM_THRESHOLD` | ObjectTracker | 0.4 | Similarity below this = drift suspicion |
 | `TEMPLATE_MISMATCH_MAX` | ObjectTracker | 3 | Consecutive low-sim checks → drift (primary signal) |
-| `targetFrameOccupancy` | ZoomController | 0.15 | Target subject size as fraction of frame |
-| `zoomSpeed` | ZoomController | 0.05 | Zoom change per frame |
-| `scoreThreshold` | ObjectTracker (MediaPipe) | 0.5 | MediaPipe detector confidence cutoff |
+| `templateOk` / `templateLow` | ObjectTracker | dynamic | Per-lock from `lockSelfFloor` (no longer static — #120) |
+| `VT_BOX_AREA_MAX_RATIO` | ObjectTracker | 5 | VT box area runaway → kill |
+| `VT_RESEAT_GROWTH_RATIO` | ObjectTracker | 1.3 | Min growth-since-init for VT reseat (#120) |
+| `VT_RESEAT_DISAGREEMENT_RATIO` | ObjectTracker | 1.3 | Min vt-area / det-area for reseat |
 | `VT_SKIP_INTERVAL_BASE` | ObjectTracker | 2 | Default skip interval (50% detector frames) |
 | `VT_SKIP_INTERVAL_STABLE` | ObjectTracker | 3 | Widened interval when VT is long-stable (33% detector frames) |
 | `VT_SKIP_MIN_CONFIRMED` | ObjectTracker | 5 | Min VT confirmations before frame skipping kicks in |
 | `VT_SKIP_STABLE_CONFIRMED` | ObjectTracker | 10 | Confirmations required to switch to the stable skip interval |
 | `VT_SKIP_STABLE_CONFIDENCE` | ObjectTracker | 0.7 | VT confidence required to switch to the stable skip interval |
+| `targetFrameOccupancy` | ZoomController | 0.15 | Target subject size as fraction of frame |
+| `zoomSpeed` | ZoomController | 0.05 | Zoom change per frame |
+| `scoreThreshold` | ObjectTracker (MediaPipe) | 0.5 | MediaPipe detector confidence cutoff |
 
 ## What's Built vs. What's Not
 
@@ -516,28 +642,36 @@ All in constructor defaults — no settings UI yet:
 - [x] Debug frame capture for on-device diagnostics
 - [x] Scenario recording + deterministic replay testing
 - [x] Off-device model quality testing (Python + MediaPipe)
-- [x] Cascade scoring (DeepSORT-style label gate + embedding-primary ranking)
+- [x] Cascade scoring (hard person/not-person category gate + within-category label gate + Phase 4 z-norm calibration)
+- [x] SessionRoster: per-session non-lock person memory + ROSTER_REJECT margin gate (#113)
+- [x] Scene face-body paired memory for asymmetric identity veto (#89)
+- [x] Adaptive `lockSelfFloor` for accumulator + dynamic template thresholds (#120)
+- [x] Detector-anchor VT reseat (handles VitTracker box runaway during legitimate zoom)
 - [x] Loading spinner with per-model status during GPU init
-- [x] Regression baseline scenarios (15 replay tests with quantitative thresholds)
-- [x] 184 unit tests
+- [x] Regression baseline scenarios (31 replay tests with quantitative thresholds)
+- [x] On-device video replay (`VideoReplayTest`) feeding production GL pipeline
+- [x] 301 unit tests
 
 ### Not built yet (from concept doc)
-- [ ] **Scenario replay validation (#30 phase 3)** — capture more real-world scenarios and validate cascade behavior against them. Phase 1 (recorder) and Phase 2 (cascade) are done.
 - [ ] **Pre-roll buffer** — continuously capture last 30-60s so you never miss the moment before recording started
-- [ ] **Quick-start gesture** — double-tap volume button to begin tracking + recording instantly
 - [ ] **Settings UI** — all tunable parameters are constructor defaults with no runtime configuration
 - [ ] **Landscape UI** — the activity is portrait-locked. Detection works in all orientations but the UI doesn't rotate
 - [ ] **Battery/thermal management** — continuous ML + camera + haptics drains battery fast
-- [ ] **Tracking responsiveness (#43)** — fast-moving subjects (kids, pets) cause frequent lost/reacquire cycles. VT drift detection too aggressive, re-acquisition too slow, auto-zoom can't keep up.
+- [ ] **VT refactor / drift-by-detection (#120 follow-up)** — VitTracker regression head lets boxes grow over time; evaluate OSTrack/MixFormerV2/SeqTrack or a JDE-style joint detector+embedder
+- [ ] **Tracking responsiveness for fast subjects** — kids, pets cause frequent lost/reacquire cycles
 - [ ] **Photo capture + recording speed (#38)** — photo interval mode and slow-motion/timelapse
+- [ ] **Auto-lock on predefined criteria (#35)** — lock on label + attributes (e.g. "men in 40s") without tap
 
 ### Known issues
 - InteractiveSegmenter GPU delegate returns empty masks for crops >100K pixels on Adreno 740. Workaround: downscale to ~300x300 before segmenting (MAX_SEGMENT_PIXELS = 90000).
 - TFLite GPU delegate requires both `tensorflow-lite-gpu` and `tensorflow-lite-gpu-api` dependencies (GpuDelegateFactory$Options is in the api artifact).
-- Wrong-label candidates with strong embedding (>0.7) still pass the label gate — this handles genuine label flicker but could theoretically allow cross-category matches if the embedder is confused. In practice, sim>0.7 across categories is rare.
-- Visual tracker (VitTracker) dies quickly on small/transparent objects (bottles, glasses) — confidence drops below 0.25 within 2-3s, forcing unnecessary re-acquisition cycles.
+- OSNet on Adreno 740 has overlapping same-person / different-person distributions (`same_p10 ≈ diff_p99`) — no fixed cosine threshold separates them. SessionRoster + Phase 4 z-norm are the structural answer; raw cosine alone is unreliable.
+- OSNet-IBN MSMT17 conversion to TFLite produces degenerate output (#117). InstanceNorm GPU miscompile upstream; OSNet x1.0 MSMT17 (non-IBN) ships instead. Tools/conversion preserved in `tools/models/tflite/`.
+- VitTracker (regression head) lets boxes grow over time even when tracking is correct. Mitigated by detector-anchor reseat (#120) and `VT_BOX_AREA_MAX_RATIO` kill, but not eliminated — full fix needs a tracker swap.
+- VitTracker dies quickly on small/transparent objects (bottles, glasses) — confidence drops below 0.25 within 2-3s, forcing unnecessary re-acquisition cycles.
+- Walking/handheld sessions with mid-recording rotation produce upside-down REACQUIRE frames (#116). Detection runs on the rotated bitmap but the rest of the pipeline doesn't share the upright transform.
 - Multiple visually similar objects of the same label (several bottles in a bathroom) are hard to distinguish — embedding similarity alone isn't enough.
-- EfficientDet-Lite2 labels flicker across frames (bowl↔potted plant↔toilet). Mitigated by the binary person/not-person gate + embedding identity — specific labels don't drive matching anyway.
+- EfficientDet-Lite2 labels flicker across frames (bowl↔potted plant↔toilet). The hard person/not-person category gate + within-category label flicker override (raw sim > 0.7) handles this — specific labels don't drive matching anyway.
 - Cross-angle re-acquisition weakened when the object looks very different from lock angle. Gallery augmentation + accumulated embeddings help but don't eliminate.
 - OpenCV adds ~10MB to APK (arm64).
 
