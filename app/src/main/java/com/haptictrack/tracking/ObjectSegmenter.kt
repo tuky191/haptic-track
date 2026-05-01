@@ -284,6 +284,86 @@ class ObjectSegmenter(
         }
     }
 
+    /**
+     * Run segmentation and return the tight bounding box of foreground pixels
+     * in normalized source-frame coordinates. Returns null when the bbox is
+     * too large, the mask is low quality, or segmentation fails.
+     *
+     * Cheaper than [extractContour] — no OpenCV contour extraction, just a
+     * pixel-bounds scan over the mask.
+     */
+    @Synchronized
+    fun extractTightBbox(bitmap: Bitmap, normalizedBox: RectF): RectF? {
+        val canonical = cropper.prepare(
+            bitmap, normalizedBox,
+            targetWidth = MODEL_SIZE, targetHeight = MODEL_SIZE,
+        ) ?: return null
+        return try {
+            tightBboxFromCanonical(canonical, bitmap.width, bitmap.height)
+        } catch (e: Exception) {
+            Log.w(TAG, "Tight bbox failed: ${e.message}")
+            null
+        } finally {
+            canonical.bitmap.recycle()
+        }
+    }
+
+    private fun tightBboxFromCanonical(
+        canonical: CanonicalCrop,
+        fullW: Int,
+        fullH: Int,
+    ): RectF? {
+        val srcBox = canonical.sourceBoxNormalized
+        val frac = (srcBox.right - srcBox.left) * (srcBox.bottom - srcBox.top)
+        if (frac > MAX_BBOX_FRACTION) return null
+
+        fillInputBuffer(canonical.bitmap)
+        outputBuffer.rewind()
+        interpreter.run(inputBuffer, outputBuffer)
+
+        outputBuffer.rewind()
+        val mask = FloatArray(MODEL_SIZE * MODEL_SIZE)
+        outputBuffer.asFloatBuffer().get(mask)
+
+        var minMx = MODEL_SIZE
+        var minMy = MODEL_SIZE
+        var maxMx = -1
+        var maxMy = -1
+        var fgCount = 0
+        for (i in mask.indices) {
+            if (mask[i] >= MASK_THRESHOLD) {
+                val mx = i % MODEL_SIZE
+                val my = i / MODEL_SIZE
+                if (mx < minMx) minMx = mx
+                if (mx > maxMx) maxMx = mx
+                if (my < minMy) minMy = my
+                if (my > maxMy) maxMy = my
+                fgCount++
+            }
+        }
+
+        val fgPct = fgCount * 100 / (MODEL_SIZE * MODEL_SIZE)
+        if (fgPct < MIN_USEFUL_FG_PCT || fgPct > MAX_USEFUL_FG_PCT) return null
+        if (maxMx < minMx || maxMy < minMy) return null
+
+        val pad = canonical.padding
+        val drawW = canonical.drawWidth.toFloat()
+        val drawH = canonical.drawHeight.toFloat()
+        if (drawW <= 0f || drawH <= 0f) return null
+        val sc = canonical.sourceCropPx
+
+        fun mapX(mx: Int): Float {
+            val dx = ((mx.toFloat() - pad.left) / drawW).coerceIn(0f, 1f)
+            return (sc.left + dx * sc.width()) / fullW
+        }
+        fun mapY(my: Int): Float {
+            val dy = ((my.toFloat() - pad.top) / drawH).coerceIn(0f, 1f)
+            return (sc.top + dy * sc.height()) / fullH
+        }
+
+        return RectF(mapX(minMx), mapY(minMy), mapX(maxMx + 1), mapY(maxMy + 1))
+    }
+
     fun shutdown() {
         gpu.close()
     }
