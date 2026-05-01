@@ -162,7 +162,12 @@ class ObjectTracker(
      */
     private val VT_RESEAT_GROWTH_RATIO = 1.3f       // condition 1
     private val VT_RESEAT_DISAGREEMENT_RATIO = 1.3f // condition 2
+    private val VT_RESEAT_COOLDOWN = 10 // skip reseat for N frames after one fires
     private var vtLockedBoxArea = 0f  // area of VT's init box (normalized 0..1)
+    private var vtReseatCooldown = 0
+
+    private val bboxSmoother = BboxSmoother()
+    private val TIGHT_BBOX_INTERVAL = 10
 
     /** Async embedding pipeline: compute embeddings on background thread, use results next frame. */
     private val embeddingExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "EmbeddingAsync") }
@@ -372,6 +377,7 @@ class ObjectTracker(
                 cocoLabel = result.label, reIdEmbedding = result.reIdEmb, faceEmbedding = result.faceEmb)
             visualTracker.init(result.snapshotBmp, result.boundingBox)
             vtLockedBoxArea = result.boundingBox.width() * result.boundingBox.height()
+            bboxSmoother.reset()
 
             for (neg in result.sceneNegatives) reacquisition.addSceneNegative(neg)
             for ((face, body) in result.sceneRosterObservations) {
@@ -431,6 +437,8 @@ class ObjectTracker(
         vtFrameCounter = 0
         templateMismatchCount = 0
         vtLockedBoxArea = 0f
+        vtReseatCooldown = 0
+        bboxSmoother.reset()
         velocityEstimator.reset()
         pendingEmbeddings?.cancel(true)
         pendingEmbeddings = null
@@ -547,7 +555,7 @@ class ObjectTracker(
                         //   - detector skipped this frame (matchedDet null)
                         //   - VT and detector agree on size (legitimate zoom)
                         //   - detector reports LARGER box (some other path; not our concern)
-                        if (matchedDet != null) {
+                        if (matchedDet != null && vtReseatCooldown <= 0) {
                             val detBox = matchedDet.boundingBox
                             val detArea = detBox.width() * detBox.height()
                             val vtArea = vtBox.width() * vtBox.height()
@@ -565,6 +573,7 @@ class ObjectTracker(
                                 // doesn't immediately fire on this frame's drifted
                                 // crop (rotated-coord rawBox is the inflated VT box).
                                 vtConfirmedFrames = 0
+                                vtReseatCooldown = VT_RESEAT_COOLDOWN
                                 // Swap working boxes for downstream embedding/sync so
                                 // this frame's accumulator and template-check operate
                                 // on detector-confirmed pixels, not the runaway crop.
@@ -574,6 +583,7 @@ class ObjectTracker(
                                 android.util.Log.d("VisualTracker", "VT_RESEAT growth=${"%.2fx".format(growthRatio)} disagreement=${"%.2fx".format(disagreementRatio)}")
                             }
                         }
+                        if (vtReseatCooldown > 0) vtReseatCooldown--
 
                         // Sync lastKnownBox and velocity in screen coords when detector confirms
                         reacquisition.updateFromVisualTracker(vtBox)
@@ -780,16 +790,52 @@ class ObjectTracker(
                         vtLockedBoxArea = 0f
                         // Fall through to detector path below
                     } else {
+                        // --- Tight bbox from segmentation (option C) ---
+                        // Offset from template checks (multiples of 5) to spread GPU load.
+                        var tightBbox: RectF? = null
+                        if (vtFrameCounter % TIGHT_BBOX_INTERVAL == 3) {
+                            val rawTight = appearanceEmbedder.extractTightBbox(bitmap, rawBox)
+                            if (rawTight != null) {
+                                tightBbox = unmapRotation(
+                                    rawTight.left, rawTight.top, rawTight.right, rawTight.bottom, deviceRot
+                                )
+                            }
+                        }
+
+                        // --- Bbox smoothing (A + B + C) ---
+                        // VT tracks center well; dimensions come from the best source this frame.
+                        val sizeSource: BboxSmoother.SizeSource
+                        val sizeW: Float
+                        val sizeH: Float
+                        when {
+                            tightBbox != null -> {
+                                sizeSource = BboxSmoother.SizeSource.SEGMENTATION
+                                sizeW = tightBbox.width()
+                                sizeH = tightBbox.height()
+                            }
+                            matchedDet != null -> {
+                                sizeSource = BboxSmoother.SizeSource.DETECTOR
+                                sizeW = matchedDet.boundingBox.width()
+                                sizeH = matchedDet.boundingBox.height()
+                            }
+                            else -> {
+                                sizeSource = BboxSmoother.SizeSource.VT_ONLY
+                                sizeW = vtBox.width()
+                                sizeH = vtBox.height()
+                            }
+                        }
+                        val smoothedBox = bboxSmoother.smooth(vtBox, sizeW, sizeH, sizeSource)
+
                         val lockedObj = TrackedObject(
                             id = reacquisition.lockedId ?: -1,
-                            boundingBox = vtBox,
+                            boundingBox = smoothedBox,
                             label = reacquisition.lastKnownLabel,
                             confidence = vtResult.confidence
                         )
                         // Include the visual tracker's box, but remove detector
                         // boxes that overlap it to avoid duplicate rectangles.
                         val displayObjects = filter.filter(tracked)
-                            .filter { FrameToFrameTracker.computeIou(it.boundingBox, vtBox) < 0.3f } + lockedObj
+                            .filter { FrameToFrameTracker.computeIou(it.boundingBox, smoothedBox) < 0.3f } + lockedObj
 
                         // Update contour periodically, unmap from rotated to screen coords
                         if (contourEnabled) {
@@ -1021,6 +1067,15 @@ class ObjectTracker(
                 visualTracker.init(bitmap, lockedObject.boundingBox)
                 vtLockedBoxArea = lockedObject.boundingBox.width() * lockedObject.boundingBox.height()
                 templateMismatchCount = 0
+                // Preserve smoothed size across LOST→REACQUIRE when the
+                // reacquire box is close to the old size (same object, detection
+                // noise). Reset when sizes diverge — wrong reacquire or genuine
+                // scale change; stale smoothed dims would fight the new truth.
+                val reacqW = lockedObject.boundingBox.width()
+                val reacqH = lockedObject.boundingBox.height()
+                if (!bboxSmoother.isCompatible(reacqW, reacqH)) {
+                    bboxSmoother.reset()
+                }
             }
 
             // Retain the frame for debug capture and future lockOnObject calls.
