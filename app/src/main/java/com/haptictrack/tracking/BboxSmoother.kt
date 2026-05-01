@@ -30,6 +30,18 @@ class BboxSmoother {
     }
 
     /**
+     * True when [w]×[h] is close enough to the current smoothed size that
+     * keeping the EMA state is better than reinitializing. When false, the
+     * caller should [reset] before the next [smooth] call.
+     */
+    fun isCompatible(w: Float, h: Float, maxRatio: Float = 2.0f): Boolean {
+        if (!initialized || smoothedWidth <= 0f || smoothedHeight <= 0f) return false
+        val wr = if (w > smoothedWidth) w / smoothedWidth else smoothedWidth / w
+        val hr = if (h > smoothedHeight) h / smoothedHeight else smoothedHeight / h
+        return wr <= maxRatio && hr <= maxRatio
+    }
+
+    /**
      * Returns a bbox with [vtBox]'s center and EMA-smoothed dimensions.
      * [sizeWidth]/[sizeHeight] come from the best available source this frame.
      */

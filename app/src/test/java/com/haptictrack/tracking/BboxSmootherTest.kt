@@ -115,4 +115,30 @@ class BboxSmootherTest {
         assertEquals(0.215f, result.width(), 0.001f)
         assertEquals(0.115f, result.height(), 0.001f)
     }
+
+    @Test
+    fun `isCompatible returns false before initialization`() {
+        assertFalse(smoother.isCompatible(0.2f, 0.2f))
+    }
+
+    @Test
+    fun `isCompatible returns true for similar sizes`() {
+        smoother.smooth(RectF(0.4f, 0.4f, 0.6f, 0.6f), 0.2f, 0.2f, BboxSmoother.SizeSource.DETECTOR)
+        assertTrue(smoother.isCompatible(0.25f, 0.25f))   // 1.25× — within 2×
+        assertTrue(smoother.isCompatible(0.15f, 0.15f))    // 1.33× — within 2×
+    }
+
+    @Test
+    fun `isCompatible returns false for wildly different sizes`() {
+        smoother.smooth(RectF(0.4f, 0.4f, 0.6f, 0.6f), 0.2f, 0.2f, BboxSmoother.SizeSource.DETECTOR)
+        assertFalse(smoother.isCompatible(0.5f, 0.5f))    // 2.5× — exceeds 2×
+        assertFalse(smoother.isCompatible(0.05f, 0.05f))   // 4× — exceeds 2×
+    }
+
+    @Test
+    fun `isCompatible respects custom maxRatio`() {
+        smoother.smooth(RectF(0.4f, 0.4f, 0.6f, 0.6f), 0.2f, 0.2f, BboxSmoother.SizeSource.DETECTOR)
+        assertFalse(smoother.isCompatible(0.35f, 0.35f, maxRatio = 1.5f))  // 1.75× > 1.5×
+        assertTrue(smoother.isCompatible(0.35f, 0.35f, maxRatio = 2.0f))   // 1.75× < 2.0×
+    }
 }

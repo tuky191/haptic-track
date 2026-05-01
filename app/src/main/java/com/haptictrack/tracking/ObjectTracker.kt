@@ -1067,10 +1067,15 @@ class ObjectTracker(
                 visualTracker.init(bitmap, lockedObject.boundingBox)
                 vtLockedBoxArea = lockedObject.boundingBox.width() * lockedObject.boundingBox.height()
                 templateMismatchCount = 0
-                // Don't reset bboxSmoother — same object, just temporarily lost.
-                // The smoothed size from the previous VT window is a better
-                // starting point than the reacquire detection box (which can be
-                // wildly oversized for small objects like mouse).
+                // Preserve smoothed size across LOST→REACQUIRE when the
+                // reacquire box is close to the old size (same object, detection
+                // noise). Reset when sizes diverge — wrong reacquire or genuine
+                // scale change; stale smoothed dims would fight the new truth.
+                val reacqW = lockedObject.boundingBox.width()
+                val reacqH = lockedObject.boundingBox.height()
+                if (!bboxSmoother.isCompatible(reacqW, reacqH)) {
+                    bboxSmoother.reset()
+                }
             }
 
             // Retain the frame for debug capture and future lockOnObject calls.
