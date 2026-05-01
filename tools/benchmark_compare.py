@@ -129,7 +129,7 @@ def _resize_letterbox(img: Image.Image, target_w: int, target_h: int) -> Image.I
     new_w = max(1, int(src_w * scale))
     new_h = max(1, int(src_h * scale))
     resized = img.resize((new_w, new_h), Image.BILINEAR)
-    canvas = Image.new("RGB", (target_w, target_h), (114, 114, 114))
+    canvas = Image.new("RGB", (target_w, target_h), (128, 128, 128))
     canvas.paste(resized, ((target_w - new_w) // 2, (target_h - new_h) // 2))
     return canvas
 
@@ -160,8 +160,14 @@ def build_tflite_embedder(model_path: str) -> EmbedFn:
         import tflite_runtime.interpreter as tflite
         Interpreter = tflite.Interpreter
     except ImportError:
-        import tensorflow as tf
-        Interpreter = tf.lite.Interpreter
+        try:
+            import tensorflow as tf
+            Interpreter = tf.lite.Interpreter
+        except ImportError:
+            raise ImportError(
+                "tflite backend requires tflite-runtime or tensorflow: "
+                "pip install tflite-runtime  (or)  pip install tensorflow"
+            )
 
     interpreter = Interpreter(model_path=model_path)
     interpreter.allocate_tensors()
@@ -191,11 +197,17 @@ def build_tflite_embedder(model_path: str) -> EmbedFn:
             feat = feat / n
         return feat
 
+    embed._close = lambda: None
     return embed
 
 
 def build_onnx_embedder(model_path: str) -> EmbedFn:
-    import onnxruntime as ort
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        raise ImportError(
+            "onnx backend requires onnxruntime: pip install onnxruntime"
+        )
 
     sess = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
     inp = sess.get_inputs()[0]
@@ -222,6 +234,7 @@ def build_onnx_embedder(model_path: str) -> EmbedFn:
             feat = feat / n
         return feat
 
+    embed._close = lambda: None
     return embed
 
 
