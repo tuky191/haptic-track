@@ -223,9 +223,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         val state = _uiState.value
 
         if (state.isRecording) {
-            // Recording → stop recording and clear
+            // Recording → stop recording (toggleRecording also clears tracking)
             toggleRecording()
-            clearTracking()
             return
         }
 
@@ -293,6 +292,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         if (!isTrackerReady) return
         if (recordingManager.isRecording) {
             recordingManager.stopRecording()
+            if (_uiState.value.status != TrackingStatus.IDLE) {
+                clearTracking()
+            }
         } else {
             // No camera rebind needed — SurfaceTexture pipeline is always active.
             // Just start recording on the existing VideoCapture.

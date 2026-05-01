@@ -62,7 +62,8 @@ class CameraManager(private val context: Context) {
     /** Callback for viewfinder display frames from SurfaceTexture (GL thread, ~29fps). */
     var onViewfinderFrame: ((android.graphics.Bitmap) -> Unit)? = null
 
-    val preview = Preview.Builder().build()
+    var preview = Preview.Builder().build()
+        private set
 
     private val videoExecutor = Executors.newSingleThreadExecutor()
     var videoCapture = createVideoCapture()
@@ -126,6 +127,21 @@ class CameraManager(private val context: Context) {
 
         val selector = if (isFrontCamera) CameraSelector.DEFAULT_FRONT_CAMERA
                        else CameraSelector.DEFAULT_BACK_CAMERA
+
+        // Rebuild Preview with stabilization if the device supports it.
+        val previewBuilder = Preview.Builder()
+        try {
+            val caps = Preview.getPreviewCapabilities(provider.getCameraInfo(selector))
+            if (caps.isStabilizationSupported) {
+                previewBuilder.setPreviewStabilizationEnabled(true)
+                Log.i(TAG, "Preview stabilization enabled (ISP-level EIS)")
+            } else {
+                Log.i(TAG, "Preview stabilization not supported on this device")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to query stabilization caps: ${e.message}")
+        }
+        preview = previewBuilder.build()
 
         // Always route Preview to SurfaceTextureFrameReader for fast off-thread frame capture.
         // 2-stream binding (preview + video) enables 4K recording.
