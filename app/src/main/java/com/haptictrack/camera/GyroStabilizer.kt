@@ -44,7 +44,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     private var fyUv: Double = fxUv
 
     /** Crop zoom applied to absorb warp margins (1.0 = no crop, 1.05 = 5% crop). */
-    var cropZoom: Float = 1.05f
+    var cropZoom: Float = 1.10f
 
     /** Current stabilization matrix in column-major order for GL (mat3). Identity when disabled. */
     private val currentMatrix = AtomicReference(IDENTITY_MATRIX.clone())

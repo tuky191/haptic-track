@@ -285,6 +285,13 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         _uiState.update { it.copy(gyroEis = newValue) }
     }
 
+    fun setGyroStrength(strength: Float) {
+        val clamped = strength.coerceIn(0f, 1f)
+        // Map 0..1 strength to timeConstant: 1.0 = aggressive (0.04s), 0.0 = light (0.30s)
+        cameraManager.gyroStabilizer.timeConstant = (0.30 - 0.26 * clamped)
+        _uiState.update { it.copy(gyroStrength = clamped) }
+    }
+
     fun switchCamera() {
         clearTracking()
         cameraManager.switchCamera()
@@ -296,7 +303,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         zoomController.reset()
         hapticManager.updateTrackingStatus(TrackingStatus.IDLE)
         _uiState.update {
-            TrackingUiState(status = TrackingStatus.IDLE, isRecording = it.isRecording, captureMode = it.captureMode, stealthMode = it.stealthMode, isReady = it.isReady, ispStabilization = it.ispStabilization, gyroEis = it.gyroEis)
+            TrackingUiState(status = TrackingStatus.IDLE, isRecording = it.isRecording, captureMode = it.captureMode, stealthMode = it.stealthMode, isReady = it.isReady, ispStabilization = it.ispStabilization, gyroEis = it.gyroEis, gyroStrength = it.gyroStrength)
         }
     }
 

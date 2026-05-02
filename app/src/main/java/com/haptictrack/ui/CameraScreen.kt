@@ -416,8 +416,10 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                     StabilizationToggles(
                         ispEnabled = uiState.ispStabilization,
                         gyroEnabled = uiState.gyroEis,
+                        gyroStrength = uiState.gyroStrength,
                         onToggleIsp = { viewModel.toggleIspStabilization() },
                         onToggleGyro = { viewModel.toggleGyroEis() },
+                        onGyroStrengthChange = { viewModel.setGyroStrength(it) },
                         modifier = Modifier
                             .align(Alignment.TopStart)
                             .padding(top = 110.dp, start = 16.dp)
@@ -777,13 +779,36 @@ private fun ModeLabel(text: String, selected: Boolean) {
 private fun StabilizationToggles(
     ispEnabled: Boolean,
     gyroEnabled: Boolean,
+    gyroStrength: Float,
     onToggleIsp: () -> Unit,
     onToggleGyro: () -> Unit,
+    onGyroStrengthChange: (Float) -> Unit,
     modifier: Modifier = Modifier
 ) {
     Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(6.dp)) {
         StabToggle("ISP", ispEnabled, onToggleIsp)
         StabToggle("Gyro", gyroEnabled, onToggleGyro)
+        if (gyroEnabled) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .background(Color.Black.copy(alpha = 0.5f), RoundedCornerShape(16.dp))
+                    .padding(horizontal = 8.dp)
+            ) {
+                Text("Lo", color = Color.White.copy(alpha = 0.6f), fontSize = 10.sp)
+                androidx.compose.material3.Slider(
+                    value = gyroStrength,
+                    onValueChange = onGyroStrengthChange,
+                    modifier = Modifier.weight(1f).height(32.dp),
+                    colors = androidx.compose.material3.SliderDefaults.colors(
+                        thumbColor = Color.White,
+                        activeTrackColor = Color.White.copy(alpha = 0.6f),
+                        inactiveTrackColor = Color.White.copy(alpha = 0.2f)
+                    )
+                )
+                Text("Hi", color = Color.White.copy(alpha = 0.6f), fontSize = 10.sp)
+            }
+        }
     }
 }
 

@@ -70,5 +70,7 @@ data class TrackingUiState(
     /** ISP-level preview stabilization toggle. */
     val ispStabilization: Boolean = true,
     /** Software gyro-based EIS toggle. */
-    val gyroEis: Boolean = true
+    val gyroEis: Boolean = true,
+    /** Gyro EIS strength 0.0–1.0 (0 = light, 1 = aggressive). */
+    val gyroStrength: Float = 0.5f
 )
