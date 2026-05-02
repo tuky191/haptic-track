@@ -411,6 +411,19 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                     }
                 }
 
+                // Stabilization toggles (idle only)
+                if (uiState.status == TrackingStatus.IDLE) {
+                    StabilizationToggles(
+                        ispEnabled = uiState.ispStabilization,
+                        gyroEnabled = uiState.gyroEis,
+                        onToggleIsp = { viewModel.toggleIspStabilization() },
+                        onToggleGyro = { viewModel.toggleGyroEis() },
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
+                            .padding(top = 110.dp, start = 16.dp)
+                    )
+                }
+
                 // Stealth mode is toggled by volume-up (see MainActivity) — no button.
             }
         }
@@ -758,4 +771,39 @@ private fun ModeLabel(text: String, selected: Boolean) {
             )
             .padding(horizontal = 12.dp, vertical = 4.dp)
     )
+}
+
+@Composable
+private fun StabilizationToggles(
+    ispEnabled: Boolean,
+    gyroEnabled: Boolean,
+    onToggleIsp: () -> Unit,
+    onToggleGyro: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        StabToggle("ISP", ispEnabled, onToggleIsp)
+        StabToggle("Gyro", gyroEnabled, onToggleGyro)
+    }
+}
+
+@Composable
+private fun StabToggle(label: String, enabled: Boolean, onToggle: () -> Unit) {
+    Button(
+        onClick = onToggle,
+        modifier = Modifier.height(32.dp),
+        shape = RoundedCornerShape(16.dp),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = if (enabled) Color.White.copy(alpha = 0.25f)
+                             else Color.Black.copy(alpha = 0.5f)
+        ),
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 0.dp)
+    ) {
+        Text(
+            text = "$label ${if (enabled) "ON" else "OFF"}",
+            color = if (enabled) Color.White else Color.White.copy(alpha = 0.5f),
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Medium
+        )
+    }
 }

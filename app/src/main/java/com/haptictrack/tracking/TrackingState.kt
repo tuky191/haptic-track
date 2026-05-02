@@ -66,5 +66,9 @@ data class TrackingUiState(
     /** True once all ML models are loaded and ready. */
     val isReady: Boolean = false,
     /** Loading status messages shown during model init. */
-    val loadingStatus: String = "Initializing..."
+    val loadingStatus: String = "Initializing...",
+    /** ISP-level preview stabilization toggle. */
+    val ispStabilization: Boolean = true,
+    /** Software gyro-based EIS toggle. */
+    val gyroEis: Boolean = true
 )

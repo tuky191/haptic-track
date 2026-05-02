@@ -43,6 +43,9 @@ class CameraManager(private val context: Context) {
     /** Software gyro-based EIS, stacks on top of ISP stabilization. */
     val gyroStabilizer = GyroStabilizer(context)
 
+    /** Whether to request ISP-level preview stabilization on next bind. */
+    var ispStabilizationEnabled: Boolean = true
+
     /** Current lens facing — back by default. */
     var isFrontCamera: Boolean = false
         private set
@@ -114,6 +117,12 @@ class CameraManager(private val context: Context) {
         Log.i(TAG, "Switched to ${if (isFrontCamera) "front" else "back"} camera")
     }
 
+    fun rebind() {
+        val owner = lifecycleOwnerRef ?: return
+        val view = previewViewRef ?: return
+        bindUseCases(owner, view)
+    }
+
     /**
      * Rebind camera use cases. Always uses 2-stream (Preview + VideoCapture) with
      * SurfaceTextureFrameReader providing both analysis and viewfinder frames.
@@ -133,27 +142,25 @@ class CameraManager(private val context: Context) {
         val selector = if (isFrontCamera) CameraSelector.DEFAULT_FRONT_CAMERA
                        else CameraSelector.DEFAULT_BACK_CAMERA
 
-        // Rebuild Preview with stabilization if the device supports it.
-        // ISP and gyro EIS are mutually exclusive — ISP is higher quality (has
-        // rolling-shutter correction + sub-pixel accuracy), so prefer it when
-        // available and fall back to software gyro EIS otherwise.
+        // ISP stabilization and gyro EIS are independently togglable.
         val previewBuilder = Preview.Builder()
-        var ispStabilized = false
-        try {
-            val caps = Preview.getPreviewCapabilities(provider.getCameraInfo(selector))
-            if (caps.isStabilizationSupported) {
-                previewBuilder.setPreviewStabilizationEnabled(true)
-                ispStabilized = true
-                Log.i(TAG, "Preview stabilization enabled (ISP-level EIS)")
-            } else {
-                Log.i(TAG, "Preview stabilization not supported on this device")
+        if (ispStabilizationEnabled) {
+            try {
+                val caps = Preview.getPreviewCapabilities(provider.getCameraInfo(selector))
+                if (caps.isStabilizationSupported) {
+                    previewBuilder.setPreviewStabilizationEnabled(true)
+                    Log.i(TAG, "ISP stabilization ON")
+                } else {
+                    Log.i(TAG, "ISP stabilization requested but not supported on this device")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to query stabilization caps: ${e.message}")
             }
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to query stabilization caps: ${e.message}")
+        } else {
+            Log.i(TAG, "ISP stabilization OFF (user toggle)")
         }
-        gyroStabilizer.enabled = !ispStabilized
         gyroStabilizer.readCameraIntrinsics(context, frontFacing = isFrontCamera)
-        Log.i(TAG, "Gyro EIS ${if (gyroStabilizer.enabled) "active (no ISP)" else "disabled (ISP active)"}")
+        Log.i(TAG, "Gyro EIS ${if (gyroStabilizer.enabled) "ON" else "OFF"}")
         preview = previewBuilder.build()
 
         // Always route Preview to SurfaceTextureFrameReader for fast off-thread frame capture.
