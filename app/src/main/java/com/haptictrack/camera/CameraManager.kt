@@ -40,6 +40,9 @@ class CameraManager(private val context: Context) {
     /** Detected optical zoom limit from physical camera focal lengths. */
     private var opticalZoomMax: Float = DEFAULT_OPTICAL_MAX
 
+    /** Software gyro-based EIS, stacks on top of ISP stabilization. */
+    val gyroStabilizer = GyroStabilizer(context)
+
     /** Current lens facing — back by default. */
     var isFrontCamera: Boolean = false
         private set
@@ -84,11 +87,13 @@ class CameraManager(private val context: Context) {
 
     init {
         opticalZoomMax = detectOpticalZoomMax()
+        gyroStabilizer.readCameraIntrinsics(context)
     }
 
     fun startCamera(lifecycleOwner: LifecycleOwner, previewView: PreviewView) {
         lifecycleOwnerRef = lifecycleOwner
         previewViewRef = previewView
+        gyroStabilizer.start()
         val providerFuture = ProcessCameraProvider.getInstance(context)
         providerFuture.addListener({
             cameraProvider = providerFuture.get()
@@ -144,7 +149,7 @@ class CameraManager(private val context: Context) {
         preview = previewBuilder.build()
 
         // Always route Preview to SurfaceTextureFrameReader for fast off-thread frame capture.
-        // 2-stream binding (preview + video) enables 4K recording.
+        // 2-stream binding (preview + video) — FHD when stabilized, 4K otherwise.
         preview.surfaceProvider = Preview.SurfaceProvider { request ->
             val inputSize = request.resolution // camera's native buffer size (landscape, e.g. 1600x1200)
             // Output in portrait at analysis resolution.
@@ -164,7 +169,8 @@ class CameraManager(private val context: Context) {
                 outputWidth = outW,
                 outputHeight = outH,
                 onFrame = { bitmap -> onAnalysisFrame?.invoke(bitmap) },
-                onViewfinderFrame = { bitmap -> onViewfinderFrame?.invoke(bitmap) }
+                onViewfinderFrame = { bitmap -> onViewfinderFrame?.invoke(bitmap) },
+                stabMatrixProvider = { gyroStabilizer.getMatrix() }
             )
             val readerSurface = reader.start()
             frameReader = reader
@@ -242,6 +248,7 @@ class CameraManager(private val context: Context) {
     }
 
     fun shutdown() {
+        gyroStabilizer.stop()
         frameReader?.stop()
         frameReader = null
         cameraProvider?.unbindAll()
