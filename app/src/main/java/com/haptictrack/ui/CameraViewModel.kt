@@ -272,6 +272,19 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         toggleStealthMode()
     }
 
+    fun toggleIspStabilization() {
+        val newValue = !_uiState.value.ispStabilization
+        cameraManager.ispStabilizationEnabled = newValue
+        _uiState.update { it.copy(ispStabilization = newValue) }
+        cameraManager.rebind()
+    }
+
+    fun toggleGyroEis() {
+        val newValue = !_uiState.value.gyroEis
+        cameraManager.gyroStabilizer.enabled = newValue
+        _uiState.update { it.copy(gyroEis = newValue) }
+    }
+
     fun switchCamera() {
         clearTracking()
         cameraManager.switchCamera()
@@ -283,7 +296,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         zoomController.reset()
         hapticManager.updateTrackingStatus(TrackingStatus.IDLE)
         _uiState.update {
-            TrackingUiState(status = TrackingStatus.IDLE, isRecording = it.isRecording, captureMode = it.captureMode, stealthMode = it.stealthMode, isReady = it.isReady)
+            TrackingUiState(status = TrackingStatus.IDLE, isRecording = it.isRecording, captureMode = it.captureMode, stealthMode = it.stealthMode, isReady = it.isReady, ispStabilization = it.ispStabilization, gyroEis = it.gyroEis)
         }
     }
 
