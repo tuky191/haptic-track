@@ -87,13 +87,15 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     }
 
     /** Read camera intrinsics from Camera2 characteristics. */
-    fun readCameraIntrinsics(context: Context) {
+    fun readCameraIntrinsics(context: Context, frontFacing: Boolean = false) {
+        val targetFacing = if (frontFacing) CameraCharacteristics.LENS_FACING_FRONT
+                           else CameraCharacteristics.LENS_FACING_BACK
         try {
             val cam2 = context.getSystemService(Context.CAMERA_SERVICE) as Camera2Manager
             for (cameraId in cam2.cameraIdList) {
                 val chars = cam2.getCameraCharacteristics(cameraId)
                 val facing = chars.get(CameraCharacteristics.LENS_FACING)
-                if (facing != CameraCharacteristics.LENS_FACING_BACK) continue
+                if (facing != targetFacing) continue
 
                 val focalLengths = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
                 val sensorSize = chars.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
@@ -189,32 +191,8 @@ class GyroStabilizer(context: Context) : SensorEventListener {
 
     // --- Math utilities ---
 
-    private fun slerp(a: Quat, b: Quat, t: Double): Quat {
-        var dot = a.dot(b)
-        // Ensure shortest path
-        val b2 = if (dot < 0) { dot = -dot; Quat(-b.w, -b.x, -b.y, -b.z) } else b
+    // Smoothing uses the package-level slerp() below.
 
-        return if (dot > 0.9995) {
-            // Very close — use linear interpolation to avoid division by zero
-            Quat(
-                a.w + t * (b2.w - a.w),
-                a.x + t * (b2.x - a.x),
-                a.y + t * (b2.y - a.y),
-                a.z + t * (b2.z - a.z)
-            ).normalized()
-        } else {
-            val theta = acos(dot.coerceIn(-1.0, 1.0))
-            val sinTheta = sin(theta)
-            val wa = sin((1 - t) * theta) / sinTheta
-            val wb = sin(t * theta) / sinTheta
-            Quat(
-                wa * a.w + wb * b2.w,
-                wa * a.x + wb * b2.x,
-                wa * a.y + wb * b2.y,
-                wa * a.z + wb * b2.z
-            ).normalized()
-        }
-    }
 
     /**
      * Compute H = K × R × K⁻¹ in UV [0,1]² coordinates, with crop zoom.
@@ -268,3 +246,28 @@ private val IDENTITY_MATRIX = floatArrayOf(
     0f, 1f, 0f,
     0f, 0f, 1f
 )
+
+internal fun slerp(a: GyroStabilizer.Quat, b: GyroStabilizer.Quat, t: Double): GyroStabilizer.Quat {
+    var dot = a.dot(b)
+    val b2 = if (dot < 0) { dot = -dot; GyroStabilizer.Quat(-b.w, -b.x, -b.y, -b.z) } else b
+
+    return if (dot > 0.9995) {
+        GyroStabilizer.Quat(
+            a.w + t * (b2.w - a.w),
+            a.x + t * (b2.x - a.x),
+            a.y + t * (b2.y - a.y),
+            a.z + t * (b2.z - a.z)
+        ).normalized()
+    } else {
+        val theta = kotlin.math.acos(dot.coerceIn(-1.0, 1.0))
+        val sinTheta = kotlin.math.sin(theta)
+        val wa = kotlin.math.sin((1 - t) * theta) / sinTheta
+        val wb = kotlin.math.sin(t * theta) / sinTheta
+        GyroStabilizer.Quat(
+            wa * a.w + wb * b2.w,
+            wa * a.x + wb * b2.x,
+            wa * a.y + wb * b2.y,
+            wa * a.z + wb * b2.z
+        ).normalized()
+    }
+}
