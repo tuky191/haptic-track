@@ -425,8 +425,7 @@ class SurfaceTextureFrameReader(
         void main() {
             gl_Position = aPosition;
             vec2 camUV = (uTexMatrix * vec4(aTexCoord, 0.0, 1.0)).xy;
-            vec3 stabUV = uStabMatrix * vec3(camUV, 1.0);
-            vTexCoord = stabUV.xy / stabUV.z;
+            vTexCoord = (uStabMatrix * vec3(camUV, 1.0)).xy;
         }
     """.trimIndent()
 

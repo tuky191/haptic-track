@@ -19,7 +19,9 @@ class ObjectTracker(
     val debugCapture: DebugFrameCapture = DebugFrameCapture(context),
     private val visualTracker: VisualTracker = VisualTracker(context),
     /** Provides physical device orientation; set from ViewModel. */
-    var deviceRotationProvider: (() -> Int)? = null
+    var deviceRotationProvider: (() -> Int)? = null,
+    /** Called when a tracking session starts (dir) or ends (null). */
+    var onSessionDir: ((java.io.File?) -> Unit)? = null
 ) {
 
     companion object {
@@ -382,6 +384,7 @@ class ObjectTracker(
             debugCapture.sessionDir?.let { dir ->
                 scenarioRecorder.start(dir, result.trackingId, result.label, result.label,
                     result.boundingBox, result.gallery, result.colorHist)
+                onSessionDir?.invoke(dir)
             }
 
             val locked = TrackedObject(result.trackingId, result.boundingBox, result.label)
@@ -418,6 +421,7 @@ class ObjectTracker(
         }
         val summary = stabilityLogger.flush(debugCapture.sessionDir)
         if (summary != null) lastEmbeddingStabilitySummary = summary
+        onSessionDir?.invoke(null)
         cropDebugCapture.endSession()
         stabilityLogger.clear()
         debugCapture.endSession()

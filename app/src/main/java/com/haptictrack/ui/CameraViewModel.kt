@@ -61,6 +61,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 _uiState.update { it.copy(loadingStatus = status) }
             })
             tracker.deviceRotationProvider = { orientationListener.deviceRotation }
+            tracker.onSessionDir = { dir ->
+                if (dir != null) cameraManager.gyroStabilizer.startSessionLog(dir)
+                else cameraManager.gyroStabilizer.endSessionLog()
+            }
 
             tracker.onDetectionResult = { allObjects, lockedObject, imgWidth, imgHeight, contour ->
                 val previousStatus = _uiState.value.status
@@ -287,8 +291,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     fun setGyroStrength(strength: Float) {
         val clamped = strength.coerceIn(0f, 1f)
-        // Map 0..1 strength to timeConstant: 1.0 = aggressive (0.04s), 0.0 = light (0.30s)
-        cameraManager.gyroStabilizer.timeConstant = (0.30 - 0.26 * clamped)
+        val tc = 0.30 - 0.26 * clamped
+        val crop = 1.05f + 0.15f * clamped
+        cameraManager.gyroStabilizer.timeConstant = tc
+        cameraManager.gyroStabilizer.cropZoom = crop
+        Log.d(TAG, "Gyro strength=${"%.2f".format(clamped)} tc=${"%.3f".format(tc)} crop=${"%.2f".format(crop)}")
         _uiState.update { it.copy(gyroStrength = clamped) }
     }
 
