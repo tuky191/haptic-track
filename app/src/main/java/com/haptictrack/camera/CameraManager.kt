@@ -134,11 +134,16 @@ class CameraManager(private val context: Context) {
                        else CameraSelector.DEFAULT_BACK_CAMERA
 
         // Rebuild Preview with stabilization if the device supports it.
+        // ISP and gyro EIS are mutually exclusive — ISP is higher quality (has
+        // rolling-shutter correction + sub-pixel accuracy), so prefer it when
+        // available and fall back to software gyro EIS otherwise.
         val previewBuilder = Preview.Builder()
+        var ispStabilized = false
         try {
             val caps = Preview.getPreviewCapabilities(provider.getCameraInfo(selector))
             if (caps.isStabilizationSupported) {
                 previewBuilder.setPreviewStabilizationEnabled(true)
+                ispStabilized = true
                 Log.i(TAG, "Preview stabilization enabled (ISP-level EIS)")
             } else {
                 Log.i(TAG, "Preview stabilization not supported on this device")
@@ -146,6 +151,9 @@ class CameraManager(private val context: Context) {
         } catch (e: Exception) {
             Log.w(TAG, "Failed to query stabilization caps: ${e.message}")
         }
+        gyroStabilizer.enabled = !ispStabilized
+        gyroStabilizer.readCameraIntrinsics(context, frontFacing = isFrontCamera)
+        Log.i(TAG, "Gyro EIS ${if (gyroStabilizer.enabled) "active (no ISP)" else "disabled (ISP active)"}")
         preview = previewBuilder.build()
 
         // Always route Preview to SurfaceTextureFrameReader for fast off-thread frame capture.

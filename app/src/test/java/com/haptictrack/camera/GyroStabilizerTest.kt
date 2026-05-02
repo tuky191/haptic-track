@@ -84,20 +84,4 @@ class GyroStabilizerTest {
         assertEquals(0.0, m[1], 1e-6)
         assertEquals(1.0, m[4], 1e-6)
     }
-
-    private fun slerp(a: GyroStabilizer.Quat, b: GyroStabilizer.Quat, t: Double): GyroStabilizer.Quat {
-        var dot = a.dot(b)
-        val b2 = if (dot < 0) { dot = -dot; GyroStabilizer.Quat(-b.w, -b.x, -b.y, -b.z) } else b
-        return if (dot > 0.9995) {
-            GyroStabilizer.Quat(a.w + t * (b2.w - a.w), a.x + t * (b2.x - a.x),
-              a.y + t * (b2.y - a.y), a.z + t * (b2.z - a.z)).normalized()
-        } else {
-            val theta = kotlin.math.acos(dot.coerceIn(-1.0, 1.0))
-            val sinTheta = kotlin.math.sin(theta)
-            val wa = kotlin.math.sin((1 - t) * theta) / sinTheta
-            val wb = kotlin.math.sin(t * theta) / sinTheta
-            GyroStabilizer.Quat(wa * a.w + wb * b2.w, wa * a.x + wb * b2.x,
-              wa * a.y + wb * b2.y, wa * a.z + wb * b2.z).normalized()
-        }
-    }
 }
