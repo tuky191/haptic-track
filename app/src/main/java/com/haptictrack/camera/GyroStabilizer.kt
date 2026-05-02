@@ -8,6 +8,9 @@ import android.hardware.SensorManager
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager as Camera2Manager
 import android.util.Log
+import java.io.File
+import java.io.FileWriter
+import java.io.PrintWriter
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.*
 
@@ -29,8 +32,11 @@ class GyroStabilizer(context: Context) : SensorEventListener {
 
     companion object {
         private const val TAG = "GyroStab"
-        private const val DEFAULT_TIME_CONSTANT = 0.12
+        private const val DEFAULT_TIME_CONSTANT = 0.17
         private const val DEFAULT_HFOV_DEGREES = 75.0
+        private const val TEL_INTERVAL = 200
+        private const val OOB_WARN_COOLDOWN_NS = 2_000_000_000L
+        private const val SENSOR_GAP_THRESHOLD_NS = 100_000_000L
     }
 
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
@@ -44,20 +50,44 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     private var fyUv: Double = fxUv
 
     /** Crop zoom applied to absorb warp margins (1.0 = no crop, 1.05 = 5% crop). */
-    var cropZoom: Float = 1.10f
+    var cropZoom: Float = 1.125f
 
     /** Current stabilization matrix in column-major order for GL (mat3). Identity when disabled. */
     private val currentMatrix = AtomicReference(IDENTITY_MATRIX.clone())
 
     /** Whether stabilization is active. */
     @Volatile
-    var enabled: Boolean = true
+    private var _enabled: Boolean = true
+    var enabled: Boolean
+        get() = _enabled
+        set(value) {
+            if (_enabled != value) {
+                _enabled = value
+                Log.i(TAG, if (value) "ON tc=${"%.3f".format(timeConstant)}" else "OFF")
+                if (!value) currentMatrix.set(IDENTITY_MATRIX.clone())
+                resetTelemetry()
+            }
+        }
 
     private var rawQuat = Quat(1.0, 0.0, 0.0, 0.0)
     private var smoothedQuat = Quat(1.0, 0.0, 0.0, 0.0)
     private var initialized = false
     private var lastTimestampNs = 0L
     private var sampleRate = 200.0
+
+    // Session log file (gyro.log in the tracking session directory)
+    @Volatile
+    private var sessionWriter: PrintWriter? = null
+
+    // Telemetry accumulators (reset every TEL_INTERVAL sensor events)
+    private var telFrames = 0
+    private var telSumAlpha = 0.0
+    private var telSumCorrDeg = 0.0
+    private var telPeakCorrDeg = 0.0
+    private var telPeakExcursion = 0f
+    private var telSumClamp = 0.0
+    private var telWorstGapMs = 0.0
+    private var telLastWarnNs = 0L
 
     fun start() {
         if (rotationSensor == null) {
@@ -70,8 +100,26 @@ class GyroStabilizer(context: Context) : SensorEventListener {
 
     fun stop() {
         sensorManager.unregisterListener(this)
+        Log.i(TAG, "Stopped (was ${if (_enabled) "ON" else "OFF"}, hz=${"%.0f".format(sampleRate)})")
+        endSessionLog()
         initialized = false
         currentMatrix.set(IDENTITY_MATRIX.clone())
+        resetTelemetry()
+    }
+
+    fun startSessionLog(dir: File) {
+        endSessionLog()
+        try {
+            sessionWriter = PrintWriter(FileWriter(File(dir, "gyro.log"), true), true)
+            sessionWriter?.println("# tc=${"%.3f".format(timeConstant)} crop=$cropZoom fx=${"%.3f".format(fxUv)} fy=${"%.3f".format(fyUv)} hz=${"%.0f".format(sampleRate)}")
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to create gyro.log: ${e.message}")
+        }
+    }
+
+    fun endSessionLog() {
+        sessionWriter?.close()
+        sessionWriter = null
     }
 
     /** Get the current stabilization matrix (column-major mat3, 9 floats). Thread-safe. */
@@ -134,7 +182,14 @@ class GyroStabilizer(context: Context) : SensorEventListener {
 
         val dtNs = nowNs - lastTimestampNs
         lastTimestampNs = nowNs
-        if (dtNs <= 0 || dtNs > 500_000_000L) return // skip bad timestamps
+        if (dtNs <= 0) return
+        if (dtNs > SENSOR_GAP_THRESHOLD_NS) {
+            val warn = "SENSOR_GAP dt=${"%.0f".format(dtNs / 1_000_000.0)}ms — reset smoothed"
+            Log.w(TAG, warn)
+            sessionWriter?.println("${System.currentTimeMillis()} WARN $warn")
+            smoothedQuat = rawQuat
+            return
+        }
 
         val dtSec = dtNs / 1_000_000_000.0
         sampleRate = 0.95 * sampleRate + 0.05 * (1.0 / dtSec)
@@ -149,8 +204,44 @@ class GyroStabilizer(context: Context) : SensorEventListener {
 
         // Build homography H = K × R × K⁻¹ in UV [0,1]² space
         val r = correction.toRotationMatrix()
-        val h = computeHomographyUV(r, fxUv, fyUv, cropZoom.toDouble())
+        var h = computeHomographyUV(r, fxUv, fyUv, cropZoom.toDouble())
+
+        // Clamp correction so edge excursion stays within crop margin.
+        // Excess shake passes through rather than creating edge artifacts.
+        val rawExcursion = maxCornerExcursion(h)
+        val cropMargin = (cropZoom - 1f) / 2f
+        var clampRatio = 1.0
+        if (rawExcursion > cropMargin) {
+            clampRatio = (cropMargin / rawExcursion).toDouble()
+            val clamped = slerp(Quat(1.0, 0.0, 0.0, 0.0), correction, clampRatio)
+            h = computeHomographyUV(clamped.toRotationMatrix(), fxUv, fyUv, cropZoom.toDouble())
+        }
         currentMatrix.set(h)
+
+        // --- Telemetry ---
+        val corrAngleDeg = 2.0 * acos(correction.w.coerceIn(-1.0, 1.0)) * (180.0 / PI)
+
+        telFrames++
+        telSumAlpha += alpha
+        telSumCorrDeg += corrAngleDeg
+        if (corrAngleDeg > telPeakCorrDeg) telPeakCorrDeg = corrAngleDeg
+        if (rawExcursion > telPeakExcursion) telPeakExcursion = rawExcursion
+        telSumClamp += clampRatio
+        val dtMs = dtSec * 1000.0
+        if (dtMs > telWorstGapMs) telWorstGapMs = dtMs
+
+        if (telFrames >= TEL_INTERVAL) {
+            val line = "hz=${"%.0f".format(sampleRate)} " +
+                "alpha=${"%.4f".format(telSumAlpha / telFrames)} " +
+                "corrDeg=${"%.2f".format(telSumCorrDeg / telFrames)}/${"%.2f".format(telPeakCorrDeg)} " +
+                "clamp=${"%.0f".format(100.0 * telSumClamp / telFrames)}% " +
+                "excur=${"%.4f".format(telPeakExcursion)}/margin${"%.4f".format(cropMargin)} " +
+                "gap=${"%.1f".format(telWorstGapMs)}ms " +
+                "tc=${"%.3f".format(timeConstant)} crop=${"%.2f".format(cropZoom)}"
+            Log.d(TAG, line)
+            sessionWriter?.println("${System.currentTimeMillis()} $line")
+            resetTelemetry()
+        }
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
@@ -233,6 +324,27 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             result[1], result[4], result[7],
             result[2], result[5], result[8]
         )
+    }
+
+    private fun maxCornerExcursion(colMajorMat3: FloatArray): Float {
+        val m = colMajorMat3
+        var maxExc = 0f
+        for (cu in 0..1) {
+            for (cv in 0..1) {
+                val u = cu.toFloat(); val v = cv.toFloat()
+                val tu = m[0] * u + m[3] * v + m[6]
+                val tv = m[1] * u + m[4] * v + m[7]
+                val exc = maxOf(-tu, tu - 1f, -tv, tv - 1f, 0f)
+                if (exc > maxExc) maxExc = exc
+            }
+        }
+        return maxExc
+    }
+
+    private fun resetTelemetry() {
+        telFrames = 0; telSumAlpha = 0.0; telSumCorrDeg = 0.0
+        telPeakCorrDeg = 0.0; telPeakExcursion = 0f
+        telSumClamp = 0.0; telWorstGapMs = 0.0
     }
 
     private fun hfovToFocalUv(hfovDegrees: Double): Double {

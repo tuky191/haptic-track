@@ -8,6 +8,7 @@ import androidx.camera.core.CameraControl
 import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview
+import androidx.camera.core.UseCaseGroup
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.FallbackStrategy
 import androidx.camera.video.Quality
@@ -52,6 +53,9 @@ class CameraManager(private val context: Context) {
 
     /** Reads frames from Preview surface via OpenGL. Always active. */
     private var frameReader: SurfaceTextureFrameReader? = null
+
+    /** GPU stabilization processor for VideoCapture (gyro EIS on recorded footage). */
+    private var stabProcessor: StabilizationProcessor? = null
 
     /**
      * Callback for analysis frames from SurfaceTexture (processing thread, ~10-12fps).
@@ -139,6 +143,10 @@ class CameraManager(private val context: Context) {
         // Recreate VideoCapture for fresh recorder per session
         videoCapture = createVideoCapture()
 
+        // Release previous stabilization processor
+        stabProcessor?.release()
+        stabProcessor = null
+
         val selector = if (isFrontCamera) CameraSelector.DEFAULT_FRONT_CAMERA
                        else CameraSelector.DEFAULT_BACK_CAMERA
 
@@ -194,13 +202,24 @@ class CameraManager(private val context: Context) {
                 Log.d(TAG, "Preview surface result: ${result.resultCode}")
             }
         }
-        val camera = provider.bindToLifecycle(lifecycleOwner, selector, preview, videoCapture)
+        val useCaseGroupBuilder = UseCaseGroup.Builder()
+            .addUseCase(preview)
+            .addUseCase(videoCapture)
+
+        if (gyroStabilizer.enabled) {
+            val processor = StabilizationProcessor { gyroStabilizer.getMatrix() }
+            stabProcessor = processor
+            useCaseGroupBuilder.addEffect(StabilizationEffect(processor))
+            Log.i(TAG, "Video stabilization effect added to VideoCapture pipeline")
+        }
+
+        val camera = provider.bindToLifecycle(lifecycleOwner, selector, useCaseGroupBuilder.build())
 
         cameraControl = camera.cameraControl
         cameraInfo = camera.cameraInfo
 
         val previewRes = preview.resolutionInfo?.resolution
-        Log.i(TAG, "Bound use cases — preview: $previewRes, frameReader: ${frameReader != null}, mode: always SurfaceTexture (2-stream)")
+        Log.i(TAG, "Bound use cases — preview: $previewRes, frameReader: ${frameReader != null}, gyroVideo: ${stabProcessor != null}")
     }
 
     fun setZoomRatio(ratio: Float) {
@@ -266,6 +285,8 @@ class CameraManager(private val context: Context) {
         gyroStabilizer.stop()
         frameReader?.stop()
         frameReader = null
+        stabProcessor?.release()
+        stabProcessor = null
         cameraProvider?.unbindAll()
     }
 }
