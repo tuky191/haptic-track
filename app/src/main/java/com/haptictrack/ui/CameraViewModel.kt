@@ -269,9 +269,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    /** UI-only overlay; recording and pipeline are unaffected. */
     fun toggleStealthMode() {
-        val entering = !_uiState.value.stealthMode
-        _uiState.update { it.copy(stealthMode = entering) }
+        _uiState.update { it.copy(stealthMode = !it.stealthMode) }
     }
 
     /** Volume-up: toggle stealth mode. Entry/exit point for hands-free stealth. */
