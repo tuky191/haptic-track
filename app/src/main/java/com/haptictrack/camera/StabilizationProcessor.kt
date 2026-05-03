@@ -49,7 +49,7 @@ class StabilizationProcessor(
     private var inputTextureId: Int = 0
     private var inputSurfaceTexture: SurfaceTexture? = null
     private var inputSurface: Surface? = null
-    private var released = false
+    @Volatile private var released = false
 
     // Output (to encoder)
     @Volatile private var outputSurface: Surface? = null
@@ -232,6 +232,7 @@ class StabilizationProcessor(
             outputEglSurface = EGL14.EGL_NO_SURFACE
         }
         outputSurface = null
+        outputSurfaceOutput?.close()
         outputSurfaceOutput = null
     }
 
