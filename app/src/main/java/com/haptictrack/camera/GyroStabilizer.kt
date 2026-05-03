@@ -193,7 +193,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         if (dtNs > SENSOR_GAP_THRESHOLD_NS) {
             val warn = "SENSOR_GAP dt=${"%.0f".format(dtNs / 1_000_000.0)}ms — reset smoothed"
             Log.w(TAG, warn)
-            sessionWriter?.println("${System.currentTimeMillis()} WARN $warn")
+            try { sessionWriter?.println("${System.currentTimeMillis()} WARN $warn") } catch (_: Exception) {}
             smoothedQuat = rawQuat
             return
         }
