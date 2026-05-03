@@ -35,7 +35,6 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         private const val DEFAULT_TIME_CONSTANT = 0.17
         private const val DEFAULT_HFOV_DEGREES = 75.0
         private const val TEL_INTERVAL = 200
-        private const val OOB_WARN_COOLDOWN_NS = 2_000_000_000L
         private const val SENSOR_GAP_THRESHOLD_NS = 100_000_000L
         private const val CLAMP_MARGIN_FRACTION = 0.6
     }
@@ -91,7 +90,6 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     private var telPeakExcursion = 0f
     private var telSumClamp = 0.0
     private var telWorstGapMs = 0.0
-    private var telLastWarnNs = 0L
 
     fun start() {
         if (rotationSensor == null) {
