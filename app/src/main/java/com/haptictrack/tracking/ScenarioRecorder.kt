@@ -66,8 +66,7 @@ class ScenarioRecorder {
         cocoLabel: String?,
         boundingBox: RectF,
         embeddings: List<FloatArray>,
-        colorHistogram: FloatArray?,
-        personAttributes: PersonAttributes?
+        colorHistogram: FloatArray?
     ) {
         lockState = JSONObject().apply {
             put("trackingId", trackingId)
@@ -78,7 +77,6 @@ class ScenarioRecorder {
                 embeddings.forEach { put(floatArrayToBase64(it)) }
             })
             put("colorHistogram", colorHistogram?.let { floatArrayToBase64(it) } ?: JSONObject.NULL)
-            put("personAttributes", personAttributes?.let { attrsToJson(it) } ?: JSONObject.NULL)
         }
         rawFrames = mutableListOf()
         rawEvents = mutableListOf()
@@ -165,25 +163,8 @@ class ScenarioRecorder {
             put("boundingBox", boxToJson(obj.boundingBox))
             put("embedding", obj.embedding?.let { floatArrayToBase64(it) } ?: JSONObject.NULL)
             put("colorHistogram", obj.colorHistogram?.let { floatArrayToBase64(it) } ?: JSONObject.NULL)
-            put("personAttributes", obj.personAttributes?.let { attrsToJson(it) } ?: JSONObject.NULL)
             put("reIdEmbedding", obj.reIdEmbedding?.let { floatArrayToBase64(it) } ?: JSONObject.NULL)
             put("faceEmbedding", obj.faceEmbedding?.let { floatArrayToBase64(it) } ?: JSONObject.NULL)
-        }
-    }
-
-    private fun attrsToJson(attrs: PersonAttributes): JSONObject {
-        return JSONObject().apply {
-            put("isMale", attrs.isMale)
-            put("hasBag", attrs.hasBag)
-            put("hasBackpack", attrs.hasBackpack)
-            put("hasHat", attrs.hasHat)
-            put("hasLongSleeves", attrs.hasLongSleeves)
-            put("hasLongPants", attrs.hasLongPants)
-            put("hasLongHair", attrs.hasLongHair)
-            put("hasCoatJacket", attrs.hasCoatJacket)
-            put("upperColor", attrs.upperColor ?: JSONObject.NULL)
-            put("lowerColor", attrs.lowerColor ?: JSONObject.NULL)
-            put("rawProbabilities", attrs.rawProbabilities?.let { floatArrayToBase64(it) } ?: JSONObject.NULL)
         }
     }
 
@@ -223,23 +204,6 @@ fun jsonToBox(arr: JSONArray): RectF {
     )
 }
 
-/** Deserialize a JSONObject to PersonAttributes. */
-fun jsonToPersonAttributes(obj: JSONObject): PersonAttributes {
-    return PersonAttributes(
-        isMale = obj.getBoolean("isMale"),
-        hasBag = obj.getBoolean("hasBag"),
-        hasBackpack = obj.getBoolean("hasBackpack"),
-        hasHat = obj.getBoolean("hasHat"),
-        hasLongSleeves = obj.getBoolean("hasLongSleeves"),
-        hasLongPants = obj.getBoolean("hasLongPants"),
-        hasLongHair = obj.getBoolean("hasLongHair"),
-        hasCoatJacket = obj.getBoolean("hasCoatJacket"),
-        upperColor = if (!obj.isNull("upperColor")) obj.getString("upperColor") else null,
-        lowerColor = if (!obj.isNull("lowerColor")) obj.getString("lowerColor") else null,
-        rawProbabilities = if (!obj.isNull("rawProbabilities")) base64ToFloatArray(obj.getString("rawProbabilities")) else null
-    )
-}
-
 /** Deserialize a JSONObject to TrackedObject. */
 fun jsonToTrackedObject(obj: JSONObject): TrackedObject {
     return TrackedObject(
@@ -249,7 +213,6 @@ fun jsonToTrackedObject(obj: JSONObject): TrackedObject {
         boundingBox = jsonToBox(obj.getJSONArray("boundingBox")),
         embedding = if (!obj.isNull("embedding")) base64ToFloatArray(obj.getString("embedding")) else null,
         colorHistogram = if (!obj.isNull("colorHistogram")) base64ToFloatArray(obj.getString("colorHistogram")) else null,
-        personAttributes = if (!obj.isNull("personAttributes")) jsonToPersonAttributes(obj.getJSONObject("personAttributes")) else null,
         reIdEmbedding = if (obj.has("reIdEmbedding") && !obj.isNull("reIdEmbedding")) base64ToFloatArray(obj.getString("reIdEmbedding")) else null,
         faceEmbedding = if (obj.has("faceEmbedding") && !obj.isNull("faceEmbedding")) base64ToFloatArray(obj.getString("faceEmbedding")) else null
     )

@@ -73,7 +73,7 @@ class ZNormTest {
     fun `znMnv3Sim returns null when fewer than MIN_COHORT_FOR_ZNORM negatives`() {
         val engine = ReacquisitionEngine()
         engine.lock(1, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
-            listOf(mnv3Unit(0)), null, null, cocoLabel = "person")
+            listOf(mnv3Unit(0)), null, cocoLabel = "person")
 
         // Add 4 negatives — below the 5-negative floor.
         repeat(4) { engine.addSceneNegative(mnv3Unit(it + 1)) }
@@ -86,7 +86,7 @@ class ZNormTest {
     fun `znMnv3Sim returns z-score once cohort reaches MIN_COHORT_FOR_ZNORM`() {
         val engine = ReacquisitionEngine()
         engine.lock(1, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
-            listOf(mnv3Unit(0)), null, null, cocoLabel = "person")
+            listOf(mnv3Unit(0)), null, cocoLabel = "person")
 
         // 5 orthogonal negatives → all cosines against gallery axis 0 are 0,
         // so impostor mean ≈ 0, std at the σ-floor.
@@ -109,7 +109,7 @@ class ZNormTest {
     fun `znMnv3Sim sigma floor clamps homogeneous cohort`() {
         val engine = ReacquisitionEngine()
         engine.lock(1, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
-            listOf(mnv3Unit(0)), null, null, cocoLabel = "person")
+            listOf(mnv3Unit(0)), null, cocoLabel = "person")
 
         // 6 IDENTICAL negatives → variance is exactly 0. Without the σ floor
         // the z-score would be Infinity (divide by zero) — the floor keeps z
@@ -133,7 +133,7 @@ class ZNormTest {
     fun `znMnv3Sim z-score is correct given heterogeneous cohort`() {
         val engine = ReacquisitionEngine()
         engine.lock(1, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
-            listOf(mnv3Unit(0)), null, null, cocoLabel = "person")
+            listOf(mnv3Unit(0)), null, cocoLabel = "person")
 
         // 6 negatives with controlled cosines vs gallery axis 0:
         //   sim values: 0.1, 0.2, 0.3, 0.4, 0.5, 0.6
@@ -160,7 +160,7 @@ class ZNormTest {
         val engine = ReacquisitionEngine()
         // Lock with NO embeddings.
         engine.lock(1, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
-            emptyList(), null, null, cocoLabel = "person")
+            emptyList(), null, cocoLabel = "person")
         repeat(6) { engine.addSceneNegative(mnv3Unit(it)) }
 
         assertNull("Empty gallery → null z", engine.znMnv3Sim(mnv3Unit(0)))
@@ -172,7 +172,7 @@ class ZNormTest {
     fun `znOsnetSim returns null without locked OSNet anchor`() {
         val engine = ReacquisitionEngine()
         engine.lock(1, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
-            listOf(mnv3Unit(0)), null, null, cocoLabel = "person",
+            listOf(mnv3Unit(0)), null, cocoLabel = "person",
             reIdEmbedding = null /* no anchor */)
         // OSNet cohort comes from observePerson — add 6 paired observations
         // so the cohort has 6 OSNet bodies but the lock has no OSNet anchor.
@@ -186,7 +186,7 @@ class ZNormTest {
         val engine = ReacquisitionEngine()
         val lockedReId = osnetUnit(0)
         engine.lock(1, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
-            listOf(mnv3Unit(0)), null, null, cocoLabel = "person",
+            listOf(mnv3Unit(0)), null, cocoLabel = "person",
             reIdEmbedding = lockedReId)
 
         // 6 OSNet negatives all orthogonal to anchor → impostor mean=0, σ≈0
@@ -208,7 +208,7 @@ class ZNormTest {
     fun `znFaceSim returns null without locked face anchor`() {
         val engine = ReacquisitionEngine()
         engine.lock(1, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
-            listOf(mnv3Unit(0)), null, null, cocoLabel = "person",
+            listOf(mnv3Unit(0)), null, cocoLabel = "person",
             faceEmbedding = null /* no anchor */)
         repeat(6) { engine.addScenePersonPair(face = faceUnit(it + 1), body = osnetUnit(it + 1)) }
 
@@ -220,7 +220,7 @@ class ZNormTest {
         val engine = ReacquisitionEngine()
         val lockedFace = faceUnit(0)
         engine.lock(1, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
-            listOf(mnv3Unit(0)), null, null, cocoLabel = "person",
+            listOf(mnv3Unit(0)), null, cocoLabel = "person",
             faceEmbedding = lockedFace)
 
         repeat(6) { engine.addScenePersonPair(face = faceUnit(it + 1), body = osnetUnit(it + 1)) }
@@ -249,7 +249,7 @@ class ZNormTest {
         val lockedReId = osnetUnit(0)
         // Tiny lock box so the candidate (full-frame) has a huge size ratio.
         engine.lock(1, RectF(0.49f, 0.49f, 0.51f, 0.51f), "person",
-            listOf(mnv3Unit(0)), null, null, cocoLabel = "person",
+            listOf(mnv3Unit(0)), null, cocoLabel = "person",
             reIdEmbedding = lockedReId)
         // 6 orthogonal OSNet negatives.
         repeat(6) { engine.addScenePersonPair(face = faceUnit(it + 1), body = osnetUnit(it + 1)) }
@@ -267,7 +267,7 @@ class ZNormTest {
         val engine = ReacquisitionEngine(sizeRatioThreshold = 1.5f)
         val lockedReId = osnetUnit(0)
         engine.lock(1, RectF(0.49f, 0.49f, 0.51f, 0.51f), "person",
-            listOf(mnv3Unit(0)), null, null, cocoLabel = "person",
+            listOf(mnv3Unit(0)), null, cocoLabel = "person",
             reIdEmbedding = lockedReId)
         repeat(6) { engine.addScenePersonPair(face = faceUnit(it + 1), body = osnetUnit(it + 1)) }
 
@@ -284,7 +284,7 @@ class ZNormTest {
         val engine = ReacquisitionEngine(sizeRatioThreshold = 1.5f)
         val lockedReId = osnetUnit(0)
         engine.lock(1, RectF(0.49f, 0.49f, 0.51f, 0.51f), "person",
-            listOf(mnv3Unit(0)), null, null, cocoLabel = "person",
+            listOf(mnv3Unit(0)), null, cocoLabel = "person",
             reIdEmbedding = lockedReId)
         // No negatives added → stats are null → overridePasses falls back
         // to raw-cosine threshold (GEOMETRIC_OVERRIDE_THRESHOLD = 0.55).
@@ -301,7 +301,7 @@ class ZNormTest {
     fun `live stats invalidated by addSceneNegative`() {
         val engine = ReacquisitionEngine()
         engine.lock(1, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
-            listOf(mnv3Unit(0)), null, null, cocoLabel = "person")
+            listOf(mnv3Unit(0)), null, cocoLabel = "person")
 
         repeat(6) { engine.addSceneNegative(mnv3Unit(it + 1)) }
         val stats1 = engine.mnv3LiveStats
@@ -318,7 +318,7 @@ class ZNormTest {
     fun `live stats invalidated by addEmbedding`() {
         val engine = ReacquisitionEngine()
         engine.lock(1, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
-            listOf(mnv3Unit(0)), null, null, cocoLabel = "person")
+            listOf(mnv3Unit(0)), null, cocoLabel = "person")
         repeat(6) { engine.addSceneNegative(mnv3Unit(it + 1)) }
         val statsBefore = engine.mnv3LiveStats!!
 
@@ -350,7 +350,7 @@ class ZNormTest {
             val engine = ReacquisitionEngine()
             val lockedReId = osnetUnit(0)
             engine.lock(1, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
-                listOf(mnv3Unit(0)), null, null, cocoLabel = "person",
+                listOf(mnv3Unit(0)), null, cocoLabel = "person",
                 reIdEmbedding = lockedReId)
             // Impostor bodies: each has OSNet cosine 0.65 against the lock.
             // Distinct second axes (1, 2, 3...) keep them mutually orthogonal
@@ -398,7 +398,7 @@ class ZNormTest {
     fun `clear resets live stats`() {
         val engine = ReacquisitionEngine()
         engine.lock(1, RectF(0.4f, 0.4f, 0.6f, 0.6f), "person",
-            listOf(mnv3Unit(0)), null, null, cocoLabel = "person")
+            listOf(mnv3Unit(0)), null, cocoLabel = "person")
         repeat(6) { engine.addSceneNegative(mnv3Unit(it + 1)) }
         assertNotNull(engine.mnv3LiveStats)
 
