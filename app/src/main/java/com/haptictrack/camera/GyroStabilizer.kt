@@ -50,6 +50,9 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     private var fxUv: Double = hfovToFocalUv(DEFAULT_HFOV_DEGREES)
     private var fyUv: Double = fxUv
 
+    /** Quaternion that rotates correction from device space to camera sensor space. */
+    private var deviceToSensorQuat = sensorOrientationToQuat(90)
+
     /** Crop zoom applied to absorb warp margins (1.0 = no crop, 1.05 = 5% crop). */
     var cropZoom: Float = 1.125f
 
@@ -151,6 +154,9 @@ class GyroStabilizer(context: Context) : SensorEventListener {
                 if (focalLengths != null && focalLengths.isNotEmpty() && sensorSize != null) {
                     setCameraIntrinsics(focalLengths[0], sensorSize.width, sensorSize.height)
                 }
+                val orientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+                deviceToSensorQuat = sensorOrientationToQuat(orientation)
+                Log.i(TAG, "Sensor orientation: ${orientation}° → d2s quat=(${deviceToSensorQuat.w}, ${deviceToSensorQuat.x}, ${deviceToSensorQuat.y}, ${deviceToSensorQuat.z})")
                 break
             }
         } catch (e: Exception) {
@@ -199,9 +205,15 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         val alpha = 1.0 - exp(-(1.0 / sampleRate) / timeConstant)
         smoothedQuat = slerp(smoothedQuat, rawQuat, alpha)
 
-        // Correction: rotation that maps output (smoothed) position to input (raw) position
-        // For each output pixel, "where did this content actually land in the raw frame?"
-        val correction = rawQuat * smoothedQuat.conjugate()
+        // Correction: undo device shake so the output matches the smoothed orientation.
+        // R = raw⁻¹ × smoothed transforms from the raw (shaky) sensor frame to the
+        // smoothed (stable) frame, telling the shader where to sample in the texture.
+        val correctionDevice = rawQuat.conjugate() * smoothedQuat
+
+        // Rotate correction from device coordinate space into camera sensor space.
+        // The sensor is physically rotated (SENSOR_ORIENTATION, typically 90°) from
+        // the device, so the homography's rotation axes must match the sensor frame.
+        val correction = deviceToSensorQuat * correctionDevice * deviceToSensorQuat.conjugate()
 
         // Build homography H = K × R × K⁻¹ in UV [0,1]² space
         val r = correction.toRotationMatrix()
@@ -355,6 +367,11 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     private fun hfovToFocalUv(hfovDegrees: Double): Double {
         val hfovRad = Math.toRadians(hfovDegrees)
         return 1.0 / (2.0 * tan(hfovRad / 2.0))
+    }
+
+    private fun sensorOrientationToQuat(degrees: Int): Quat {
+        val angle = -Math.toRadians(degrees.toDouble())
+        return Quat(cos(angle / 2), 0.0, 0.0, sin(angle / 2))
     }
 }
 
