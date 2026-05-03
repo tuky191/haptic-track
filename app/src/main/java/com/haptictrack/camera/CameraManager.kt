@@ -74,7 +74,7 @@ class CameraManager(private val context: Context) {
     /** Callback for viewfinder display frames from SurfaceTexture (GL thread, ~29fps). */
     var onViewfinderFrame: ((android.graphics.Bitmap) -> Unit)? = null
 
-    var preview = Preview.Builder().build()
+    lateinit var preview: Preview
         private set
 
     private val videoExecutor = Executors.newSingleThreadExecutor()

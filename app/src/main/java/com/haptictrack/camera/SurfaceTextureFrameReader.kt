@@ -424,6 +424,7 @@ class SurfaceTextureFrameReader(
         varying vec2 vTexCoord;
         void main() {
             gl_Position = aPosition;
+            // .xy discards w — valid because the homography keeps w≈1 for small rotations
             vec2 stabUV = (uStabMatrix * vec3(aTexCoord, 1.0)).xy;
             vTexCoord = (uTexMatrix * vec4(stabUV, 0.0, 1.0)).xy;
         }

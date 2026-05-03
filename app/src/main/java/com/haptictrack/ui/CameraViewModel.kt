@@ -45,6 +45,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         private const val TAG = "CameraVM"
         /** Tap target padding in normalized coordinates (~3% of screen on each side). */
         private const val TAP_PADDING = 0.03f
+        private const val GYRO_TC_MAX = 0.30       // time constant at strength=0 (most responsive)
+        private const val GYRO_TC_RANGE = 0.26      // TC swing: TC_MAX - TC_RANGE = 0.04 at strength=1
+        private const val GYRO_CROP_MIN = 1.05f     // crop zoom at strength=0
+        private const val GYRO_CROP_RANGE = 0.15f   // crop swing: 1.05 + 0.15 = 1.20 at strength=1
     }
 
     /** Smooths idle detections by keeping objects alive for a few frames after they disappear. */
@@ -291,8 +295,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     fun setGyroStrength(strength: Float) {
         val clamped = strength.coerceIn(0f, 1f)
-        val tc = 0.30 - 0.26 * clamped
-        val crop = 1.05f + 0.15f * clamped
+        val tc = GYRO_TC_MAX - GYRO_TC_RANGE * clamped
+        val crop = GYRO_CROP_MIN + GYRO_CROP_RANGE * clamped
         cameraManager.gyroStabilizer.timeConstant = tc
         cameraManager.gyroStabilizer.cropZoom = crop
         Log.d(TAG, "Gyro strength=${"%.2f".format(clamped)} tc=${"%.3f".format(tc)} crop=${"%.2f".format(crop)}")

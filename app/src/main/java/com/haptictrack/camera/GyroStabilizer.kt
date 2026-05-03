@@ -67,14 +67,16 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             if (_enabled != value) {
                 _enabled = value
                 Log.i(TAG, if (value) "ON tc=${"%.3f".format(timeConstant)}" else "OFF")
-                if (!value) currentMatrix.set(IDENTITY_MATRIX.clone())
-                resetTelemetry()
+                if (!value) {
+                    currentMatrix.set(IDENTITY_MATRIX.clone())
+                    initialized = false
+                }
             }
         }
 
     private var rawQuat = Quat(1.0, 0.0, 0.0, 0.0)
     private var smoothedQuat = Quat(1.0, 0.0, 0.0, 0.0)
-    private var initialized = false
+    @Volatile private var initialized = false
     private var lastTimestampNs = 0L
     private var sampleRate = 200.0
 
@@ -218,8 +220,9 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         var h = computeHomographyUV(r, fxUv, fyUv, cropZoom.toDouble())
 
         // Clamp correction so edge excursion stays well inside the crop margin.
-        // Using 60% of the margin keeps perspective distortion invisible at the edges;
-        // excess shake passes through rather than creating warp artifacts.
+        // Single-pass SLERP toward identity — the re-projected max corner won't
+        // land exactly at usableMargin due to homography non-linearity, but the
+        // residual is sub-pixel for the small rotations we see in practice.
         val rawExcursion = maxCornerExcursion(h)
         val cropMargin = (0.5 * (1.0 - 1.0 / cropZoom)).toFloat()
         val usableMargin = cropMargin * CLAMP_MARGIN_FRACTION
@@ -252,7 +255,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
                 "gap=${"%.1f".format(telWorstGapMs)}ms " +
                 "tc=${"%.3f".format(timeConstant)} crop=${"%.2f".format(cropZoom)}"
             Log.d(TAG, line)
-            sessionWriter?.println("${System.currentTimeMillis()} $line")
+            try { sessionWriter?.println("${System.currentTimeMillis()} $line") } catch (_: Exception) {}
             resetTelemetry()
         }
     }
