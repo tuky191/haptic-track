@@ -269,14 +269,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    /** UI-only overlay; recording and pipeline are unaffected. */
     fun toggleStealthMode() {
-        val entering = !_uiState.value.stealthMode
-        if (!entering && _uiState.value.isRecording) {
-            recordingManager.stopRecording()
-        }
-        _uiState.update { it.copy(stealthMode = entering) }
-        // No camera rebind needed — SurfaceTexture pipeline is always active.
-        // Stealth is purely a UI overlay change.
+        _uiState.update { it.copy(stealthMode = !it.stealthMode) }
     }
 
     /** Volume-up: toggle stealth mode. Entry/exit point for hands-free stealth. */
