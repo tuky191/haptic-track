@@ -319,18 +319,25 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         if (!isTrackerReady) return
         if (recordingManager.isRecording) {
             recordingManager.stopRecording()
+            cameraManager.gyroStabilizer.endBenchCapture()
             if (_uiState.value.status != TrackingStatus.IDLE) {
                 clearTracking()
             }
         } else {
-            // No camera rebind needed — SurfaceTexture pipeline is always active.
-            // Just start recording on the existing VideoCapture.
+            val benchDir = java.io.File(
+                getApplication<Application>().getExternalFilesDir(null),
+                "bench/session_${java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US).format(java.util.Date())}"
+            ).also { it.mkdirs() }
+            cameraManager.gyroStabilizer.startBenchCapture(benchDir)
+
             recordingManager.startRecording(cameraManager.videoCapture) { event ->
                 when (event) {
                     is VideoRecordEvent.Start ->
                         _uiState.update { it.copy(isRecording = true) }
-                    is VideoRecordEvent.Finalize ->
+                    is VideoRecordEvent.Finalize -> {
+                        cameraManager.gyroStabilizer.endBenchCapture()
                         _uiState.update { it.copy(isRecording = false) }
+                    }
                 }
             }
         }

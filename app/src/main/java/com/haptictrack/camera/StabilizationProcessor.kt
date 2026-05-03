@@ -28,7 +28,8 @@ import java.util.concurrent.Executor
  * before they reach the encoder. Runs on its own GL thread.
  */
 class StabilizationProcessor(
-    private val stabMatrixProvider: () -> FloatArray
+    private val stabMatrixProvider: () -> FloatArray,
+    private val frameTimestampLogger: ((Long, Long) -> Unit)? = null
 ) : SurfaceProcessor, SurfaceTexture.OnFrameAvailableListener {
 
     companion object {
@@ -131,6 +132,7 @@ class StabilizationProcessor(
         if (outputSurfaceOutput == null) return
 
         surfaceTexture.updateTexImage()
+        frameTimestampLogger?.invoke(frameCount, surfaceTexture.timestamp)
         surfaceTexture.getTransformMatrix(texMatrix)
 
         EGL14.eglMakeCurrent(eglDisplay, eglSurf, eglSurf, eglContext)
