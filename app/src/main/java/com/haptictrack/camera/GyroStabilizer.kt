@@ -37,6 +37,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         private const val TEL_INTERVAL = 200
         private const val OOB_WARN_COOLDOWN_NS = 2_000_000_000L
         private const val SENSOR_GAP_THRESHOLD_NS = 100_000_000L
+        private const val CLAMP_MARGIN_FRACTION = 0.6
     }
 
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
@@ -206,13 +207,15 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         val r = correction.toRotationMatrix()
         var h = computeHomographyUV(r, fxUv, fyUv, cropZoom.toDouble())
 
-        // Clamp correction so edge excursion stays within crop margin.
-        // Excess shake passes through rather than creating edge artifacts.
+        // Clamp correction so edge excursion stays well inside the crop margin.
+        // Using 60% of the margin keeps perspective distortion invisible at the edges;
+        // excess shake passes through rather than creating warp artifacts.
         val rawExcursion = maxCornerExcursion(h)
-        val cropMargin = (cropZoom - 1f) / 2f
+        val cropMargin = (0.5 * (1.0 - 1.0 / cropZoom)).toFloat()
+        val usableMargin = cropMargin * CLAMP_MARGIN_FRACTION
         var clampRatio = 1.0
-        if (rawExcursion > cropMargin) {
-            clampRatio = (cropMargin / rawExcursion).toDouble()
+        if (rawExcursion > usableMargin) {
+            clampRatio = (usableMargin / rawExcursion).toDouble()
             val clamped = slerp(Quat(1.0, 0.0, 0.0, 0.0), correction, clampRatio)
             h = computeHomographyUV(clamped.toRotationMatrix(), fxUv, fyUv, cropZoom.toDouble())
         }
@@ -291,8 +294,9 @@ class GyroStabilizer(context: Context) : SensorEventListener {
      * K_uv = [[fx, 0, 0.5], [0, fy, 0.5], [0, 0, 1]]
      * K_uv⁻¹ = [[1/fx, 0, -0.5/fx], [0, 1/fy, -0.5/fy], [0, 0, 1]]
      *
-     * The crop zoom is applied as a scale around the image center:
-     * S = [[z, 0, 0.5*(1-z)], [0, z, 0.5*(1-z)], [0, 0, 1]]
+     * The crop zoom scales texture coordinates INWARD so the viewport maps to the
+     * centre of the texture, leaving margin at the edges for stabilization correction.
+     * S = [[1/z, 0, 0.5*(1-1/z)], [0, 1/z, 0.5*(1-1/z)], [0, 0, 1]]
      * Final: H = S × K × R × K⁻¹
      */
     private fun computeHomographyUV(
@@ -311,11 +315,12 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             kr[3] * ifx,              kr[4] * ify,              kr[5] - kr[3] * 0.5 * ifx - kr[4] * 0.5 * ify,
             kr[6] * ifx,              kr[7] * ify,              kr[8] - kr[6] * 0.5 * ifx - kr[7] * 0.5 * ify
         )
-        // Apply zoom: scale around center
-        val tx = 0.5 * (1.0 - zoom)
+        // Apply crop: scale inward around center (1/zoom keeps tex coords within [0,1])
+        val iz = 1.0 / zoom
+        val tx = 0.5 * (1.0 - iz)
         val result = floatArrayOf(
-            (zoom * h[0]).toFloat(),             (zoom * h[1]).toFloat(),             (zoom * h[2] + tx).toFloat(),
-            (zoom * h[3]).toFloat(),             (zoom * h[4]).toFloat(),             (zoom * h[5] + tx).toFloat(),
+            (iz * h[0]).toFloat(),             (iz * h[1]).toFloat(),             (iz * h[2] + tx).toFloat(),
+            (iz * h[3]).toFloat(),             (iz * h[4]).toFloat(),             (iz * h[5] + tx).toFloat(),
             h[6].toFloat(),                      h[7].toFloat(),                      h[8].toFloat()
         )
         // Convert from row-major to column-major for GL
