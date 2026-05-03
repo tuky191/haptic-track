@@ -42,7 +42,6 @@ app/src/main/java/com/haptictrack/
 │   ├── SessionRoster.kt                   # Per-session non-lock person memory (#113)
 │   ├── AppearanceEmbedder.kt              # MobileNetV3 generic embedding + gallery
 │   ├── FaceEmbedder.kt, PersonReIdEmbedder.kt   # Person path (face + body)
-│   ├── PersonAttributeClassifier.kt       # BlazeFace + age-gender
 │   ├── VisualTracker.kt                   # OpenCV VitTracker wrapper
 │   ├── FrameToFrameTracker.kt             # IoU-based detection ID assignment
 │   ├── DetectionFilter.kt, ObjectSegmenter.kt, ScenarioRecorder.kt, DebugFrameCapture.kt
@@ -73,7 +72,6 @@ CameraViewModel
 │   ├── AppearanceEmbedder     (MobileNetV3: generic visual identity fingerprint)
 │   ├── FaceEmbedder           (MobileFaceNet: face identity for person path)
 │   ├── PersonReIdEmbedder     (OSNet x1.0 MSMT17: body re-ID for person path)
-│   ├── PersonAttributeClassifier (BlazeFace + age-gender: person attributes)
 │   ├── SessionRoster          (per-session non-lock person memory → ROSTER_REJECT margin gate)
 │   ├── ReacquisitionEngine    (cascade scoring: hard category gate + z-norm calibration + ranking)
 │   ├── ScenarioRecorder       (captures processFrame inputs as JSON for replay testing)
@@ -183,7 +181,7 @@ z-norm activates per-modality once that modality's cohort has ≥ `MIN_COHORT_FO
 **With z-norm active (multi-person scenes):**
 - `hasFace` and `hasReId` person paths use `calibratedFromZ()` for face + body re-ID
 - `hasAppearance` (non-person) path stays on raw cosine — the Phase 2 calibration was person-vs-person, the non-person cohort isn't calibrated
-- Position (decays), size, color histogram, person attributes contribute at smaller weights
+- Position (decays), size, color histogram contribute at smaller weights
 - Label-bonus (+0.05) still rewards exact label matches over the embedding-override pass
 
 **Without embeddings (fallback):** Position (50%, decays) + size (25%) + base bonus (25%). All survivors already passed the gates above.
@@ -224,7 +222,7 @@ At lock, `AppearanceEmbedder` generates 5 embeddings (original + rot 90/180/270 
 First lock in a session auto-starts recording so the moment isn't lost. Volume-down still cycles idle → lock → start → stop+clear; tap collapses lock+start into one gesture.
 
 ### Single-stage detection: EfficientDet-Lite2 (simplified 2026-04-24)
-EfficientDet-Lite2 (COCO 80) every frame. YOLOv8n-oiv7 label enrichment was removed once the re-acquisition gate became binary person/not-person — finer OIV7 labels stopped influencing any gate. Saved ~270ms at lock, ~1-2s at startup, 6.8MB APK, one GPU interpreter. `PersonAttributeClassifier` covers person attributes (gender, age) where OIV7 labels were too coarse anyway.
+EfficientDet-Lite2 (COCO 80) every frame. YOLOv8n-oiv7 label enrichment was removed once the re-acquisition gate became binary person/not-person — finer OIV7 labels stopped influencing any gate. Saved ~270ms at lock, ~1-2s at startup, 6.8MB APK, one GPU interpreter.
 
 ### Unified SurfaceTexture pipeline (PR #54)
 Always 2-stream (SurfaceTexture + VideoCapture). Recording toggles VideoCapture on/off — no rebind, no `prepareForRebind()`. Replaced the old 2/3-stream switching where ImageAnalysis was dropped during recording. Always 4K-capable.
@@ -298,10 +296,9 @@ Setup: `cd tools && python3.13 -m venv .venv && .venv/bin/pip install -r require
 | VitTracker | `object_tracking_vittrack_2023sep.onnx` | 0.7MB | FP32 | CPU (OpenCV DNN) | Visual frame-to-frame tracker |
 | magic_touch | `magic_touch.tflite` | 5.9MB | FP32 | GPU (MediaPipe) | Segmentation for masked crops |
 | BlazeFace | `blaze_face_short_range.tflite` | 0.2MB | FP32 | GPU (MediaPipe) | Face detection within person crops |
-| age-gender-retail-0013 | `age_gender_retail_0013.tflite` | 4.1MB | FP32 | GPU (fallback CPU) | Face-based gender + age |
 | OSNet x1.0 MSMT17 | `osnet_x1_0_msmt17.tflite` | 4.2MB | FP32 | GPU (fallback CPU) | Person re-ID embedding (512-dim) — MSMT17 weights, swapped from Market in #113 |
 | MobileFaceNet | `mobilefacenet.tflite` | 5.0MB | FP32 | GPU (fallback CPU) | Face embedding (192-dim) |
-| **Total** | | **~42MB** | | |
+| **Total** | | **~38MB** | | |
 
 ## Tunable Parameters
 

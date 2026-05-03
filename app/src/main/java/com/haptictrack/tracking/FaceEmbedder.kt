@@ -8,6 +8,7 @@ import android.graphics.RectF
 import android.util.Log
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
+import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.vision.facedetector.FaceDetector
 import org.tensorflow.lite.Interpreter
 import java.nio.ByteBuffer
@@ -74,11 +75,17 @@ class FaceEmbedder(
             faceDetector = sharedFaceDetector
             ownsFaceDetector = false
         } else {
-            val faceOptions = FaceDetector.FaceDetectorOptions.builder()
-                .setBaseOptions(BaseOptions.builder().setModelAssetPath(FACE_MODEL_ASSET).build())
-                .setMinDetectionConfidence(FACE_MIN_CONFIDENCE)
-                .build()
-            faceDetector = FaceDetector.createFromOptions(context, faceOptions)
+            faceDetector = try {
+                FaceDetector.createFromOptions(context, FaceDetector.FaceDetectorOptions.builder()
+                    .setBaseOptions(BaseOptions.builder().setModelAssetPath(FACE_MODEL_ASSET)
+                        .setDelegate(Delegate.GPU).build())
+                    .setMinDetectionConfidence(FACE_MIN_CONFIDENCE).build())
+            } catch (e: Exception) {
+                Log.w(TAG, "BlazeFace GPU failed, falling back to CPU: ${e.message}")
+                FaceDetector.createFromOptions(context, FaceDetector.FaceDetectorOptions.builder()
+                    .setBaseOptions(BaseOptions.builder().setModelAssetPath(FACE_MODEL_ASSET).build())
+                    .setMinDetectionConfidence(FACE_MIN_CONFIDENCE).build())
+            }
             ownsFaceDetector = true
         }
 
