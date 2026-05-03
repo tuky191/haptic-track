@@ -2,8 +2,10 @@ package com.haptictrack.camera
 
 import android.content.Context
 import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CameraManager as Camera2Manager
 import android.util.Log
+import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.core.CameraControl
 import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
@@ -150,9 +152,8 @@ class CameraManager(private val context: Context) {
         val selector = if (isFrontCamera) CameraSelector.DEFAULT_FRONT_CAMERA
                        else CameraSelector.DEFAULT_BACK_CAMERA
 
-        // ISP stabilization and gyro EIS are independently togglable.
         val previewBuilder = Preview.Builder()
-        if (ispStabilizationEnabled) {
+        if (ispStabilizationEnabled && !gyroStabilizer.enabled) {
             try {
                 val caps = Preview.getPreviewCapabilities(provider.getCameraInfo(selector))
                 if (caps.isStabilizationSupported) {
@@ -164,8 +165,19 @@ class CameraManager(private val context: Context) {
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to query stabilization caps: ${e.message}")
             }
+        } else if (ispStabilizationEnabled && gyroStabilizer.enabled) {
+            Log.i(TAG, "ISP stabilization OFF (gyro EIS takes over)")
         } else {
             Log.i(TAG, "ISP stabilization OFF (user toggle)")
+        }
+        @Suppress("UnsafeOptInUsageError")
+        if (gyroStabilizer.enabled) {
+            Camera2Interop.Extender(previewBuilder)
+                .setCaptureRequestOption(
+                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF
+                )
+            Log.i(TAG, "OIS disabled (gyro EIS handles stabilization)")
         }
         gyroStabilizer.readCameraIntrinsics(context, frontFacing = isFrontCamera)
         Log.i(TAG, "Gyro EIS ${if (gyroStabilizer.enabled) "ON" else "OFF"}")

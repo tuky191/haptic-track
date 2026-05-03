@@ -62,8 +62,7 @@ class StabilizationProcessor(
     private var program: Int = 0
 
     // Matrices
-    private val rawTexMatrix = FloatArray(16)
-    private val updatedTexMatrix = FloatArray(16)
+    private val texMatrix = FloatArray(16)
 
     private var frameCount = 0L
 
@@ -129,20 +128,17 @@ class StabilizationProcessor(
         if (released) return
         val eglSurf = outputEglSurface
         if (eglSurf == EGL14.EGL_NO_SURFACE) return
-        val surfOut = outputSurfaceOutput ?: return
+        if (outputSurfaceOutput == null) return
 
         surfaceTexture.updateTexImage()
-        surfaceTexture.getTransformMatrix(rawTexMatrix)
-
-        // CameraX applies crop/rotation/mirror corrections
-        surfOut.updateTransformMatrix(updatedTexMatrix, rawTexMatrix)
+        surfaceTexture.getTransformMatrix(texMatrix)
 
         EGL14.eglMakeCurrent(eglDisplay, eglSurf, eglSurf, eglContext)
         GLES20.glViewport(0, 0, outputWidth, outputHeight)
         GLES20.glUseProgram(program)
 
         val texMatLoc = GLES20.glGetUniformLocation(program, "uTexMatrix")
-        GLES20.glUniformMatrix4fv(texMatLoc, 1, false, updatedTexMatrix, 0)
+        GLES20.glUniformMatrix4fv(texMatLoc, 1, false, texMatrix, 0)
 
         val stabMatLoc = GLES20.glGetUniformLocation(program, "uStabMatrix")
         GLES20.glUniformMatrix3fv(stabMatLoc, 1, false, stabMatrixProvider(), 0)
