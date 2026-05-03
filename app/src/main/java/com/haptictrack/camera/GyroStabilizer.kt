@@ -218,7 +218,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
                        quaternion[2].toDouble(), quaternion[3].toDouble()).normalized()
 
         val nowNs = event.timestamp
-        benchGyroWriter?.println("$nowNs,${rawQuat.w},${rawQuat.x},${rawQuat.y},${rawQuat.z}")
+        try { benchGyroWriter?.println("$nowNs,${rawQuat.w},${rawQuat.x},${rawQuat.y},${rawQuat.z}") } catch (_: Exception) {}
 
         if (!initialized) {
             smoothedQuat = rawQuat

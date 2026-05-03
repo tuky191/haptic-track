@@ -18,6 +18,10 @@ import com.haptictrack.tracking.TrackingStatus
 import com.haptictrack.tracking.TrackingUiState
 import com.haptictrack.tracking.CaptureMode
 import com.haptictrack.zoom.ZoomController
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -329,9 +333,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             }
         } else {
             if (cameraManager.gyroStabilizer.enabled) {
-                val benchDir = java.io.File(
+                val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+                val benchDir = File(
                     getApplication<Application>().getExternalFilesDir(null),
-                    "bench/session_${java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US).format(java.util.Date())}"
+                    "bench/session_$ts"
                 ).also { it.mkdirs() }
                 cameraManager.gyroStabilizer.startBenchCapture(benchDir)
             }
