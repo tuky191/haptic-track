@@ -121,21 +121,14 @@ class AblationTest {
     companion object {
         val PERSON_LABELS = setOf("person", "boy", "girl", "man", "woman", "human face")
 
-        val ALL_SCENARIOS = listOf(
-            "boy_indoor_wife_swap.json",
-            "boy_label_flicker.json",
-            "chair_living_room_wrong_reacq.json",
-            "chair_lost_no_recovery.json",
-            "cup_no_hop_limit.json",
-            "cup_reacquisition.json",
-            "man_desk_camera_swing.json",
-            "man_multi_person_lock_holds.json",
-            "mouse_cascade_reacquisition.json",
-            "person_boy_flicker.json",
-            "person_playground_tracking.json",
-            "person_tracking_recovery.json",
-            "two_people_indoor.json"
-        )
+        val ALL_SCENARIOS: List<String> by lazy {
+            val dir = AblationTest::class.java.classLoader!!.getResource("scenarios")
+                ?: error("scenarios/ not found on classpath")
+            java.io.File(dir.toURI()).listFiles()!!
+                .filter { it.extension == "json" }
+                .map { it.name }
+                .sorted()
+        }
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -274,6 +267,8 @@ class AblationTest {
             }
 
             // Check: reacquisition count didn't drop significantly
+            // Allow 1-reacq slack: scenario replay is deterministic but timing-sensitive
+            // edge cases (e.g. tentative confirmation frame count) can shift ±1 reacq
             if (baseline.reacquisitions > 0 && noAttrs.reacquisitions < baseline.reacquisitions - 1) {
                 regressions.add("$baseLabel: reacqs dropped ${baseline.reacquisitions} → ${noAttrs.reacquisitions}")
             }
@@ -373,10 +368,10 @@ class AblationTest {
                 if (engine.hasTimedOut && prevLost <= engine.maxFramesLost) timeouts++
 
                 if (engine.isSearching) {
-                    val matchingLabel = if (lockIsPerson) "person" else (lockLabel ?: "")
                     val hasSameCategoryCandidate = detections.any { det ->
                         val detIsPerson = det.label == "person"
-                        if (lockIsPerson) detIsPerson else !detIsPerson && det.label == matchingLabel
+                        if (lockIsPerson) detIsPerson
+                        else !detIsPerson && (lockLabel == null || det.label == lockLabel)
                     }
                     if (hasSameCategoryCandidate) framesWithCorrect++ else framesWithoutCorrect++
                 }
