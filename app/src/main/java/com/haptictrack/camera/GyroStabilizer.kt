@@ -32,7 +32,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
 
     companion object {
         private const val TAG = "GyroStab"
-        private const val DEFAULT_TIME_CONSTANT = 0.17
+        private const val DEFAULT_TIME_CONSTANT = 0.50
         private const val DEFAULT_HFOV_DEGREES = 75.0
         private const val TEL_INTERVAL = 200
         private const val SENSOR_GAP_THRESHOLD_NS = 100_000_000L
@@ -52,8 +52,11 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     /** Quaternion that rotates correction from device space to camera sensor space. */
     private var deviceToSensorQuat = sensorOrientationToQuat(90)
 
+    /** Sensor orientation in degrees — needed to convert sensor-UV homography to portrait UV. */
+    private var sensorOrientation: Int = 90
+
     /** Crop zoom applied to absorb warp margins (1.0 = no crop, 1.05 = 5% crop). */
-    var cropZoom: Float = 1.125f
+    var cropZoom: Float = 1.40f
 
     /** Current stabilization matrix in column-major order for GL (mat3). Identity when disabled. */
     private val currentMatrix = AtomicReference(IDENTITY_MATRIX.clone())
@@ -167,15 +170,6 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     /** Get the current stabilization matrix (column-major mat3, 9 floats). Thread-safe. */
     fun getMatrix(): FloatArray = currentMatrix.get()
 
-    /** Update camera intrinsics. Call after camera bind when focal length is known. */
-    fun setCameraIntrinsics(focalLengthMm: Float, sensorWidthMm: Float, sensorHeightMm: Float) {
-        if (sensorWidthMm > 0 && sensorHeightMm > 0 && focalLengthMm > 0) {
-            fxUv = (focalLengthMm / sensorWidthMm).toDouble()
-            fyUv = (focalLengthMm / sensorHeightMm).toDouble()
-            Log.i(TAG, "Intrinsics: focal=${focalLengthMm}mm, sensor=${sensorWidthMm}x${sensorHeightMm}mm → fx=${"%.3f".format(fxUv)} fy=${"%.3f".format(fyUv)}")
-        }
-    }
-
     /** Read camera intrinsics from Camera2 characteristics. */
     fun readCameraIntrinsics(context: Context, frontFacing: Boolean = false) {
         val targetFacing = if (frontFacing) CameraCharacteristics.LENS_FACING_FRONT
@@ -187,13 +181,45 @@ class GyroStabilizer(context: Context) : SensorEventListener {
                 val facing = chars.get(CameraCharacteristics.LENS_FACING)
                 if (facing != targetFacing) continue
 
-                val focalLengths = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
-                val sensorSize = chars.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
-                if (focalLengths != null && focalLengths.isNotEmpty() && sensorSize != null) {
-                    setCameraIntrinsics(focalLengths[0], sensorSize.width, sensorSize.height)
-                }
+                val activeArray = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
                 val orientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+                sensorOrientation = orientation
                 deviceToSensorQuat = sensorOrientationToQuat(orientation)
+
+                // Try LENS_INTRINSIC_CALIBRATION first — calibrated pixel focal lengths
+                val intrinsicCal = chars.get(CameraCharacteristics.LENS_INTRINSIC_CALIBRATION)
+                if (intrinsicCal != null && activeArray != null) {
+                    val fxPx = intrinsicCal[0]  // focal length in pixels (x)
+                    val fyPx = intrinsicCal[1]  // focal length in pixels (y)
+                    val arrayW = activeArray.width().toDouble()
+                    val arrayH = activeArray.height().toDouble()
+                    // Bench regression (eis_bench_ois_off_2) measured 1.27x uniform
+                    // scale error on both axes — HAL applies additional crop beyond
+                    // what active array dimensions describe.
+                    val empiricalScale = 1.27
+                    fxUv = fxPx / arrayW * empiricalScale
+                    fyUv = fyPx / arrayH * empiricalScale
+                    Log.i(TAG, "Intrinsics (calibrated): fxPx=${"%.1f".format(fxPx)} fyPx=${"%.1f".format(fyPx)} " +
+                        "array=${arrayW.toInt()}x${arrayH.toInt()} scale=$empiricalScale " +
+                        "→ fx=${"%.3f".format(fxUv)} fy=${"%.3f".format(fyUv)}")
+                } else {
+                    // Fallback: physical focal length / sensor size
+                    val focalLengths = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+                    val sensorSize = chars.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+                    if (focalLengths != null && focalLengths.isNotEmpty() && sensorSize != null) {
+                        val focalMm = focalLengths[0].toDouble()
+                        val sensorW = sensorSize.width.toDouble()
+                        val sensorH = sensorSize.height.toDouble()
+                        val empiricalScale = 1.27
+                        fxUv = focalMm / sensorW * empiricalScale
+                        fyUv = focalMm / sensorH * empiricalScale
+                        Log.i(TAG, "Intrinsics (physical): focal=${"%.2f".format(focalMm)}mm " +
+                            "sensor=${"%.2f".format(sensorW)}x${"%.2f".format(sensorH)}mm " +
+                            "scale=$empiricalScale " +
+                            "→ fx=${"%.3f".format(fxUv)} fy=${"%.3f".format(fyUv)}" +
+                            (if (activeArray != null) " array=${activeArray.width()}x${activeArray.height()}" else ""))
+                    }
+                }
                 Log.i(TAG, "Sensor orientation: ${orientation}° → d2s quat=(${deviceToSensorQuat.w}, ${deviceToSensorQuat.x}, ${deviceToSensorQuat.y}, ${deviceToSensorQuat.z})")
                 break
             }
@@ -206,19 +232,19 @@ class GyroStabilizer(context: Context) : SensorEventListener {
 
     override fun onSensorChanged(event: SensorEvent) {
         if (event.sensor.type != Sensor.TYPE_GAME_ROTATION_VECTOR) return
-        if (!enabled) {
-            currentMatrix.set(IDENTITY_MATRIX.clone())
-            return
-        }
 
         val quaternion = FloatArray(4)
         SensorManager.getQuaternionFromVector(quaternion, event.values)
-        // Android returns [w, x, y, z]
         rawQuat = Quat(quaternion[0].toDouble(), quaternion[1].toDouble(),
                        quaternion[2].toDouble(), quaternion[3].toDouble()).normalized()
 
         val nowNs = event.timestamp
         try { benchGyroWriter?.println("$nowNs,${rawQuat.w},${rawQuat.x},${rawQuat.y},${rawQuat.z}") } catch (_: Exception) {}
+
+        if (!enabled) {
+            currentMatrix.set(IDENTITY_MATRIX.clone())
+            return
+        }
 
         if (!initialized) {
             smoothedQuat = rawQuat
@@ -245,34 +271,35 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         val alpha = 1.0 - exp(-(1.0 / sampleRate) / timeConstant)
         smoothedQuat = slerp(smoothedQuat, rawQuat, alpha)
 
-        // Correction: undo device shake so the output matches the smoothed orientation.
-        // R = raw⁻¹ × smoothed transforms from the raw (shaky) sensor frame to the
-        // smoothed (stable) frame, telling the shader where to sample in the texture.
-        val correctionDevice = rawQuat.conjugate() * smoothedQuat
+        // Leash: limit how far smoothed can deviate from raw. Without this, the
+        // smoothed path drifts far during handheld walking (34% of samples exceed
+        // the crop margin). The hard clamp that used to follow would truncate 87%
+        // of the correction during peaks, creating visible wobble artifacts.
+        // The leash pulls smoothed toward raw so corrections always fit the margin.
+        val cropMargin = 0.5 * (1.0 - 1.0 / cropZoom)
+        val maxCorrAngle = cropMargin / maxOf(fxUv, fyUv)
+        val devQuat = smoothedQuat.conjugate() * rawQuat
+        val devAngle = 2.0 * acos(devQuat.w.coerceIn(-1.0, 1.0))
+        if (devAngle > maxCorrAngle && devAngle > 1e-6) {
+            val catchUp = 1.0 - maxCorrAngle / devAngle
+            smoothedQuat = slerp(smoothedQuat, rawQuat, catchUp)
+        }
+
+        // Correction: for each output pixel (in the smoothed frame), find where to
+        // sample in the raw (shaky) input texture. That's smooth⁻¹ × raw.
+        val correctionDevice = smoothedQuat.conjugate() * rawQuat
 
         // Rotate correction from device coordinate space into camera sensor space.
-        // The sensor is physically rotated (SENSOR_ORIENTATION, typically 90°) from
-        // the device, so the homography's rotation axes must match the sensor frame.
         val correction = deviceToSensorQuat * correctionDevice * deviceToSensorQuat.conjugate()
 
         // Build homography H = K × R × K⁻¹ in UV [0,1]² space
         val r = correction.toRotationMatrix()
-        var h = computeHomographyUV(r, fxUv, fyUv, cropZoom.toDouble())
+        val h = computeHomographyUV(r, fxUv, fyUv, cropZoom.toDouble())
 
-        // Clamp correction so edge excursion stays well inside the crop margin.
-        // Single-pass SLERP toward identity — the re-projected max corner won't
-        // land exactly at usableMargin due to homography non-linearity, but the
-        // residual is sub-pixel for the small rotations we see in practice.
-        val rawExcursion = maxCornerExcursion(h)
-        val cropMargin = (0.5 * (1.0 - 1.0 / cropZoom)).toFloat()
-        val usableMargin = cropMargin * CLAMP_MARGIN_FRACTION
-        var clampRatio = 1.0
-        if (rawExcursion > usableMargin) {
-            clampRatio = (usableMargin / rawExcursion).toDouble()
-            val clamped = slerp(Quat(1.0, 0.0, 0.0, 0.0), correction, clampRatio)
-            h = computeHomographyUV(clamped.toRotationMatrix(), fxUv, fyUv, cropZoom.toDouble())
-        }
-        currentMatrix.set(h)
+        val hPortrait = sensorToPortraitGL(h, sensorOrientation)
+        val rawExcursion = maxCornerExcursion(hPortrait)
+        val clampRatio = 1.0
+        currentMatrix.set(hPortrait)
 
         // --- Telemetry ---
         val corrAngleDeg = 2.0 * acos(correction.w.coerceIn(-1.0, 1.0)) * (180.0 / PI)
@@ -411,8 +438,48 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     }
 
     private fun sensorOrientationToQuat(degrees: Int): Quat {
-        val angle = -Math.toRadians(degrees.toDouble())
+        val angle = Math.toRadians(degrees.toDouble())
         return Quat(cos(angle / 2), 0.0, 0.0, sin(angle / 2))
+    }
+
+    /**
+     * Convert a sensor-UV homography (GL column-major) to portrait UV.
+     *
+     * The GL shader applies the matrix to quad UV coordinates which are in portrait
+     * orientation, but computeHomographyUV produces the matrix in sensor UV space.
+     * H_portrait = T⁻¹ × H_sensor × T where T maps portrait UV → sensor UV.
+     */
+    private fun sensorToPortraitGL(colMajor: FloatArray, orientation: Int): FloatArray {
+        if (orientation != 90 && orientation != 270) return colMajor
+
+        // GL column-major → row-major element naming
+        val h00 = colMajor[0]; val h10 = colMajor[1]; val h20 = colMajor[2]
+        val h01 = colMajor[3]; val h11 = colMajor[4]; val h21 = colMajor[5]
+        val h02 = colMajor[6]; val h12 = colMajor[7]; val h22 = colMajor[8]
+
+        val p00: Float; val p01: Float; val p02: Float
+        val p10: Float; val p11: Float; val p12: Float
+        val p20: Float; val p21: Float; val p22: Float
+
+        if (orientation == 90) {
+            // portrait_u = sensor_v, portrait_v = 1 - sensor_u
+            // T = [0,-1,1; 1,0,0; 0,0,1]  T⁻¹ = [0,1,0; -1,0,1; 0,0,1]
+            p00 = h11;        p01 = -h10;       p02 = h10 + h12
+            p10 = h21 - h01;  p11 = h00 - h20;  p12 = h20 + h22 - h00 - h02
+            p20 = h21;        p21 = -h20;        p22 = h20 + h22
+        } else {
+            // 270°: portrait_u = 1 - sensor_v, portrait_v = sensor_u
+            // T = [0,1,0; -1,0,1; 0,0,1]  T⁻¹ = [0,-1,1; 1,0,0; 0,0,1]
+            p00 = h11 - h21;  p01 = h20 - h10;  p02 = h21 + h22 - h11 - h12
+            p10 = -h01;       p11 = h00;         p12 = h01 + h02
+            p20 = -h21;       p21 = h20;         p22 = h21 + h22
+        }
+
+        return floatArrayOf(
+            p00, p10, p20,
+            p01, p11, p21,
+            p02, p12, p22
+        )
     }
 }
 

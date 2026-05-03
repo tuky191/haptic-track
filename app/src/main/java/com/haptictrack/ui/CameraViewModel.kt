@@ -49,10 +49,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         private const val TAG = "CameraVM"
         /** Tap target padding in normalized coordinates (~3% of screen on each side). */
         private const val TAP_PADDING = 0.03f
-        private const val GYRO_TC_MAX = 0.30       // time constant at strength=0 (most responsive)
-        private const val GYRO_TC_RANGE = 0.26      // TC swing: TC_MAX - TC_RANGE = 0.04 at strength=1
-        private const val GYRO_CROP_MIN = 1.05f     // crop zoom at strength=0
-        private const val GYRO_CROP_RANGE = 0.15f   // crop swing: 1.05 + 0.15 = 1.20 at strength=1
+        private const val GYRO_TC_MAX = 0.80       // time constant at strength=0 (most laggy)
+        private const val GYRO_TC_RANGE = 0.50      // TC swing: 0.80 - 0.50 = 0.30 at strength=1
+        private const val GYRO_CROP_MIN = 1.15f     // crop zoom at strength=0
+        private const val GYRO_CROP_RANGE = 0.35f   // crop swing: 1.15 + 0.35 = 1.50 at strength=1
     }
 
     /** Smooths idle detections by keeping objects alive for a few frames after they disappear. */
@@ -327,14 +327,12 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 clearTracking()
             }
         } else {
-            if (cameraManager.gyroStabilizer.enabled) {
-                val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-                val benchDir = File(
-                    getApplication<Application>().getExternalFilesDir(null),
-                    "bench/session_$ts"
-                ).also { it.mkdirs() }
-                cameraManager.gyroStabilizer.startBenchCapture(benchDir)
-            }
+            val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+            val benchDir = File(
+                getApplication<Application>().getExternalFilesDir(null),
+                "bench/session_$ts"
+            ).also { it.mkdirs() }
+            cameraManager.gyroStabilizer.startBenchCapture(benchDir)
 
             recordingManager.startRecording(cameraManager.videoCapture) { event ->
                 when (event) {

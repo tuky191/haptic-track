@@ -171,14 +171,12 @@ class CameraManager(private val context: Context) {
             Log.i(TAG, "ISP stabilization OFF (user toggle)")
         }
         @Suppress("UnsafeOptInUsageError")
-        if (gyroStabilizer.enabled) {
-            Camera2Interop.Extender(previewBuilder)
-                .setCaptureRequestOption(
-                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
-                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF
-                )
-            Log.i(TAG, "OIS disabled (gyro EIS handles stabilization)")
-        }
+        Camera2Interop.Extender(previewBuilder)
+            .setCaptureRequestOption(
+                CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF
+            )
+        Log.i(TAG, "OIS disabled (gyro bench needs raw sensor data)")
         gyroStabilizer.readCameraIntrinsics(context, frontFacing = isFrontCamera)
         Log.i(TAG, "Gyro EIS ${if (gyroStabilizer.enabled) "ON" else "OFF"}")
         preview = previewBuilder.build()
@@ -218,15 +216,13 @@ class CameraManager(private val context: Context) {
             .addUseCase(preview)
             .addUseCase(videoCapture)
 
-        if (gyroStabilizer.enabled) {
-            val processor = StabilizationProcessor(
-                stabMatrixProvider = { gyroStabilizer.getMatrix() },
-                frameTimestampLogger = { idx, ts -> gyroStabilizer.logFrameTimestamp(idx, ts) }
-            )
-            stabProcessor = processor
-            useCaseGroupBuilder.addEffect(StabilizationEffect(processor))
-            Log.i(TAG, "Video stabilization effect added to VideoCapture pipeline")
-        }
+        val processor = StabilizationProcessor(
+            stabMatrixProvider = { gyroStabilizer.getMatrix() },
+            frameTimestampLogger = { idx, ts -> gyroStabilizer.logFrameTimestamp(idx, ts) }
+        )
+        stabProcessor = processor
+        useCaseGroupBuilder.addEffect(StabilizationEffect(processor))
+        Log.i(TAG, "StabilizationProcessor added (EIS ${if (gyroStabilizer.enabled) "ON" else "OFF — identity pass-through"})")
 
         val camera = provider.bindToLifecycle(lifecycleOwner, selector, useCaseGroupBuilder.build())
 
