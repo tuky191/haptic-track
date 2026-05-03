@@ -63,6 +63,7 @@ class PersonAttributeClassifier(context: Context) {
      * [bitmap] is the full frame, [normalizedBox] is the person's bounding box in [0,1].
      * Returns null for non-person labels, if the crop is too small, or if no face is detected.
      */
+    // TODO(#35): wire face-based gender/age into auto-lock criteria
     fun classify(bitmap: Bitmap, normalizedBox: RectF, label: String?): FaceGenderResult? {
         if (label != "person") return null
 
