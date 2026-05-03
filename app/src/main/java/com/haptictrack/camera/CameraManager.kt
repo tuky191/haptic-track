@@ -219,7 +219,10 @@ class CameraManager(private val context: Context) {
             .addUseCase(videoCapture)
 
         if (gyroStabilizer.enabled) {
-            val processor = StabilizationProcessor { gyroStabilizer.getMatrix() }
+            val processor = StabilizationProcessor(
+                stabMatrixProvider = { gyroStabilizer.getMatrix() },
+                frameTimestampLogger = { idx, ts -> gyroStabilizer.logFrameTimestamp(idx, ts) }
+            )
             stabProcessor = processor
             useCaseGroupBuilder.addEffect(StabilizationEffect(processor))
             Log.i(TAG, "Video stabilization effect added to VideoCapture pipeline")

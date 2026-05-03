@@ -18,6 +18,10 @@ import com.haptictrack.tracking.TrackingStatus
 import com.haptictrack.tracking.TrackingUiState
 import com.haptictrack.tracking.CaptureMode
 import com.haptictrack.zoom.ZoomController
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -323,18 +327,28 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         if (!isTrackerReady) return
         if (recordingManager.isRecording) {
             recordingManager.stopRecording()
+            cameraManager.gyroStabilizer.endBenchCapture()
             if (_uiState.value.status != TrackingStatus.IDLE) {
                 clearTracking()
             }
         } else {
-            // No camera rebind needed — SurfaceTexture pipeline is always active.
-            // Just start recording on the existing VideoCapture.
+            if (cameraManager.gyroStabilizer.enabled) {
+                val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+                val benchDir = File(
+                    getApplication<Application>().getExternalFilesDir(null),
+                    "bench/session_$ts"
+                ).also { it.mkdirs() }
+                cameraManager.gyroStabilizer.startBenchCapture(benchDir)
+            }
+
             recordingManager.startRecording(cameraManager.videoCapture) { event ->
                 when (event) {
                     is VideoRecordEvent.Start ->
                         _uiState.update { it.copy(isRecording = true) }
-                    is VideoRecordEvent.Finalize ->
+                    is VideoRecordEvent.Finalize -> {
+                        cameraManager.gyroStabilizer.endBenchCapture()
                         _uiState.update { it.copy(isRecording = false) }
+                    }
                 }
             }
         }
