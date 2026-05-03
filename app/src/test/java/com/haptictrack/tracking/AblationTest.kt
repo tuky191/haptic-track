@@ -1,6 +1,5 @@
 package com.haptictrack.tracking
 
-import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test

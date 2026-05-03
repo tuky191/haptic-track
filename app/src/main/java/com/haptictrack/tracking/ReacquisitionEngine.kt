@@ -2,6 +2,7 @@ package com.haptictrack.tracking
 
 import android.graphics.RectF
 import android.util.Log
+import androidx.annotation.VisibleForTesting
 import kotlin.math.exp
 
 /**
@@ -35,7 +36,7 @@ class ReacquisitionEngine(
     /** Pre-computed background OSNet embeddings; same role for the person-reId path. */
     private val frozenNegativesOsnet: List<FloatArray> = emptyList(),
     /** When true, person-attribute scores are zeroed in [scoreCandidate]. Ablation flag (#123). */
-    val disableAttributes: Boolean = false
+    @VisibleForTesting val disableAttributes: Boolean = false
 ) {
 
     companion object {

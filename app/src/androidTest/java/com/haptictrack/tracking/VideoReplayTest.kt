@@ -141,13 +141,13 @@ class VideoReplayTest {
         override fun succeeded(d: Description) {
             passed++
             val elapsed = (System.currentTimeMillis() - testStartMs) / 1000.0
-            Log.i(TAG, "✅ PASSED [${passed + failed}]: ${d.methodName} (${String.format("%.1f", elapsed)}s) — $passed passed, $failed failed")
+            Log.i(TAG, "✅ PASSED [${passed + failed}]: ${d.methodName} (${String.format(java.util.Locale.US, "%.1f", elapsed)}s) — $passed passed, $failed failed")
         }
 
         override fun failed(e: Throwable, d: Description) {
             failed++
             val elapsed = (System.currentTimeMillis() - testStartMs) / 1000.0
-            Log.e(TAG, "❌ FAILED [${passed + failed}]: ${d.methodName} (${String.format("%.1f", elapsed)}s) — ${e.message}")
+            Log.e(TAG, "❌ FAILED [${passed + failed}]: ${d.methodName} (${String.format(java.util.Locale.US, "%.1f", elapsed)}s) — ${e.message}")
             Log.e(TAG, "   Score: $passed passed, $failed failed")
         }
     }
