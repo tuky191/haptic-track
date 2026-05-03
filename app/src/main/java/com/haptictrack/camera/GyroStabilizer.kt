@@ -141,7 +141,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             }
             PrintWriter(FileWriter(File(dir, "bench_params.csv"))).use { pw ->
                 pw.println("timeConstant,cropZoom,fxUv,fyUv,clampMarginFraction")
-                pw.println("$timeConstant,$cropZoom,$fxUv,$fyUv,0.6")
+                pw.println("$timeConstant,$cropZoom,$fxUv,$fyUv,$CLAMP_MARGIN_FRACTION")
             }
             Log.i(TAG, "Bench capture started → ${dir.absolutePath}")
         } catch (e: Exception) {

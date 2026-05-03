@@ -324,11 +324,13 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 clearTracking()
             }
         } else {
-            val benchDir = java.io.File(
-                getApplication<Application>().getExternalFilesDir(null),
-                "bench/session_${java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US).format(java.util.Date())}"
-            ).also { it.mkdirs() }
-            cameraManager.gyroStabilizer.startBenchCapture(benchDir)
+            if (cameraManager.gyroStabilizer.enabled) {
+                val benchDir = java.io.File(
+                    getApplication<Application>().getExternalFilesDir(null),
+                    "bench/session_${java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US).format(java.util.Date())}"
+                ).also { it.mkdirs() }
+                cameraManager.gyroStabilizer.startBenchCapture(benchDir)
+            }
 
             recordingManager.startRecording(cameraManager.videoCapture) { event ->
                 when (event) {
