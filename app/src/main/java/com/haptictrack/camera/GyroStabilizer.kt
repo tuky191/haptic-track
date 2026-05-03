@@ -84,6 +84,12 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     @Volatile
     private var sessionWriter: PrintWriter? = null
 
+    // Bench capture: full-rate gyro CSV + frame timestamp CSV for off-device analysis
+    @Volatile
+    private var benchGyroWriter: PrintWriter? = null
+    @Volatile
+    private var benchFrameWriter: PrintWriter? = null
+
     // Telemetry accumulators (reset every TEL_INTERVAL sensor events)
     private var telFrames = 0
     private var telSumAlpha = 0.0
@@ -124,6 +130,38 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     fun endSessionLog() {
         sessionWriter?.close()
         sessionWriter = null
+    }
+
+    fun startBenchCapture(dir: File) {
+        endBenchCapture()
+        try {
+            benchGyroWriter = PrintWriter(FileWriter(File(dir, "gyro_raw.csv")), false).also {
+                it.println("timestamp_ns,w,x,y,z")
+            }
+            benchFrameWriter = PrintWriter(FileWriter(File(dir, "frames.csv")), false).also {
+                it.println("frame_idx,timestamp_ns")
+            }
+            PrintWriter(FileWriter(File(dir, "bench_params.csv"))).use { pw ->
+                pw.println("timeConstant,cropZoom,fxUv,fyUv,clampMarginFraction")
+                pw.println("$timeConstant,$cropZoom,$fxUv,$fyUv,0.6")
+            }
+            Log.i(TAG, "Bench capture started → ${dir.absolutePath}")
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to start bench capture: ${e.message}")
+        }
+    }
+
+    fun endBenchCapture() {
+        benchGyroWriter?.flush()
+        benchGyroWriter?.close()
+        benchGyroWriter = null
+        benchFrameWriter?.flush()
+        benchFrameWriter?.close()
+        benchFrameWriter = null
+    }
+
+    fun logFrameTimestamp(frameIdx: Long, timestampNs: Long) {
+        benchFrameWriter?.println("$frameIdx,$timestampNs")
     }
 
     /** Get the current stabilization matrix (column-major mat3, 9 floats). Thread-safe. */
@@ -180,6 +218,8 @@ class GyroStabilizer(context: Context) : SensorEventListener {
                        quaternion[2].toDouble(), quaternion[3].toDouble()).normalized()
 
         val nowNs = event.timestamp
+        benchGyroWriter?.println("$nowNs,${rawQuat.w},${rawQuat.x},${rawQuat.y},${rawQuat.z}")
+
         if (!initialized) {
             smoothedQuat = rawQuat
             initialized = true
