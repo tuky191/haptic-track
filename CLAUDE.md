@@ -224,7 +224,7 @@ At lock, `AppearanceEmbedder` generates 5 embeddings (original + rot 90/180/270 
 First lock in a session auto-starts recording so the moment isn't lost. Volume-down still cycles idle → lock → start → stop+clear; tap collapses lock+start into one gesture.
 
 ### Single-stage detection: EfficientDet-Lite2 (simplified 2026-04-24)
-EfficientDet-Lite2 (COCO 80) every frame. YOLOv8n-oiv7 label enrichment was removed once the re-acquisition gate became binary person/not-person — finer OIV7 labels stopped influencing any gate. Saved ~270ms at lock, ~1-2s at startup, 6.8MB APK, one GPU interpreter. `PersonAttributeClassifier` covers person attributes (gender, clothing, age) where OIV7 labels were too coarse anyway.
+EfficientDet-Lite2 (COCO 80) every frame. YOLOv8n-oiv7 label enrichment was removed once the re-acquisition gate became binary person/not-person — finer OIV7 labels stopped influencing any gate. Saved ~270ms at lock, ~1-2s at startup, 6.8MB APK, one GPU interpreter. `PersonAttributeClassifier` covers person attributes (gender, age) where OIV7 labels were too coarse anyway.
 
 ### Unified SurfaceTexture pipeline (PR #54)
 Always 2-stream (SurfaceTexture + VideoCapture). Recording toggles VideoCapture on/off — no rebind, no `prepareForRebind()`. Replaced the old 2/3-stream switching where ImageAnalysis was dropped during recording. Always 4K-capable.
