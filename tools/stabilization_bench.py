@@ -384,7 +384,7 @@ def compute_metrics(raw_disp, causal_pred, noncausal_pred, fps):
 
     # Gyro-video correlation
     n_corr = min(len(raw_disp), len(causal_pred))
-    if n_corr > 2:
+    if n_corr > 2 and np.std(raw_disp[:n_corr, 0]) > 0 and np.std(causal_pred[:n_corr, 0]) > 0:
         corr_x = np.corrcoef(raw_disp[:n_corr, 0], causal_pred[:n_corr, 0])[0, 1]
         corr_y = np.corrcoef(raw_disp[:n_corr, 1], causal_pred[:n_corr, 1])[0, 1]
     else:
