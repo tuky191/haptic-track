@@ -11,7 +11,10 @@ import org.junit.AfterClass
 import org.junit.Assert.*
 import org.junit.Before
 import org.junit.BeforeClass
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TestWatcher
+import org.junit.runner.Description
 import org.junit.runner.RunWith
 import java.io.File
 import java.util.concurrent.CountDownLatch
@@ -123,6 +126,31 @@ class VideoReplayTest {
     }
 
     private lateinit var testVideoDir: File
+    private var testStartMs = 0L
+
+    @get:Rule
+    val progressWatcher = object : TestWatcher() {
+        private var passed = 0
+        private var failed = 0
+
+        override fun starting(d: Description) {
+            testStartMs = System.currentTimeMillis()
+            Log.i(TAG, "▶ STARTING: ${d.methodName}")
+        }
+
+        override fun succeeded(d: Description) {
+            passed++
+            val elapsed = (System.currentTimeMillis() - testStartMs) / 1000.0
+            Log.i(TAG, "✅ PASSED [${passed + failed}]: ${d.methodName} (${String.format(java.util.Locale.US, "%.1f", elapsed)}s) — $passed passed, $failed failed")
+        }
+
+        override fun failed(e: Throwable, d: Description) {
+            failed++
+            val elapsed = (System.currentTimeMillis() - testStartMs) / 1000.0
+            Log.e(TAG, "❌ FAILED [${passed + failed}]: ${d.methodName} (${String.format(java.util.Locale.US, "%.1f", elapsed)}s) — ${e.message}")
+            Log.e(TAG, "   Score: $passed passed, $failed failed")
+        }
+    }
 
     @Before
     fun setup() {
