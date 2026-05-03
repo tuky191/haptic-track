@@ -411,6 +411,21 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                     }
                 }
 
+                // Stabilization toggles (idle only)
+                if (uiState.status == TrackingStatus.IDLE) {
+                    StabilizationToggles(
+                        ispEnabled = uiState.ispStabilization,
+                        gyroEnabled = uiState.gyroEis,
+                        gyroStrength = uiState.gyroStrength,
+                        onToggleIsp = { viewModel.toggleIspStabilization() },
+                        onToggleGyro = { viewModel.toggleGyroEis() },
+                        onGyroStrengthChange = { viewModel.setGyroStrength(it) },
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
+                            .padding(top = 110.dp, start = 16.dp)
+                    )
+                }
+
                 // Stealth mode is toggled by volume-up (see MainActivity) — no button.
             }
         }
@@ -758,4 +773,62 @@ private fun ModeLabel(text: String, selected: Boolean) {
             )
             .padding(horizontal = 12.dp, vertical = 4.dp)
     )
+}
+
+@Composable
+private fun StabilizationToggles(
+    ispEnabled: Boolean,
+    gyroEnabled: Boolean,
+    gyroStrength: Float,
+    onToggleIsp: () -> Unit,
+    onToggleGyro: () -> Unit,
+    onGyroStrengthChange: (Float) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        StabToggle("ISP", ispEnabled, onToggleIsp)
+        StabToggle("Gyro", gyroEnabled, onToggleGyro)
+        if (gyroEnabled) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .background(Color.Black.copy(alpha = 0.5f), RoundedCornerShape(16.dp))
+                    .padding(horizontal = 8.dp)
+            ) {
+                Text("Lo", color = Color.White.copy(alpha = 0.6f), fontSize = 10.sp)
+                androidx.compose.material3.Slider(
+                    value = gyroStrength,
+                    onValueChange = onGyroStrengthChange,
+                    modifier = Modifier.weight(1f).height(32.dp),
+                    colors = androidx.compose.material3.SliderDefaults.colors(
+                        thumbColor = Color.White,
+                        activeTrackColor = Color.White.copy(alpha = 0.6f),
+                        inactiveTrackColor = Color.White.copy(alpha = 0.2f)
+                    )
+                )
+                Text("Hi", color = Color.White.copy(alpha = 0.6f), fontSize = 10.sp)
+            }
+        }
+    }
+}
+
+@Composable
+private fun StabToggle(label: String, enabled: Boolean, onToggle: () -> Unit) {
+    Button(
+        onClick = onToggle,
+        modifier = Modifier.height(32.dp),
+        shape = RoundedCornerShape(16.dp),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = if (enabled) Color.White.copy(alpha = 0.25f)
+                             else Color.Black.copy(alpha = 0.5f)
+        ),
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 0.dp)
+    ) {
+        Text(
+            text = "$label ${if (enabled) "ON" else "OFF"}",
+            color = if (enabled) Color.White else Color.White.copy(alpha = 0.5f),
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Medium
+        )
+    }
 }

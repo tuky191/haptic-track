@@ -45,6 +45,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         private const val TAG = "CameraVM"
         /** Tap target padding in normalized coordinates (~3% of screen on each side). */
         private const val TAP_PADDING = 0.03f
+        private const val GYRO_TC_MAX = 0.30       // time constant at strength=0 (most responsive)
+        private const val GYRO_TC_RANGE = 0.26      // TC swing: TC_MAX - TC_RANGE = 0.04 at strength=1
+        private const val GYRO_CROP_MIN = 1.05f     // crop zoom at strength=0
+        private const val GYRO_CROP_RANGE = 0.15f   // crop swing: 1.05 + 0.15 = 1.20 at strength=1
     }
 
     /** Smooths idle detections by keeping objects alive for a few frames after they disappear. */
@@ -61,6 +65,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 _uiState.update { it.copy(loadingStatus = status) }
             })
             tracker.deviceRotationProvider = { orientationListener.deviceRotation }
+            tracker.onSessionDir = { dir ->
+                if (dir != null) cameraManager.gyroStabilizer.startSessionLog(dir)
+                else cameraManager.gyroStabilizer.endSessionLog()
+            }
 
             tracker.onDetectionResult = { allObjects, lockedObject, imgWidth, imgHeight, contour ->
                 val previousStatus = _uiState.value.status
@@ -223,9 +231,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         val state = _uiState.value
 
         if (state.isRecording) {
-            // Recording → stop recording and clear
+            // Recording → stop recording (toggleRecording also clears tracking)
             toggleRecording()
-            clearTracking()
             return
         }
 
@@ -273,6 +280,29 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         toggleStealthMode()
     }
 
+    fun toggleIspStabilization() {
+        val newValue = !_uiState.value.ispStabilization
+        cameraManager.ispStabilizationEnabled = newValue
+        _uiState.update { it.copy(ispStabilization = newValue) }
+        cameraManager.rebind()
+    }
+
+    fun toggleGyroEis() {
+        val newValue = !_uiState.value.gyroEis
+        cameraManager.gyroStabilizer.enabled = newValue
+        _uiState.update { it.copy(gyroEis = newValue) }
+    }
+
+    fun setGyroStrength(strength: Float) {
+        val clamped = strength.coerceIn(0f, 1f)
+        val tc = GYRO_TC_MAX - GYRO_TC_RANGE * clamped
+        val crop = GYRO_CROP_MIN + GYRO_CROP_RANGE * clamped
+        cameraManager.gyroStabilizer.timeConstant = tc
+        cameraManager.gyroStabilizer.cropZoom = crop
+        Log.d(TAG, "Gyro strength=${"%.2f".format(clamped)} tc=${"%.3f".format(tc)} crop=${"%.2f".format(crop)}")
+        _uiState.update { it.copy(gyroStrength = clamped) }
+    }
+
     fun switchCamera() {
         clearTracking()
         cameraManager.switchCamera()
@@ -284,7 +314,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         zoomController.reset()
         hapticManager.updateTrackingStatus(TrackingStatus.IDLE)
         _uiState.update {
-            TrackingUiState(status = TrackingStatus.IDLE, isRecording = it.isRecording, captureMode = it.captureMode, stealthMode = it.stealthMode, isReady = it.isReady)
+            TrackingUiState(status = TrackingStatus.IDLE, isRecording = it.isRecording, captureMode = it.captureMode, stealthMode = it.stealthMode, isReady = it.isReady, ispStabilization = it.ispStabilization, gyroEis = it.gyroEis, gyroStrength = it.gyroStrength)
         }
     }
 
@@ -293,6 +323,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         if (!isTrackerReady) return
         if (recordingManager.isRecording) {
             recordingManager.stopRecording()
+            if (_uiState.value.status != TrackingStatus.IDLE) {
+                clearTracking()
+            }
         } else {
             // No camera rebind needed — SurfaceTexture pipeline is always active.
             // Just start recording on the existing VideoCapture.

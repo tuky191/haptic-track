@@ -43,7 +43,9 @@ class SurfaceTextureFrameReader(
     /** Called on processing thread when a frame is ready for ObjectTracker. */
     private val onFrame: (Bitmap) -> Unit,
     /** Called on GL thread at camera rate (~29fps) for viewfinder display. */
-    private val onViewfinderFrame: ((Bitmap) -> Unit)? = null
+    private val onViewfinderFrame: ((Bitmap) -> Unit)? = null,
+    /** Provides a 3×3 stabilization matrix (column-major, 9 floats) each frame. */
+    private val stabMatrixProvider: (() -> FloatArray)? = null
 ) {
 
     companion object {
@@ -158,6 +160,11 @@ class SurfaceTextureFrameReader(
                         // Pass transform matrix (handles rotation, flip from camera HAL)
                         val texMatLoc = GLES20.glGetUniformLocation(program, "uTexMatrix")
                         GLES20.glUniformMatrix4fv(texMatLoc, 1, false, texMatrix, 0)
+
+                        // Pass stabilization matrix (gyro-based EIS correction)
+                        val stabMatLoc = GLES20.glGetUniformLocation(program, "uStabMatrix")
+                        val stabMat = stabMatrixProvider?.invoke() ?: IDENTITY_MAT3
+                        GLES20.glUniformMatrix3fv(stabMatLoc, 1, false, stabMat, 0)
 
                         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
                         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
@@ -413,10 +420,13 @@ class SurfaceTextureFrameReader(
         attribute vec4 aPosition;
         attribute vec2 aTexCoord;
         uniform mat4 uTexMatrix;
+        uniform mat3 uStabMatrix;
         varying vec2 vTexCoord;
         void main() {
             gl_Position = aPosition;
-            vTexCoord = (uTexMatrix * vec4(aTexCoord, 0.0, 1.0)).xy;
+            // .xy discards w — valid because the homography keeps w≈1 for small rotations
+            vec2 stabUV = (uStabMatrix * vec3(aTexCoord, 1.0)).xy;
+            vTexCoord = (uTexMatrix * vec4(stabUV, 0.0, 1.0)).xy;
         }
     """.trimIndent()
 
@@ -485,3 +495,9 @@ class SurfaceTextureFrameReader(
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
     }
 }
+
+private val IDENTITY_MAT3 = floatArrayOf(
+    1f, 0f, 0f,
+    0f, 1f, 0f,
+    0f, 0f, 1f
+)

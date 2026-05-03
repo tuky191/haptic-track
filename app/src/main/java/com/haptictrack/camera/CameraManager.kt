@@ -2,12 +2,15 @@ package com.haptictrack.camera
 
 import android.content.Context
 import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CameraManager as Camera2Manager
 import android.util.Log
+import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.core.CameraControl
 import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview
+import androidx.camera.core.UseCaseGroup
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.FallbackStrategy
 import androidx.camera.video.Quality
@@ -40,12 +43,21 @@ class CameraManager(private val context: Context) {
     /** Detected optical zoom limit from physical camera focal lengths. */
     private var opticalZoomMax: Float = DEFAULT_OPTICAL_MAX
 
+    /** Software gyro-based EIS, stacks on top of ISP stabilization. */
+    val gyroStabilizer = GyroStabilizer(context)
+
+    /** Whether to request ISP-level preview stabilization on next bind. */
+    var ispStabilizationEnabled: Boolean = true
+
     /** Current lens facing — back by default. */
     var isFrontCamera: Boolean = false
         private set
 
     /** Reads frames from Preview surface via OpenGL. Always active. */
     private var frameReader: SurfaceTextureFrameReader? = null
+
+    /** GPU stabilization processor for VideoCapture (gyro EIS on recorded footage). */
+    private var stabProcessor: StabilizationProcessor? = null
 
     /**
      * Callback for analysis frames from SurfaceTexture (processing thread, ~10-12fps).
@@ -62,7 +74,8 @@ class CameraManager(private val context: Context) {
     /** Callback for viewfinder display frames from SurfaceTexture (GL thread, ~29fps). */
     var onViewfinderFrame: ((android.graphics.Bitmap) -> Unit)? = null
 
-    val preview = Preview.Builder().build()
+    lateinit var preview: Preview
+        private set
 
     private val videoExecutor = Executors.newSingleThreadExecutor()
     var videoCapture = createVideoCapture()
@@ -83,11 +96,13 @@ class CameraManager(private val context: Context) {
 
     init {
         opticalZoomMax = detectOpticalZoomMax()
+        gyroStabilizer.readCameraIntrinsics(context)
     }
 
     fun startCamera(lifecycleOwner: LifecycleOwner, previewView: PreviewView) {
         lifecycleOwnerRef = lifecycleOwner
         previewViewRef = previewView
+        gyroStabilizer.start()
         val providerFuture = ProcessCameraProvider.getInstance(context)
         providerFuture.addListener({
             cameraProvider = providerFuture.get()
@@ -108,6 +123,12 @@ class CameraManager(private val context: Context) {
         Log.i(TAG, "Switched to ${if (isFrontCamera) "front" else "back"} camera")
     }
 
+    fun rebind() {
+        val owner = lifecycleOwnerRef ?: return
+        val view = previewViewRef ?: return
+        bindUseCases(owner, view)
+    }
+
     /**
      * Rebind camera use cases. Always uses 2-stream (Preview + VideoCapture) with
      * SurfaceTextureFrameReader providing both analysis and viewfinder frames.
@@ -124,11 +145,46 @@ class CameraManager(private val context: Context) {
         // Recreate VideoCapture for fresh recorder per session
         videoCapture = createVideoCapture()
 
+        // Release previous stabilization processor
+        stabProcessor?.release()
+        stabProcessor = null
+
         val selector = if (isFrontCamera) CameraSelector.DEFAULT_FRONT_CAMERA
                        else CameraSelector.DEFAULT_BACK_CAMERA
 
+        val previewBuilder = Preview.Builder()
+        if (ispStabilizationEnabled && !gyroStabilizer.enabled) {
+            try {
+                val caps = Preview.getPreviewCapabilities(provider.getCameraInfo(selector))
+                if (caps.isStabilizationSupported) {
+                    previewBuilder.setPreviewStabilizationEnabled(true)
+                    Log.i(TAG, "ISP stabilization ON")
+                } else {
+                    Log.i(TAG, "ISP stabilization requested but not supported on this device")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to query stabilization caps: ${e.message}")
+            }
+        } else if (ispStabilizationEnabled && gyroStabilizer.enabled) {
+            Log.i(TAG, "ISP stabilization OFF (gyro EIS takes over)")
+        } else {
+            Log.i(TAG, "ISP stabilization OFF (user toggle)")
+        }
+        @Suppress("UnsafeOptInUsageError")
+        if (gyroStabilizer.enabled) {
+            Camera2Interop.Extender(previewBuilder)
+                .setCaptureRequestOption(
+                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF
+                )
+            Log.i(TAG, "OIS disabled (gyro EIS handles stabilization)")
+        }
+        gyroStabilizer.readCameraIntrinsics(context, frontFacing = isFrontCamera)
+        Log.i(TAG, "Gyro EIS ${if (gyroStabilizer.enabled) "ON" else "OFF"}")
+        preview = previewBuilder.build()
+
         // Always route Preview to SurfaceTextureFrameReader for fast off-thread frame capture.
-        // 2-stream binding (preview + video) enables 4K recording.
+        // 2-stream binding (preview + video) — FHD when stabilized, 4K otherwise.
         preview.surfaceProvider = Preview.SurfaceProvider { request ->
             val inputSize = request.resolution // camera's native buffer size (landscape, e.g. 1600x1200)
             // Output in portrait at analysis resolution.
@@ -148,7 +204,8 @@ class CameraManager(private val context: Context) {
                 outputWidth = outW,
                 outputHeight = outH,
                 onFrame = { bitmap -> onAnalysisFrame?.invoke(bitmap) },
-                onViewfinderFrame = { bitmap -> onViewfinderFrame?.invoke(bitmap) }
+                onViewfinderFrame = { bitmap -> onViewfinderFrame?.invoke(bitmap) },
+                stabMatrixProvider = { gyroStabilizer.getMatrix() }
             )
             val readerSurface = reader.start()
             frameReader = reader
@@ -157,13 +214,24 @@ class CameraManager(private val context: Context) {
                 Log.d(TAG, "Preview surface result: ${result.resultCode}")
             }
         }
-        val camera = provider.bindToLifecycle(lifecycleOwner, selector, preview, videoCapture)
+        val useCaseGroupBuilder = UseCaseGroup.Builder()
+            .addUseCase(preview)
+            .addUseCase(videoCapture)
+
+        if (gyroStabilizer.enabled) {
+            val processor = StabilizationProcessor { gyroStabilizer.getMatrix() }
+            stabProcessor = processor
+            useCaseGroupBuilder.addEffect(StabilizationEffect(processor))
+            Log.i(TAG, "Video stabilization effect added to VideoCapture pipeline")
+        }
+
+        val camera = provider.bindToLifecycle(lifecycleOwner, selector, useCaseGroupBuilder.build())
 
         cameraControl = camera.cameraControl
         cameraInfo = camera.cameraInfo
 
         val previewRes = preview.resolutionInfo?.resolution
-        Log.i(TAG, "Bound use cases — preview: $previewRes, frameReader: ${frameReader != null}, mode: always SurfaceTexture (2-stream)")
+        Log.i(TAG, "Bound use cases — preview: $previewRes, frameReader: ${frameReader != null}, gyroVideo: ${stabProcessor != null}")
     }
 
     fun setZoomRatio(ratio: Float) {
@@ -226,8 +294,11 @@ class CameraManager(private val context: Context) {
     }
 
     fun shutdown() {
+        gyroStabilizer.stop()
         frameReader?.stop()
         frameReader = null
+        stabProcessor?.release()
+        stabProcessor = null
         cameraProvider?.unbindAll()
     }
 }
