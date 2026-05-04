@@ -397,6 +397,9 @@ def replay_noncausal(gyro_ts, gyro_quats, params: BenchParams, sensor_orientatio
     for i in range(n):
         raw = quat_normalize(gyro_quats[i])
         correction_device = quat_multiply(quat_conjugate(ideal_smoothed[i]), raw)
+        if params.ois_compensation < 1.0:
+            identity_q = np.array([1.0, 0.0, 0.0, 0.0])
+            correction_device = slerp(identity_q, correction_device, params.ois_compensation)
         correction = quat_multiply(quat_multiply(d2s_quat, correction_device),
                                    quat_conjugate(d2s_quat))
         R = quat_to_rotation_matrix(correction)

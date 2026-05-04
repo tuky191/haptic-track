@@ -377,11 +377,11 @@ All in constructor defaults — no settings UI yet:
 | `zoomSpeed` | ZoomController | 0.05 | Zoom change per frame |
 | `scoreThreshold` | ObjectTracker (MediaPipe) | 0.5 | MediaPipe detector confidence cutoff |
 | `DEFAULT_TIME_CONSTANT` | GyroStabilizer | 0.50 | SLERP smoothing time constant (seconds) |
-| `cropZoom` | GyroStabilizer | 1.40 | Crop zoom for stabilization margin (29% FOV sacrifice) |
+| `cropZoom` | GyroStabilizer | 1.15 | Crop zoom for stabilization margin (13% FOV sacrifice) |
 | `GYRO_TC_MAX` | CameraViewModel | 0.80 | Slider: time constant at strength=0 (most laggy) |
 | `GYRO_TC_RANGE` | CameraViewModel | 0.50 | Slider: TC swing (0.80→0.30 at strength=1) |
-| `GYRO_CROP_MIN` | CameraViewModel | 1.15 | Slider: crop zoom at strength=0 |
-| `GYRO_CROP_RANGE` | CameraViewModel | 0.35 | Slider: crop swing (1.15→1.50 at strength=1) |
+| `GYRO_CROP_MIN` | CameraViewModel | 1.05 | Slider: crop zoom at strength=0 |
+| `GYRO_CROP_RANGE` | CameraViewModel | 0.20 | Slider: crop swing (1.05→1.25 at strength=1) |
 
 ## Known sharp edges
 
