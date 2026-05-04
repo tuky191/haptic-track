@@ -11,7 +11,7 @@ All changes follow this flow — never commit directly to master:
 3. **Device test** — build, install via ADB, test on physical device
 4. **Capture scenario** — every device test should produce a `scenario.json` for replay testing
 5. **Review** — review the PR (code review or self-review)
-6. **Merge** — merge to master and delete the branch
+6. **Merge** — merge to master. **Never delete branches** unless the user explicitly asks — old branches are the only way to bisect regressions after squash-merges
 
 ## Quick Reference
 
@@ -106,6 +106,16 @@ CameraViewModel
 2. Frames always come from the SurfaceTexture GL pipeline, same as normal tracking
 3. 4K recording is always available since the pipeline uses only 2 streams (preview + video)
 4. Tap-to-lock auto-starts recording (PR #111) — the first lock in a session begins capture so users don't miss the moment
+
+**Gyro EIS (Electronic Image Stabilization):**
+1. `GyroStabilizer` reads device orientation from `TYPE_GAME_ROTATION_VECTOR` at ~200Hz (fused gyro+accel, no mag)
+2. Exponential SLERP smoothing: `smoothed = slerp(smoothed, raw, alpha)` where `alpha = 1 - exp(-1/(hz*tc))`
+3. Leash limits smoothed-to-raw deviation to `cropMargin / max(fx,fy) / oisCompensation` — prevents corrections exceeding the crop margin without the hard clamp artifacts. Divides by oisCompensation because the applied correction is scaled down, so the leash can allow more deviation.
+4. Correction quaternion `smooth⁻¹ × raw` → rotation matrix → affine matrix (crop zoom + center translation) in sensor UV [0,1]². Uses affine instead of full homography to eliminate "breathing" (scale variation with correction angle).
+5. **Portrait UV conjugation** `H_portrait = T⁻¹ × H_sensor × T` converts from sensor UV (landscape) to portrait UV (what the GL shader sees). Without this, axes are swapped and corrections amplify shake.
+6. GL shader applies `uStabMatrix × aTexCoord` before `uTexMatrix` — both `SurfaceTextureFrameReader` (preview) and `StabilizationProcessor` (video capture) use the same matrix
+7. Focal lengths from `LENS_INTRINSIC_CALIBRATION` with device-specific empirical 1.27× scale (#158 tracks runtime auto-calibration)
+8. OIS is enabled alongside gyro EIS — OIS handles high-frequency micro-shake, gyro handles low-frequency sway. `oisCompensation=0.80` scales the correction quaternion via `slerp(identity, correction, 0.80)` to avoid overcorrecting the portion already handled optically.
 
 **Stealth mode:**
 - Black overlay covers the preview — purely a UI layer (opaque black Box in Compose)
@@ -223,6 +233,16 @@ First lock in a session auto-starts recording so the moment isn't lost. Volume-d
 
 ### Single-stage detection: EfficientDet-Lite2 (simplified 2026-04-24)
 EfficientDet-Lite2 (COCO 80) every frame. YOLOv8n-oiv7 label enrichment was removed once the re-acquisition gate became binary person/not-person — finer OIV7 labels stopped influencing any gate. Saved ~270ms at lock, ~1-2s at startup, 6.8MB APK, one GPU interpreter.
+
+### Gyro EIS: leash + portrait UV conjugation
+Gyroflow-style causal SLERP smoothing with a leash instead of hard clamp. The old hard clamp truncated 34% of corrections by up to 87%, causing visible wobble. The leash limits how far smoothed can deviate from raw, pulling it back before corrections exceed the crop margin.
+
+**Critical coordinate space issue:** The homography `H = K × R × K⁻¹` is computed in sensor UV (landscape), but the GL shader applies it in portrait UV (quad texture coordinates). Without the conjugation `H_portrait = T⁻¹ × H_sensor × T`, axes are swapped — horizontal corrections go vertical and vice versa, amplifying shake (measured 0.83× = making it worse). The transform `T` is derived from `SENSOR_ORIENTATION` (90° for rear, 270° for front cameras).
+
+Focal lengths from `LENS_INTRINSIC_CALIBRATION` with empirical 1.27× scale factor (device-specific, #158 tracks auto-calibration). OIS is enabled alongside gyro EIS with `oisCompensation=0.80` to avoid overcorrecting the high-frequency shake already handled optically.
+
+### EIS bench pipeline (`tools/stabilization_bench.py`)
+Off-device replay of the gyro stabilization algorithm for parameter tuning without device iteration. Loads `gyro_raw.csv` + `frames.csv` + `bench_params.csv` from `adb pull .../bench/session_*`, replays causal + non-causal smoothing, measures quality via phase correlation against the raw video. Key metrics: scale ratio (should be ~1.0), gyro-video correlation (>0.7 = good alignment), improvement ratio (causal vs raw). Supports `--tc`, `--crop`, `--fx`, `--fy` overrides for parameter sweeps and `--output-video` for visual comparison.
 
 ### Unified SurfaceTexture pipeline (PR #54)
 Always 2-stream (SurfaceTexture + VideoCapture). Recording toggles VideoCapture on/off — no rebind, no `prepareForRebind()`. Replaced the old 2/3-stream switching where ImageAnalysis was dropped during recording. Always 4K-capable.
@@ -356,6 +376,12 @@ All in constructor defaults — no settings UI yet:
 | `targetFrameOccupancy` | ZoomController | 0.15 | Target subject size as fraction of frame |
 | `zoomSpeed` | ZoomController | 0.05 | Zoom change per frame |
 | `scoreThreshold` | ObjectTracker (MediaPipe) | 0.5 | MediaPipe detector confidence cutoff |
+| `DEFAULT_TIME_CONSTANT` | GyroStabilizer | 0.50 | SLERP smoothing time constant (seconds) |
+| `cropZoom` | GyroStabilizer | 1.15 | Crop zoom for stabilization margin (13% FOV sacrifice) |
+| `GYRO_TC_MAX` | CameraViewModel | 0.80 | Slider: time constant at strength=0 (most laggy) |
+| `GYRO_TC_RANGE` | CameraViewModel | 0.50 | Slider: TC swing (0.80→0.30 at strength=1) |
+| `GYRO_CROP_MIN` | CameraViewModel | 1.05 | Slider: crop zoom at strength=0 |
+| `GYRO_CROP_RANGE` | CameraViewModel | 0.20 | Slider: crop swing (1.05→1.25 at strength=1) |
 
 ## Known sharp edges
 
@@ -367,6 +393,8 @@ All in constructor defaults — no settings UI yet:
 - VitTracker dies fast on small/transparent objects (bottles, glasses) — confidence drops <0.25 within 2-3s.
 - Walking/handheld with mid-recording rotation → upside-down REACQUIRE frames (#116). The runDetector upright transform isn't shared with the rest of the pipeline.
 - EfficientDet-Lite2 labels flicker (bowl↔potted plant↔toilet). Handled by the hard person/not-person gate + within-category embedding override; specific labels don't drive matching.
+- Gyro EIS focal length has a device-specific 1.27× empirical scale factor (Xiaomi 13 Pro). On other devices the scale may differ, reducing EIS effectiveness. #158 tracks runtime auto-calibration.
+- Gyro EIS homography must be conjugated from sensor UV to portrait UV (`sensorToPortraitGL`). Without this, axes are swapped and corrections amplify shake. The conjugation depends on `SENSOR_ORIENTATION` (90° rear, 270° front).
 - OpenCV adds ~10MB to APK (arm64).
 
 Roadmap items not yet built: pre-roll buffer, settings UI, landscape UI, battery/thermal management, VT refactor (drift-by-detection / OSTrack / JDE-style joint detector+embedder), photo capture (#38), auto-lock (#35).

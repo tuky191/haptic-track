@@ -417,9 +417,11 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                         ispEnabled = uiState.ispStabilization,
                         gyroEnabled = uiState.gyroEis,
                         gyroStrength = uiState.gyroStrength,
+                        adaptiveEnabled = uiState.adaptiveEis,
                         onToggleIsp = { viewModel.toggleIspStabilization() },
                         onToggleGyro = { viewModel.toggleGyroEis() },
                         onGyroStrengthChange = { viewModel.setGyroStrength(it) },
+                        onToggleAdaptive = { viewModel.toggleAdaptiveEis() },
                         modifier = Modifier
                             .align(Alignment.TopStart)
                             .padding(top = 110.dp, start = 16.dp)
@@ -780,14 +782,19 @@ private fun StabilizationToggles(
     ispEnabled: Boolean,
     gyroEnabled: Boolean,
     gyroStrength: Float,
+    adaptiveEnabled: Boolean,
     onToggleIsp: () -> Unit,
     onToggleGyro: () -> Unit,
     onGyroStrengthChange: (Float) -> Unit,
+    onToggleAdaptive: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(6.dp)) {
         StabToggle("ISP", ispEnabled, onToggleIsp)
         StabToggle("Gyro", gyroEnabled, onToggleGyro)
+        if (gyroEnabled) {
+            StabToggle("Adapt", adaptiveEnabled, onToggleAdaptive)
+        }
         if (gyroEnabled) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
