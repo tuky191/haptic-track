@@ -37,7 +37,6 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         private const val DEFAULT_HFOV_DEGREES = 75.0
         private const val TEL_INTERVAL = 200
         private const val SENSOR_GAP_THRESHOLD_NS = 100_000_000L
-        private const val CLAMP_MARGIN_FRACTION = 0.6
 
         // Adaptive smoothing: pan detection → dynamic TC
         private const val PAN_VELOCITY_THRESHOLD_DEG = 15.0
@@ -125,7 +124,6 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     private var telSumCorrDeg = 0.0
     private var telPeakCorrDeg = 0.0
     private var telPeakExcursion = 0f
-    private var telSumClamp = 0.0
     private var telWorstGapMs = 0.0
     private var telSumVel = 0.0
     private var telPeakVel = 0.0
@@ -179,7 +177,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             }
             PrintWriter(FileWriter(File(dir, "bench_params.csv"))).use { pw ->
                 pw.println("timeConstant,cropZoom,fxUv,fyUv,clampMarginFraction,oisCompensation")
-                pw.println("$timeConstant,$cropZoom,$fxUv,$fyUv,$CLAMP_MARGIN_FRACTION,$oisCompensation")
+                pw.println("$timeConstant,$cropZoom,$fxUv,$fyUv,0.6,$oisCompensation")
             }
             Log.i(TAG, "Bench capture started → ${dir.absolutePath}")
         } catch (e: Exception) {
@@ -380,7 +378,6 @@ class GyroStabilizer(context: Context) : SensorEventListener {
 
         val hPortrait = sensorToPortraitGL(h, sensorOrientation)
         val rawExcursion = maxCornerExcursion(hPortrait)
-        val clampRatio = 1.0
         currentMatrix.set(hPortrait)
 
         // --- Telemetry ---
@@ -392,7 +389,6 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         telSumCorrDeg += corrAngleDeg
         if (corrAngleDeg > telPeakCorrDeg) telPeakCorrDeg = corrAngleDeg
         if (rawExcursion > telPeakExcursion) telPeakExcursion = rawExcursion
-        telSumClamp += clampRatio
         val dtMs = dtSec * 1000.0
         if (dtMs > telWorstGapMs) telWorstGapMs = dtMs
         telSumVel += smoothedAngularVelocityDeg
@@ -404,7 +400,6 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             val line = "hz=${"%.0f".format(sampleRate)} " +
                 "alpha=${"%.4f".format(telSumAlpha / telFrames)} " +
                 "corrDeg=${"%.2f".format(telSumCorrDeg / telFrames)}/${"%.2f".format(telPeakCorrDeg)} " +
-                "clamp=${"%.0f".format(100.0 * telSumClamp / telFrames)}% " +
                 "excur=${"%.4f".format(telPeakExcursion)}/margin${"%.4f".format(cropMargin)} " +
                 "gap=${"%.1f".format(telWorstGapMs)}ms " +
                 "tc=${"%.3f".format(timeConstant)}→${"%.3f".format(telSumEffTc / telFrames)} " +
@@ -519,7 +514,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     private fun resetTelemetry() {
         telFrames = 0; telSumAlpha = 0.0; telSumCorrDeg = 0.0
         telPeakCorrDeg = 0.0; telPeakExcursion = 0f
-        telSumClamp = 0.0; telWorstGapMs = 0.0
+        telWorstGapMs = 0.0
         telSumVel = 0.0; telPeakVel = 0.0
         telSumEffTc = 0.0; telPanFrames = 0
     }

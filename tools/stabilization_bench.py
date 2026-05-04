@@ -318,7 +318,7 @@ def replay_stabilization(gyro_ts, gyro_quats, params: BenchParams, sensor_orient
         # Leash: limit deviation between smoothed and raw so the correction
         # always fits within the crop margin (replaces the old hard clamp)
         crop_margin = 0.5 * (1.0 - 1.0 / params.crop_zoom)
-        max_corr_angle = crop_margin / max(params.fx_uv, params.fy_uv)
+        max_corr_angle = crop_margin / max(params.fx_uv, params.fy_uv) / params.ois_compensation
         dev_quat = quat_multiply(quat_conjugate(smoothed), raw)
         dev_angle = 2.0 * np.arccos(np.clip(dev_quat[0], -1.0, 1.0))
         if dev_angle > max_corr_angle and dev_angle > 1e-6:
@@ -785,8 +785,8 @@ def gl_colmajor_center_disp(m):
     return tu - 0.5, tv - 0.5
 
 
-def compare_device_vs_replay(corrections_data, corrections_h, gyro_ts, frame_ts,
-                              sensor_orientation, out_dir):
+def compare_device_vs_replay(corrections_data, corrections_h, gyro_ts, gyro_quats,
+                              frame_ts, sensor_orientation, out_dir):
     """Compare device-logged corrections against replay-computed ones.
     Prints diagnostics and generates a comparison plot."""
     dev = corrections_data
@@ -821,7 +821,7 @@ def compare_device_vs_replay(corrections_data, corrections_h, gyro_ts, frame_ts,
 
         # Quaternion comparison
         dev_raw = quat_normalize(dev['raw_quat'][i])
-        rep_raw = quat_normalize(gyro_ts)  # need the actual quats
+        rep_raw = quat_normalize(gyro_quats[np.clip(idx, 0, len(gyro_quats) - 1)])
         dev_smooth = quat_normalize(dev['smooth_quat'][i])
 
     # Summary
@@ -1222,8 +1222,8 @@ def main():
         else:
             print(f"  Device TC constant — comparing against fixed TC replay")
             compare_h = fixed_h
-        compare_device_vs_replay(corrections_data, compare_h, gyro_ts, frame_ts,
-                                  args.sensor_orientation, out_dir)
+        compare_device_vs_replay(corrections_data, compare_h, gyro_ts, gyro_quats,
+                                  frame_ts, args.sensor_orientation, out_dir)
     else:
         print("\nNo corrections.csv found — capture a new session with the updated build for device-vs-replay comparison")
 

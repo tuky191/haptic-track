@@ -110,12 +110,12 @@ CameraViewModel
 **Gyro EIS (Electronic Image Stabilization):**
 1. `GyroStabilizer` reads device orientation from `TYPE_GAME_ROTATION_VECTOR` at ~200Hz (fused gyro+accel, no mag)
 2. Exponential SLERP smoothing: `smoothed = slerp(smoothed, raw, alpha)` where `alpha = 1 - exp(-1/(hz*tc))`
-3. Leash limits smoothed-to-raw deviation to `cropMargin / max(fx,fy)` — prevents corrections exceeding the crop margin without the hard clamp artifacts
-4. Correction quaternion `smooth⁻¹ × raw` → rotation matrix → homography `H = K × R × K⁻¹` in sensor UV [0,1]²
+3. Leash limits smoothed-to-raw deviation to `cropMargin / max(fx,fy) / oisCompensation` — prevents corrections exceeding the crop margin without the hard clamp artifacts. Divides by oisCompensation because the applied correction is scaled down, so the leash can allow more deviation.
+4. Correction quaternion `smooth⁻¹ × raw` → rotation matrix → affine matrix (crop zoom + center translation) in sensor UV [0,1]². Uses affine instead of full homography to eliminate "breathing" (scale variation with correction angle).
 5. **Portrait UV conjugation** `H_portrait = T⁻¹ × H_sensor × T` converts from sensor UV (landscape) to portrait UV (what the GL shader sees). Without this, axes are swapped and corrections amplify shake.
 6. GL shader applies `uStabMatrix × aTexCoord` before `uTexMatrix` — both `SurfaceTextureFrameReader` (preview) and `StabilizationProcessor` (video capture) use the same matrix
 7. Focal lengths from `LENS_INTRINSIC_CALIBRATION` with device-specific empirical 1.27× scale (#158 tracks runtime auto-calibration)
-8. OIS is unconditionally disabled — gyro EIS needs raw sensor data, and OIS introduces unmodeled corrections
+8. OIS is enabled alongside gyro EIS — OIS handles high-frequency micro-shake, gyro handles low-frequency sway. `oisCompensation=0.80` scales the correction quaternion via `slerp(identity, correction, 0.80)` to avoid overcorrecting the portion already handled optically.
 
 **Stealth mode:**
 - Black overlay covers the preview — purely a UI layer (opaque black Box in Compose)
@@ -239,7 +239,7 @@ Gyroflow-style causal SLERP smoothing with a leash instead of hard clamp. The ol
 
 **Critical coordinate space issue:** The homography `H = K × R × K⁻¹` is computed in sensor UV (landscape), but the GL shader applies it in portrait UV (quad texture coordinates). Without the conjugation `H_portrait = T⁻¹ × H_sensor × T`, axes are swapped — horizontal corrections go vertical and vice versa, amplifying shake (measured 0.83× = making it worse). The transform `T` is derived from `SENSOR_ORIENTATION` (90° for rear, 270° for front cameras).
 
-Focal lengths from `LENS_INTRINSIC_CALIBRATION` with empirical 1.27× scale factor (device-specific, #158 tracks auto-calibration). OIS is unconditionally disabled — gyro EIS needs raw sensor data.
+Focal lengths from `LENS_INTRINSIC_CALIBRATION` with empirical 1.27× scale factor (device-specific, #158 tracks auto-calibration). OIS is enabled alongside gyro EIS with `oisCompensation=0.80` to avoid overcorrecting the high-frequency shake already handled optically.
 
 ### EIS bench pipeline (`tools/stabilization_bench.py`)
 Off-device replay of the gyro stabilization algorithm for parameter tuning without device iteration. Loads `gyro_raw.csv` + `frames.csv` + `bench_params.csv` from `adb pull .../bench/session_*`, replays causal + non-causal smoothing, measures quality via phase correlation against the raw video. Key metrics: scale ratio (should be ~1.0), gyro-video correlation (>0.7 = good alignment), improvement ratio (causal vs raw). Supports `--tc`, `--crop`, `--fx`, `--fy` overrides for parameter sweeps and `--output-video` for visual comparison.
