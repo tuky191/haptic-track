@@ -174,9 +174,10 @@ class CameraManager(private val context: Context) {
         Camera2Interop.Extender(previewBuilder)
             .setCaptureRequestOption(
                 CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
-                CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF
+                CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON
             )
-        Log.i(TAG, "OIS disabled (gyro bench needs raw sensor data)")
+        gyroStabilizer.oisCompensation = 0.80
+        Log.i(TAG, "OIS enabled (gyro corrections scaled to ${gyroStabilizer.oisCompensation})")
         gyroStabilizer.readCameraIntrinsics(context, frontFacing = isFrontCamera)
         Log.i(TAG, "Gyro EIS ${if (gyroStabilizer.enabled) "ON" else "OFF"}")
         preview = previewBuilder.build()

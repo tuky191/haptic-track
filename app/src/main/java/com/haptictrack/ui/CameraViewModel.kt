@@ -51,8 +51,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         private const val TAP_PADDING = 0.03f
         private const val GYRO_TC_MAX = 0.80       // time constant at strength=0 (most laggy)
         private const val GYRO_TC_RANGE = 0.50      // TC swing: 0.80 - 0.50 = 0.30 at strength=1
-        private const val GYRO_CROP_MIN = 1.15f     // crop zoom at strength=0
-        private const val GYRO_CROP_RANGE = 0.35f   // crop swing: 1.15 + 0.35 = 1.50 at strength=1
+        private const val GYRO_CROP_MIN = 1.05f     // crop zoom at strength=0
+        private const val GYRO_CROP_RANGE = 0.20f   // crop swing: 1.05 + 0.20 = 1.25 at strength=1
     }
 
     /** Smooths idle detections by keeping objects alive for a few frames after they disappear. */
@@ -61,6 +61,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     init {
         orientationListener.start()
+        setGyroStrength(_uiState.value.gyroStrength)
 
         // Load ML models on background thread — takes ~20s with GPU delegate init
         viewModelScope.launch(Dispatchers.Default) {
@@ -292,6 +293,12 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         _uiState.update { it.copy(gyroEis = newValue) }
     }
 
+    fun toggleAdaptiveEis() {
+        val newValue = !_uiState.value.adaptiveEis
+        cameraManager.gyroStabilizer.adaptiveSmoothing = newValue
+        _uiState.update { it.copy(adaptiveEis = newValue) }
+    }
+
     fun setGyroStrength(strength: Float) {
         val clamped = strength.coerceIn(0f, 1f)
         val tc = GYRO_TC_MAX - GYRO_TC_RANGE * clamped
@@ -313,7 +320,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         zoomController.reset()
         hapticManager.updateTrackingStatus(TrackingStatus.IDLE)
         _uiState.update {
-            TrackingUiState(status = TrackingStatus.IDLE, isRecording = it.isRecording, captureMode = it.captureMode, stealthMode = it.stealthMode, isReady = it.isReady, ispStabilization = it.ispStabilization, gyroEis = it.gyroEis, gyroStrength = it.gyroStrength)
+            TrackingUiState(status = TrackingStatus.IDLE, isRecording = it.isRecording, captureMode = it.captureMode, stealthMode = it.stealthMode, isReady = it.isReady, ispStabilization = it.ispStabilization, gyroEis = it.gyroEis, gyroStrength = it.gyroStrength, adaptiveEis = it.adaptiveEis)
         }
     }
 

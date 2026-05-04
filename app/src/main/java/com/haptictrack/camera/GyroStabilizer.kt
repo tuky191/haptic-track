@@ -24,9 +24,10 @@ import kotlin.math.*
  * 4. Convert to a 3×3 homography H = K × R × K⁻¹ in texture UV space
  * 5. The GL shader applies H to texture coordinates before sampling
  *
- * The timeConstant controls smoothing strength:
- *   lower = more aggressive smoothing (more stable, but laggier on intentional pans)
- *   higher = more responsive (less smoothing, preserves fast pans)
+ * The timeConstant sets the base smoothing strength (higher = more stable,
+ * lower = more responsive). Adaptive pan detection monitors angular velocity
+ * and reduces the effective TC during intentional pans for faster response,
+ * restoring it during shake for maximum stability.
  */
 class GyroStabilizer(context: Context) : SensorEventListener {
 
@@ -37,6 +38,13 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         private const val TEL_INTERVAL = 200
         private const val SENSOR_GAP_THRESHOLD_NS = 100_000_000L
         private const val CLAMP_MARGIN_FRACTION = 0.6
+
+        // Adaptive smoothing: pan detection → dynamic TC
+        private const val PAN_VELOCITY_THRESHOLD_DEG = 15.0
+        private const val PAN_ONSET_SEC = 0.20
+        private const val PAN_TC_FACTOR = 0.30
+        private const val VELOCITY_SMOOTHING_TC = 0.05
+        private const val TC_RAMP_SPEED = 5.0
     }
 
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
@@ -56,7 +64,14 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     private var sensorOrientation: Int = 90
 
     /** Crop zoom applied to absorb warp margins (1.0 = no crop, 1.05 = 5% crop). */
-    var cropZoom: Float = 1.40f
+    var cropZoom: Float = 1.15f
+
+    /** Adaptive pan detection: reduces TC during pans, increases during shake. */
+    var adaptiveSmoothing: Boolean = true
+
+    /** OIS compensation: scales correction magnitude when optical stabilization is active.
+     *  OIS handles ~20% of shake; without compensation the gyro overcorrects. */
+    var oisCompensation: Double = 1.0
 
     /** Current stabilization matrix in column-major order for GL (mat3). Identity when disabled. */
     private val currentMatrix = AtomicReference(IDENTITY_MATRIX.clone())
@@ -77,11 +92,20 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             }
         }
 
-    private var rawQuat = Quat(1.0, 0.0, 0.0, 0.0)
-    private var smoothedQuat = Quat(1.0, 0.0, 0.0, 0.0)
+    private val IDENTITY_QUAT = Quat(1.0, 0.0, 0.0, 0.0)
+    @Volatile private var rawQuat = Quat(1.0, 0.0, 0.0, 0.0)
+    @Volatile private var smoothedQuat = Quat(1.0, 0.0, 0.0, 0.0)
     @Volatile private var initialized = false
     private var lastTimestampNs = 0L
     private var sampleRate = 200.0
+
+    // Adaptive smoothing state
+    private var prevRawQuat = Quat(1.0, 0.0, 0.0, 0.0)
+    private var smoothedAngularVelocityDeg = 0.0
+    private var highVelocityDurationSec = 0.0
+    @Volatile private var effectiveTc = DEFAULT_TIME_CONSTANT
+    @Volatile private var lastLeashActive = false
+    @Volatile private var lastCorrAngleDeg = 0.0
 
     // Session log file (gyro.log in the tracking session directory)
     @Volatile
@@ -92,6 +116,8 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     private var benchGyroWriter: PrintWriter? = null
     @Volatile
     private var benchFrameWriter: PrintWriter? = null
+    @Volatile
+    private var benchCorrWriter: PrintWriter? = null
 
     // Telemetry accumulators (reset every TEL_INTERVAL sensor events)
     private var telFrames = 0
@@ -101,6 +127,10 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     private var telPeakExcursion = 0f
     private var telSumClamp = 0.0
     private var telWorstGapMs = 0.0
+    private var telSumVel = 0.0
+    private var telPeakVel = 0.0
+    private var telSumEffTc = 0.0
+    private var telPanFrames = 0
 
     fun start() {
         if (rotationSensor == null) {
@@ -108,7 +138,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             return
         }
         sensorManager.registerListener(this, rotationSensor, SensorManager.SENSOR_DELAY_FASTEST)
-        Log.i(TAG, "Started (timeConstant=${timeConstant}s, fx=${"%.3f".format(fxUv)}, crop=$cropZoom)")
+        Log.i(TAG, "Started (timeConstant=${timeConstant}s, fx=${"%.3f".format(fxUv)}, crop=$cropZoom, oisComp=${"%.2f".format(oisCompensation)})")
     }
 
     fun stop() {
@@ -144,9 +174,12 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             benchFrameWriter = PrintWriter(FileWriter(File(dir, "frames.csv")), false).also {
                 it.println("frame_idx,timestamp_ns")
             }
+            benchCorrWriter = PrintWriter(FileWriter(File(dir, "corrections.csv")), false).also {
+                it.println("frame_idx,timestamp_ns,raw_w,raw_x,raw_y,raw_z,smooth_w,smooth_x,smooth_y,smooth_z,eff_tc,corr_deg,leash,m0,m1,m2,m3,m4,m5,m6,m7,m8")
+            }
             PrintWriter(FileWriter(File(dir, "bench_params.csv"))).use { pw ->
-                pw.println("timeConstant,cropZoom,fxUv,fyUv,clampMarginFraction")
-                pw.println("$timeConstant,$cropZoom,$fxUv,$fyUv,$CLAMP_MARGIN_FRACTION")
+                pw.println("timeConstant,cropZoom,fxUv,fyUv,clampMarginFraction,oisCompensation")
+                pw.println("$timeConstant,$cropZoom,$fxUv,$fyUv,$CLAMP_MARGIN_FRACTION,$oisCompensation")
             }
             Log.i(TAG, "Bench capture started → ${dir.absolutePath}")
         } catch (e: Exception) {
@@ -161,10 +194,23 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         benchFrameWriter?.flush()
         benchFrameWriter?.close()
         benchFrameWriter = null
+        benchCorrWriter?.flush()
+        benchCorrWriter?.close()
+        benchCorrWriter = null
     }
 
     fun logFrameTimestamp(frameIdx: Long, timestampNs: Long) {
         benchFrameWriter?.println("$frameIdx,$timestampNs")
+        val cw = benchCorrWriter ?: return
+        val rq = rawQuat
+        val sq = smoothedQuat
+        val mat = currentMatrix.get()
+        val leash = if (lastLeashActive) 1 else 0
+        cw.println("$frameIdx,$timestampNs," +
+            "${rq.w},${rq.x},${rq.y},${rq.z}," +
+            "${sq.w},${sq.x},${sq.y},${sq.z}," +
+            "$effectiveTc,$lastCorrAngleDeg,$leash," +
+            "${mat[0]},${mat[1]},${mat[2]},${mat[3]},${mat[4]},${mat[5]},${mat[6]},${mat[7]},${mat[8]}")
     }
 
     /** Get the current stabilization matrix (column-major mat3, 9 floats). Thread-safe. */
@@ -250,6 +296,8 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             smoothedQuat = rawQuat
             initialized = true
             lastTimestampNs = nowNs
+            prevRawQuat = rawQuat
+            resetAdaptiveState()
             return
         }
 
@@ -261,14 +309,40 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             Log.w(TAG, warn)
             try { sessionWriter?.println("${System.currentTimeMillis()} WARN $warn") } catch (_: Exception) {}
             smoothedQuat = rawQuat
+            prevRawQuat = rawQuat
+            resetAdaptiveState()
             return
         }
 
         val dtSec = dtNs / 1_000_000_000.0
         sampleRate = 0.95 * sampleRate + 0.05 * (1.0 / dtSec)
 
-        // Exponential SLERP smoothing (causal, forward-only — Gyroflow's plain algorithm)
-        val alpha = 1.0 - exp(-(1.0 / sampleRate) / timeConstant)
+        // --- Adaptive smoothing: angular velocity → pan detection → effective TC ---
+        val deltaQuat = prevRawQuat.conjugate() * rawQuat
+        val deltaAngle = 2.0 * acos(abs(deltaQuat.w).coerceIn(0.0, 1.0))
+        val angVelDeg = Math.toDegrees(deltaAngle) / dtSec
+
+        val velAlpha = 1.0 - exp(-dtSec / VELOCITY_SMOOTHING_TC)
+        smoothedAngularVelocityDeg += velAlpha * (angVelDeg - smoothedAngularVelocityDeg)
+
+        if (smoothedAngularVelocityDeg > PAN_VELOCITY_THRESHOLD_DEG) {
+            highVelocityDurationSec += dtSec
+        } else {
+            highVelocityDurationSec = 0.0
+        }
+
+        val isPanning = highVelocityDurationSec >= PAN_ONSET_SEC
+        if (adaptiveSmoothing) {
+            val targetTc = if (isPanning) timeConstant * PAN_TC_FACTOR else timeConstant
+            val tcAlpha = 1.0 - exp(-dtSec * TC_RAMP_SPEED)
+            effectiveTc += tcAlpha * (targetTc - effectiveTc)
+        } else {
+            effectiveTc = timeConstant
+        }
+        prevRawQuat = rawQuat
+
+        // Exponential SLERP smoothing with adaptive time constant
+        val alpha = 1.0 - exp(-(1.0 / sampleRate) / effectiveTc)
         smoothedQuat = slerp(smoothedQuat, rawQuat, alpha)
 
         // Leash: limit how far smoothed can deviate from raw. Without this, the
@@ -277,17 +351,25 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         // of the correction during peaks, creating visible wobble artifacts.
         // The leash pulls smoothed toward raw so corrections always fit the margin.
         val cropMargin = 0.5 * (1.0 - 1.0 / cropZoom)
-        val maxCorrAngle = cropMargin / maxOf(fxUv, fyUv)
+        val maxCorrAngle = cropMargin / maxOf(fxUv, fyUv) / oisCompensation
         val devQuat = smoothedQuat.conjugate() * rawQuat
         val devAngle = 2.0 * acos(devQuat.w.coerceIn(-1.0, 1.0))
-        if (devAngle > maxCorrAngle && devAngle > 1e-6) {
+        lastLeashActive = devAngle > maxCorrAngle && devAngle > 1e-6
+        if (lastLeashActive) {
             val catchUp = 1.0 - maxCorrAngle / devAngle
             smoothedQuat = slerp(smoothedQuat, rawQuat, catchUp)
         }
 
         // Correction: for each output pixel (in the smoothed frame), find where to
         // sample in the raw (shaky) input texture. That's smooth⁻¹ × raw.
-        val correctionDevice = smoothedQuat.conjugate() * rawQuat
+        var correctionDevice = smoothedQuat.conjugate() * rawQuat
+
+        // Scale correction when OIS is active — OIS handles part of the shake,
+        // so full correction overcorrects. slerp(identity, corr, factor) scales the
+        // rotation angle by factor.
+        if (oisCompensation < 1.0) {
+            correctionDevice = slerp(IDENTITY_QUAT, correctionDevice, oisCompensation)
+        }
 
         // Rotate correction from device coordinate space into camera sensor space.
         val correction = deviceToSensorQuat * correctionDevice * deviceToSensorQuat.conjugate()
@@ -303,6 +385,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
 
         // --- Telemetry ---
         val corrAngleDeg = 2.0 * acos(correction.w.coerceIn(-1.0, 1.0)) * (180.0 / PI)
+        lastCorrAngleDeg = corrAngleDeg
 
         telFrames++
         telSumAlpha += alpha
@@ -312,6 +395,10 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         telSumClamp += clampRatio
         val dtMs = dtSec * 1000.0
         if (dtMs > telWorstGapMs) telWorstGapMs = dtMs
+        telSumVel += smoothedAngularVelocityDeg
+        if (smoothedAngularVelocityDeg > telPeakVel) telPeakVel = smoothedAngularVelocityDeg
+        telSumEffTc += effectiveTc
+        if (isPanning) telPanFrames++
 
         if (telFrames >= TEL_INTERVAL) {
             val line = "hz=${"%.0f".format(sampleRate)} " +
@@ -320,7 +407,10 @@ class GyroStabilizer(context: Context) : SensorEventListener {
                 "clamp=${"%.0f".format(100.0 * telSumClamp / telFrames)}% " +
                 "excur=${"%.4f".format(telPeakExcursion)}/margin${"%.4f".format(cropMargin)} " +
                 "gap=${"%.1f".format(telWorstGapMs)}ms " +
-                "tc=${"%.3f".format(timeConstant)} crop=${"%.2f".format(cropZoom)}"
+                "tc=${"%.3f".format(timeConstant)}→${"%.3f".format(telSumEffTc / telFrames)} " +
+                "vel=${"%.1f".format(telSumVel / telFrames)}/${"%.1f".format(telPeakVel)}°/s " +
+                "pan=${"%.0f".format(100.0 * telPanFrames / telFrames)}% " +
+                "crop=${"%.2f".format(cropZoom)}"
             Log.d(TAG, line)
             try { sessionWriter?.println("${System.currentTimeMillis()} $line") } catch (_: Exception) {}
             resetTelemetry()
@@ -369,45 +459,45 @@ class GyroStabilizer(context: Context) : SensorEventListener {
 
 
     /**
-     * Compute H = K × R × K⁻¹ in UV [0,1]² coordinates, with crop zoom.
+     * Compute stabilization as crop zoom + center translation (affine, no perspective).
      *
-     * K_uv = [[fx, 0, 0.5], [0, fy, 0.5], [0, 0, 1]]
-     * K_uv⁻¹ = [[1/fx, 0, -0.5/fx], [0, 1/fy, -0.5/fy], [0, 0, 1]]
-     *
-     * The crop zoom scales texture coordinates INWARD so the viewport maps to the
-     * centre of the texture, leaving margin at the edges for stabilization correction.
-     * S = [[1/z, 0, 0.5*(1-1/z)], [0, 1/z, 0.5*(1-1/z)], [0, 0, 1]]
-     * Final: H = S × K × R × K⁻¹
+     * Computes the full homography H = K × R × K⁻¹ to find the center pixel
+     * displacement, then builds an affine matrix with constant scale (1/zoom)
+     * and variable translation. This eliminates the perspective/scale variation
+     * from the full homography that causes visible "breathing" (objects appearing
+     * to stretch and compress as the correction angle changes).
      */
     private fun computeHomographyUV(
         r: DoubleArray, fx: Double, fy: Double, zoom: Double
     ): FloatArray {
-        // K × R (3×3 row-major)
+        // Full H = K × R × K⁻¹ for center displacement extraction
         val kr = doubleArrayOf(
             fx * r[0] + 0.5 * r[6],  fx * r[1] + 0.5 * r[7],  fx * r[2] + 0.5 * r[8],
             fy * r[3] + 0.5 * r[6],  fy * r[4] + 0.5 * r[7],  fy * r[5] + 0.5 * r[8],
                            r[6],                r[7],                r[8]
         )
-        // (K × R) × K⁻¹
         val ifx = 1.0 / fx; val ify = 1.0 / fy
-        val h = doubleArrayOf(
-            kr[0] * ifx,              kr[1] * ify,              kr[2] - kr[0] * 0.5 * ifx - kr[1] * 0.5 * ify,
-            kr[3] * ifx,              kr[4] * ify,              kr[5] - kr[3] * 0.5 * ifx - kr[4] * 0.5 * ify,
-            kr[6] * ifx,              kr[7] * ify,              kr[8] - kr[6] * 0.5 * ifx - kr[7] * 0.5 * ify
-        )
-        // Apply crop: scale inward around center (1/zoom keeps tex coords within [0,1])
+        val h02 = kr[2] - kr[0] * 0.5 * ifx - kr[1] * 0.5 * ify
+        val h12 = kr[5] - kr[3] * 0.5 * ifx - kr[4] * 0.5 * ify
+        val h22 = kr[8] - kr[6] * 0.5 * ifx - kr[7] * 0.5 * ify
+
+        // Center displacement: H × [0.5, 0.5, 1] with perspective division
+        val w  = kr[6] * ifx * 0.5 + kr[7] * ify * 0.5 + h22
+        val cu = (kr[0] * ifx * 0.5 + kr[1] * ify * 0.5 + h02) / w
+        val cv = (kr[3] * ifx * 0.5 + kr[4] * ify * 0.5 + h12) / w
+        val du = cu - 0.5
+        val dv = cv - 0.5
+
+        // Affine: constant crop zoom + translation (no scale/perspective variation)
         val iz = 1.0 / zoom
-        val tx = 0.5 * (1.0 - iz)
-        val result = floatArrayOf(
-            (iz * h[0]).toFloat(),             (iz * h[1]).toFloat(),             (iz * h[2] + tx).toFloat(),
-            (iz * h[3]).toFloat(),             (iz * h[4]).toFloat(),             (iz * h[5] + tx).toFloat(),
-            h[6].toFloat(),                      h[7].toFloat(),                      h[8].toFloat()
-        )
-        // Convert from row-major to column-major for GL
+        val tx = 0.5 * (1.0 - iz) + iz * du
+        val ty = 0.5 * (1.0 - iz) + iz * dv
+
+        // Row-major [[iz,0,tx],[0,iz,ty],[0,0,1]] → column-major for GL
         return floatArrayOf(
-            result[0], result[3], result[6],
-            result[1], result[4], result[7],
-            result[2], result[5], result[8]
+            iz.toFloat(), 0f, 0f,
+            0f, iz.toFloat(), 0f,
+            tx.toFloat(), ty.toFloat(), 1f
         )
     }
 
@@ -430,6 +520,14 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         telFrames = 0; telSumAlpha = 0.0; telSumCorrDeg = 0.0
         telPeakCorrDeg = 0.0; telPeakExcursion = 0f
         telSumClamp = 0.0; telWorstGapMs = 0.0
+        telSumVel = 0.0; telPeakVel = 0.0
+        telSumEffTc = 0.0; telPanFrames = 0
+    }
+
+    private fun resetAdaptiveState() {
+        smoothedAngularVelocityDeg = 0.0
+        highVelocityDurationSec = 0.0
+        effectiveTc = timeConstant
     }
 
     private fun hfovToFocalUv(hfovDegrees: Double): Double {
