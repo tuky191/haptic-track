@@ -49,10 +49,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         private const val TAG = "CameraVM"
         /** Tap target padding in normalized coordinates (~3% of screen on each side). */
         private const val TAP_PADDING = 0.03f
-        private const val GYRO_TC_MAX = 0.80       // time constant at strength=0 (most laggy)
-        private const val GYRO_TC_RANGE = 0.50      // TC swing: 0.80 - 0.50 = 0.30 at strength=1
-        private const val GYRO_CROP_MIN = 1.05f     // crop zoom at strength=0
-        private const val GYRO_CROP_RANGE = 0.20f   // crop swing: 1.05 + 0.20 = 1.25 at strength=1
+        private const val GYRO_TC_MAX = 1.00       // time constant at strength=0 (most laggy)
+        private const val GYRO_TC_RANGE = 0.60      // TC swing: 1.00 - 0.60 = 0.40 at strength=1
+        private const val GYRO_CROP_MIN = 1.0f      // crop zoom at strength=0 (no FOV loss)
+        private const val GYRO_CROP_RANGE = 0.25f   // crop swing: 1.0 + 0.25 = 1.25 at strength=1
     }
 
     /** Smooths idle detections by keeping objects alive for a few frames after they disappear. */
@@ -299,6 +299,18 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         _uiState.update { it.copy(adaptiveEis = newValue) }
     }
 
+    fun toggleLeash() {
+        val newValue = !_uiState.value.leashEnabled
+        cameraManager.gyroStabilizer.leashEnabled = newValue
+        _uiState.update { it.copy(leashEnabled = newValue) }
+    }
+
+    fun toggleOisCompensation() {
+        val newValue = !_uiState.value.oisCompensation
+        cameraManager.gyroStabilizer.oisCompensation = if (newValue) 0.80 else 1.0
+        _uiState.update { it.copy(oisCompensation = newValue) }
+    }
+
     fun setGyroStrength(strength: Float) {
         val clamped = strength.coerceIn(0f, 1f)
         val tc = GYRO_TC_MAX - GYRO_TC_RANGE * clamped
@@ -320,7 +332,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         zoomController.reset()
         hapticManager.updateTrackingStatus(TrackingStatus.IDLE)
         _uiState.update {
-            TrackingUiState(status = TrackingStatus.IDLE, isRecording = it.isRecording, captureMode = it.captureMode, stealthMode = it.stealthMode, isReady = it.isReady, ispStabilization = it.ispStabilization, gyroEis = it.gyroEis, gyroStrength = it.gyroStrength, adaptiveEis = it.adaptiveEis)
+            TrackingUiState(status = TrackingStatus.IDLE, isRecording = it.isRecording, captureMode = it.captureMode, stealthMode = it.stealthMode, isReady = it.isReady, ispStabilization = it.ispStabilization, gyroEis = it.gyroEis, gyroStrength = it.gyroStrength, adaptiveEis = it.adaptiveEis, leashEnabled = it.leashEnabled, oisCompensation = it.oisCompensation)
         }
     }
 

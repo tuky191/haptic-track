@@ -145,6 +145,7 @@ class BenchParams:
     fy_uv: float
     clamp_margin_fraction: float
     ois_compensation: float = 1.0
+    leash_enabled: bool = True
 
 def load_params(bench_dir: Path) -> BenchParams:
     with open(bench_dir / "bench_params.csv") as f:
@@ -317,13 +318,14 @@ def replay_stabilization(gyro_ts, gyro_quats, params: BenchParams, sensor_orient
 
         # Leash: limit deviation between smoothed and raw so the correction
         # always fits within the crop margin (replaces the old hard clamp)
-        crop_margin = 0.5 * (1.0 - 1.0 / params.crop_zoom)
-        max_corr_angle = crop_margin / max(params.fx_uv, params.fy_uv) / params.ois_compensation
-        dev_quat = quat_multiply(quat_conjugate(smoothed), raw)
-        dev_angle = 2.0 * np.arccos(np.clip(dev_quat[0], -1.0, 1.0))
-        if dev_angle > max_corr_angle and dev_angle > 1e-6:
-            catch_up = 1.0 - max_corr_angle / dev_angle
-            smoothed = slerp(smoothed, raw, catch_up)
+        if params.leash_enabled:
+            crop_margin = 0.5 * (1.0 - 1.0 / params.crop_zoom)
+            max_corr_angle = crop_margin / max(params.fx_uv, params.fy_uv) / params.ois_compensation
+            dev_quat = quat_multiply(quat_conjugate(smoothed), raw)
+            dev_angle = 2.0 * np.arccos(np.clip(dev_quat[0], -1.0, 1.0))
+            if dev_angle > max_corr_angle and dev_angle > 1e-6:
+                catch_up = 1.0 - max_corr_angle / dev_angle
+                smoothed = slerp(smoothed, raw, catch_up)
 
         smoothed_quats[i] = smoothed
 
@@ -418,6 +420,327 @@ def replay_noncausal(gyro_ts, gyro_quats, params: BenchParams, sensor_orientatio
 
     return corrections_h, ideal_smoothed
 
+
+def replay_lookahead(gyro_ts, gyro_quats, params: BenchParams, sensor_orientation=90,
+                     lookahead_ms=100):
+    """
+    Causal smoothing with delayed output (#160).
+
+    The forward SLERP smoother at time t+L has already "seen" data up to t+L,
+    so using it as the smoothed orientation for time t effectively provides L ms
+    of lookahead. This is realizable in real-time by buffering L ms of frames.
+
+    For each output sample at time t, we use the forward-smoothed orientation at
+    time t+L as the "smoothed" reference, then compute correction = smoothed⁻¹ × raw(t).
+    """
+    n = len(gyro_ts)
+    SENSOR_GAP_NS = 100_000_000
+    lookahead_ns = int(lookahead_ms * 1_000_000)
+
+    # Compute forward-smoothed for all samples (standard causal SLERP)
+    fwd_smoothed = np.zeros((n, 4))
+    smoothed = quat_normalize(gyro_quats[0])
+    fwd_smoothed[0] = smoothed
+    sample_rate = 200.0
+    last_ts = gyro_ts[0]
+    for i in range(1, n):
+        raw = quat_normalize(gyro_quats[i])
+        dt_ns = gyro_ts[i] - last_ts
+        last_ts = gyro_ts[i]
+        if dt_ns <= 0 or dt_ns > SENSOR_GAP_NS:
+            smoothed = raw.copy()
+            fwd_smoothed[i] = smoothed
+            continue
+        dt_sec = dt_ns / 1e9
+        sample_rate = 0.95 * sample_rate + 0.05 * (1.0 / dt_sec)
+        alpha = 1.0 - np.exp(-(1.0 / sample_rate) / params.time_constant)
+        smoothed = slerp(smoothed, raw, alpha)
+        fwd_smoothed[i] = smoothed
+
+    # For each sample: use the forward-smoothed value at t+lookahead as the
+    # "smoothed" orientation, providing effective lookahead
+    angle = np.radians(sensor_orientation)
+    d2s_quat = np.array([np.cos(angle/2), 0, 0, np.sin(angle/2)])
+    corrections_h = np.zeros((n, 3, 3))
+
+    for i in range(n):
+        raw = quat_normalize(gyro_quats[i])
+
+        # Find the forward-smoothed value at t + lookahead
+        target_ts = gyro_ts[i] + lookahead_ns
+        la_idx = np.searchsorted(gyro_ts, target_ts, side='right') - 1
+        la_idx = np.clip(la_idx, 0, n - 1)
+        sm = fwd_smoothed[la_idx].copy()
+
+        # Leash
+        if params.leash_enabled:
+            crop_margin = 0.5 * (1.0 - 1.0 / params.crop_zoom)
+            max_corr_angle = crop_margin / max(params.fx_uv, params.fy_uv) / params.ois_compensation
+            dev_quat = quat_multiply(quat_conjugate(sm), raw)
+            dev_angle = 2.0 * np.arccos(np.clip(dev_quat[0], -1.0, 1.0))
+            if dev_angle > max_corr_angle and dev_angle > 1e-6:
+                catch_up = 1.0 - max_corr_angle / dev_angle
+                sm = slerp(sm, raw, catch_up)
+
+        correction_device = quat_multiply(quat_conjugate(sm), raw)
+        if params.ois_compensation < 1.0:
+            identity_q = np.array([1.0, 0.0, 0.0, 0.0])
+            correction_device = slerp(identity_q, correction_device, params.ois_compensation)
+        correction = quat_multiply(quat_multiply(d2s_quat, correction_device),
+                                   quat_conjugate(d2s_quat))
+        R = quat_to_rotation_matrix(correction)
+        corrections_h[i] = compute_homography_uv(R, params.fx_uv, params.fy_uv, params.crop_zoom)
+
+    return corrections_h, fwd_smoothed
+
+
+def replay_adaptive_crop(gyro_ts, gyro_quats, params: BenchParams, sensor_orientation=90,
+                         adaptive_tc=True, crop_min=1.0, crop_max=None,
+                         crop_ramp_tc=0.3, correction_threshold_deg=0.3):
+    """
+    Causal SLERP smoothing with adaptive crop zoom.
+
+    When the correction angle is small (smooth walking, translation-dominated),
+    crop zoom is reduced toward crop_min (1.0 = no FOV loss). When corrections
+    are large (shake being corrected), crop zoom ramps up to crop_max to provide
+    margin. This avoids the crop-amplification penalty during smooth motion.
+
+    Args:
+        crop_min: minimum crop zoom when no correction needed (1.0 = full FOV)
+        crop_max: maximum crop zoom during active stabilization (default: params.crop_zoom)
+        crop_ramp_tc: time constant for crop zoom transitions (seconds)
+        correction_threshold_deg: correction angle (degrees) at which crop is at midpoint
+    """
+    if crop_max is None:
+        crop_max = params.crop_zoom
+
+    n = len(gyro_ts)
+    SENSOR_GAP_NS = 100_000_000
+    angle = np.radians(sensor_orientation)
+    d2s_quat = np.array([np.cos(angle/2), 0, 0, np.sin(angle/2)])
+
+    corrections_h = np.zeros((n, 3, 3))
+    smoothed_quats = np.zeros((n, 4))
+    identity = np.eye(3)
+
+    smoothed = gyro_quats[0].copy()
+    sample_rate = 200.0
+    initialized = False
+    last_ts = gyro_ts[0]
+
+    # Adaptive TC state (same as replay_stabilization)
+    prev_raw = None
+    smoothed_vel_deg = 0.0
+    high_vel_duration = 0.0
+    effective_tc = params.time_constant
+
+    # Adaptive crop state
+    smoothed_corr_deg = 0.0  # exponentially-smoothed correction magnitude
+    current_crop = crop_min  # start at minimum (no penalty until shake detected)
+
+    # Trace arrays for diagnostics
+    trace_crop = np.zeros(n)
+    trace_corr_deg = np.zeros(n)
+
+    for i in range(n):
+        raw = quat_normalize(gyro_quats[i])
+        now_ns = gyro_ts[i]
+
+        if not initialized:
+            smoothed = raw.copy()
+            initialized = True
+            last_ts = now_ns
+            prev_raw = raw.copy()
+            smoothed_quats[i] = smoothed
+            corrections_h[i] = identity
+            trace_crop[i] = current_crop
+            continue
+
+        dt_ns = now_ns - last_ts
+        last_ts = now_ns
+        if dt_ns <= 0:
+            smoothed_quats[i] = smoothed
+            corrections_h[i] = corrections_h[max(0, i-1)]
+            trace_crop[i] = current_crop
+            continue
+        if dt_ns > SENSOR_GAP_NS:
+            smoothed = raw.copy()
+            prev_raw = raw.copy()
+            smoothed_vel_deg = 0.0
+            high_vel_duration = 0.0
+            effective_tc = params.time_constant
+            smoothed_quats[i] = smoothed
+            corrections_h[i] = identity
+            trace_crop[i] = current_crop
+            continue
+
+        dt_sec = dt_ns / 1e9
+        sample_rate = 0.95 * sample_rate + 0.05 * (1.0 / dt_sec)
+
+        # Adaptive TC (pan detection)
+        if adaptive_tc and prev_raw is not None:
+            delta_quat = quat_multiply(quat_conjugate(prev_raw), raw)
+            delta_angle = 2.0 * np.arccos(np.clip(abs(delta_quat[0]), 0.0, 1.0))
+            ang_vel_deg = np.degrees(delta_angle) / dt_sec
+
+            vel_alpha = 1.0 - np.exp(-dt_sec / VELOCITY_SMOOTHING_TC)
+            smoothed_vel_deg += vel_alpha * (ang_vel_deg - smoothed_vel_deg)
+
+            if smoothed_vel_deg > PAN_VELOCITY_THRESHOLD_DEG:
+                high_vel_duration += dt_sec
+            else:
+                high_vel_duration = 0.0
+
+            is_panning = high_vel_duration >= PAN_ONSET_SEC
+            target_tc = params.time_constant * PAN_TC_FACTOR if is_panning else params.time_constant
+            tc_alpha = 1.0 - np.exp(-dt_sec * TC_RAMP_SPEED)
+            effective_tc += tc_alpha * (target_tc - effective_tc)
+        else:
+            effective_tc = params.time_constant
+
+        prev_raw = raw.copy()
+
+        # SLERP smoothing
+        alpha = 1.0 - np.exp(-(1.0 / sample_rate) / effective_tc)
+        smoothed = slerp(smoothed, raw, alpha)
+
+        smoothed_quats[i] = smoothed
+
+        # Measure correction magnitude BEFORE leash (drives adaptive crop)
+        pre_leash_corr = quat_multiply(quat_conjugate(smoothed), raw)
+        corr_angle_deg = np.degrees(2.0 * np.arccos(np.clip(abs(pre_leash_corr[0]), 0.0, 1.0)))
+
+        # Update smoothed correction magnitude and adapt crop zoom
+        corr_alpha = 1.0 - np.exp(-dt_sec / crop_ramp_tc)
+        smoothed_corr_deg += corr_alpha * (corr_angle_deg - smoothed_corr_deg)
+        trace_corr_deg[i] = smoothed_corr_deg
+
+        # Adaptive crop zoom: ramp from crop_min to crop_max based on correction need
+        crop_t = smoothed_corr_deg / correction_threshold_deg
+        crop_t = min(crop_t, 2.0)
+        crop_factor = min(crop_t * crop_t / 4.0, 1.0) if crop_t < 2.0 else 1.0
+        target_crop = crop_min + (crop_max - crop_min) * crop_factor
+        crop_alpha = 1.0 - np.exp(-dt_sec / crop_ramp_tc)
+        current_crop += crop_alpha * (target_crop - current_crop)
+        trace_crop[i] = current_crop
+
+        # Leash (uses current_crop for margin calculation — NOW non-zero when shake detected)
+        if params.leash_enabled:
+            crop_margin = 0.5 * (1.0 - 1.0 / current_crop)
+            max_corr_angle = crop_margin / max(params.fx_uv, params.fy_uv) / params.ois_compensation
+            dev_quat = quat_multiply(quat_conjugate(smoothed), raw)
+            dev_angle = 2.0 * np.arccos(np.clip(dev_quat[0], -1.0, 1.0))
+            if dev_angle > max_corr_angle and dev_angle > 1e-6:
+                catch_up = 1.0 - max_corr_angle / dev_angle
+                smoothed = slerp(smoothed, raw, catch_up)
+                smoothed_quats[i] = smoothed
+
+        # Compute final correction (post-leash)
+        correction_device = quat_multiply(quat_conjugate(smoothed), raw)
+        if params.ois_compensation < 1.0:
+            identity_q = np.array([1.0, 0.0, 0.0, 0.0])
+            correction_device = slerp(identity_q, correction_device, params.ois_compensation)
+
+        # Transform to sensor space and compute homography with dynamic crop
+        correction = quat_multiply(quat_multiply(d2s_quat, correction_device),
+                                   quat_conjugate(d2s_quat))
+        R = quat_to_rotation_matrix(correction)
+        corrections_h[i] = compute_homography_uv(R, params.fx_uv, params.fy_uv, current_crop)
+
+    trace = {
+        'crop_zoom': trace_crop,
+        'correction_deg': trace_corr_deg,
+    }
+    return corrections_h, smoothed_quats, trace
+
+
+def replay_rts(gyro_ts, gyro_quats, params: BenchParams, frame_ts, sensor_orientation=90,
+               lookahead_ns=300_000_000):
+    """
+    Replay the RTS (forward-backward) smoothing that getVideoMatrix() uses on device.
+
+    For each video frame, builds a window of [target - 3*TC .. target + lookahead_ns],
+    runs forward SLERP through the entire window, backward from the forward end state,
+    and blends 50/50.
+
+    This uses the FIXED base time constant (matching the device bug) — no adaptive TC.
+    """
+    angle = np.radians(sensor_orientation)
+    d2s_quat = np.array([np.cos(angle/2), 0, 0, np.sin(angle/2)])
+
+    past_ns = int(3.0 * params.time_constant * 1_000_000_000)
+    tc = params.time_constant
+
+    n_frames = len(frame_ts)
+    corrections_h = np.zeros((n_frames, 3, 3))
+
+    for fi in range(n_frames):
+        target_ns = frame_ts[fi]
+        start_ns = target_ns - past_ns
+        end_ns = target_ns + lookahead_ns
+
+        # Build window indices
+        mask = (gyro_ts >= start_ns) & (gyro_ts <= end_ns)
+        indices = np.where(mask)[0]
+        if len(indices) < 10:
+            corrections_h[fi] = np.eye(3)
+            continue
+
+        w_ts = gyro_ts[indices]
+        w_q = gyro_quats[indices]
+        target_idx = np.argmin(np.abs(w_ts - target_ns))
+        last_idx = len(w_ts) - 1
+
+        # Forward pass through entire window
+        fwd = quat_normalize(w_q[0])
+        fwd_at_target = fwd.copy()
+        for i in range(1, last_idx + 1):
+            dt = (w_ts[i] - w_ts[i - 1]) / 1e9
+            if dt <= 0 or dt > 0.05:
+                fwd = quat_normalize(w_q[i])
+                if i == target_idx:
+                    fwd_at_target = fwd.copy()
+                continue
+            alpha = 1.0 - np.exp(-dt / tc)
+            fwd = slerp(fwd, quat_normalize(w_q[i]), alpha)
+            if i == target_idx:
+                fwd_at_target = fwd.copy()
+
+        # Backward pass from forward end state
+        bwd = fwd.copy()
+        for i in range(last_idx - 1, target_idx - 1, -1):
+            dt = (w_ts[i + 1] - w_ts[i]) / 1e9
+            if dt <= 0 or dt > 0.05:
+                bwd = quat_normalize(w_q[i])
+                continue
+            alpha = 1.0 - np.exp(-dt / tc)
+            bwd = slerp(bwd, quat_normalize(w_q[i]), alpha)
+
+        smoothed = slerp(fwd_at_target, bwd, 0.5)
+        raw_at_target = quat_normalize(w_q[target_idx])
+
+        # Leash
+        crop_margin = 0.5 * (1.0 - 1.0 / params.crop_zoom)
+        max_corr_angle = crop_margin / max(params.fx_uv, params.fy_uv) / params.ois_compensation
+        dev_quat = quat_multiply(quat_conjugate(smoothed), raw_at_target)
+        dev_angle = 2.0 * np.arccos(np.clip(dev_quat[0], -1.0, 1.0))
+        if dev_angle > max_corr_angle and dev_angle > 1e-6:
+            catch_up = 1.0 - max_corr_angle / dev_angle
+            smoothed = slerp(smoothed, raw_at_target, catch_up)
+
+        # Correction pipeline
+        correction_device = quat_multiply(quat_conjugate(smoothed), raw_at_target)
+        if params.ois_compensation < 1.0:
+            identity_q = np.array([1.0, 0.0, 0.0, 0.0])
+            correction_device = slerp(identity_q, correction_device, params.ois_compensation)
+        correction = quat_multiply(quat_multiply(d2s_quat, correction_device),
+                                   quat_conjugate(d2s_quat))
+        R = quat_to_rotation_matrix(correction)
+        corrections_h[fi] = compute_homography_uv(R, params.fx_uv, params.fy_uv, params.crop_zoom)
+
+    return corrections_h
+
+
 # ---------------------------------------------------------------------------
 # Video displacement measurement
 # ---------------------------------------------------------------------------
@@ -466,28 +789,36 @@ def homography_translation(H):
     cy = H[1,0]*0.5 + H[1,1]*0.5 + H[1,2]
     return cx - 0.5, cy - 0.5
 
-def corrections_to_frame_displacements(corrections_h, gyro_ts, frame_ts, width, height):
+def corrections_to_frame_displacements(corrections_h, gyro_ts, frame_ts, width, height,
+                                       sensor_orientation=90):
     """
     Interpolate gyro corrections to video frame times and convert to pixel displacements.
     Returns (N_frames-1, 2) array of predicted inter-frame displacement in pixels.
+
+    Computes displacements from the portrait pixel homography directly (using the
+    same UV conjugation as the GL shader), instead of manually mapping sensor UV axes.
     """
     n_frames = len(frame_ts)
     frame_disp = []
+    cx, cy = width / 2.0, height / 2.0
+
     for i in range(n_frames - 1):
-        # Find gyro correction at each frame time
         idx0 = np.searchsorted(gyro_ts, frame_ts[i], side='right') - 1
         idx1 = np.searchsorted(gyro_ts, frame_ts[i+1], side='right') - 1
         idx0 = np.clip(idx0, 0, len(corrections_h) - 1)
         idx1 = np.clip(idx1, 0, len(corrections_h) - 1)
 
-        tx0, ty0 = homography_translation(corrections_h[idx0])
-        tx1, ty1 = homography_translation(corrections_h[idx1])
+        # Convert each correction to portrait pixel homography
+        H0 = sensor_uv_to_portrait_px(corrections_h[idx0], width, height, sensor_orientation)
+        H1 = sensor_uv_to_portrait_px(corrections_h[idx1], width, height, sensor_orientation)
 
-        # Inter-frame correction change → portrait video pixels
-        # homography_translation returns (tx, ty) in sensor UV; portrait swaps u→y, v→x
-        dpx = (ty1 - ty0) * width   # sensor v → portrait x
-        dpy = (tx1 - tx0) * height  # sensor u → portrait y
-        frame_disp.append((dpx, dpy))
+        # Center pixel displacement in portrait pixels
+        x0 = H0[0, 0] * cx + H0[0, 1] * cy + H0[0, 2]
+        y0 = H0[1, 0] * cx + H0[1, 1] * cy + H0[1, 2]
+        x1 = H1[0, 0] * cx + H1[0, 1] * cy + H1[0, 2]
+        y1 = H1[1, 0] * cx + H1[1, 1] * cy + H1[1, 2]
+
+        frame_disp.append((x1 - x0, y1 - y0))
 
     return np.array(frame_disp)
 
@@ -541,6 +872,222 @@ def raw_gyro_frame_displacements(gyro_ts, gyro_quats, frame_ts, params, sensor_o
         frame_disp.append((dv, du))
 
     return np.array(frame_disp)
+
+
+def calibrate_timestamp_offset(gyro_ts, gyro_quats, frame_ts, raw_disp, params,
+                               sensor_orientation=90, max_offset_ms=50):
+    """
+    Cross-correlate gyro-predicted motion with optical flow to find the optimal
+    timestamp offset between gyro and video frames (#163).
+
+    Returns offset_ns (positive = gyro is ahead of video, subtract from gyro ts).
+    """
+    # Compute gyro displacements at various offsets
+    offsets_ms = np.arange(-max_offset_ms, max_offset_ms + 1, 2)  # 2ms steps
+    n_frames = min(len(raw_disp), len(frame_ts) - 1)
+
+    # Use only high-confidence optical flow frames
+    mask = raw_disp[:n_frames, 2] > 0.10
+    if mask.sum() < 20:
+        print(f"  Too few high-confidence frames ({mask.sum()}) for offset calibration")
+        return 0
+
+    opt_dx = raw_disp[:n_frames, 0][mask]
+    opt_dy = raw_disp[:n_frames, 1][mask]
+    frame_indices = np.where(mask)[0]
+
+    best_corr = -1.0
+    best_offset_ms = 0.0
+
+    for offset_ms in offsets_ms:
+        offset_ns = int(offset_ms * 1_000_000)
+        shifted_ts = frame_ts + offset_ns
+
+        gyro_dx = []
+        gyro_dy = []
+        for fi in frame_indices:
+            if fi + 1 >= len(shifted_ts):
+                continue
+            idx0 = np.searchsorted(gyro_ts, shifted_ts[fi], side='right') - 1
+            idx1 = np.searchsorted(gyro_ts, shifted_ts[fi + 1], side='right') - 1
+            idx0 = np.clip(idx0, 0, len(gyro_quats) - 1)
+            idx1 = np.clip(idx1, 0, len(gyro_quats) - 1)
+
+            q0 = quat_normalize(gyro_quats[idx0])
+            q1 = quat_normalize(gyro_quats[idx1])
+            q_rel = quat_multiply(quat_conjugate(q0), q1)
+
+            # Small-angle approximation: displacement ~ 2 * quaternion imaginary part * focal_length
+            angle = np.radians(sensor_orientation)
+            d2s_quat = np.array([np.cos(angle/2), 0, 0, np.sin(angle/2)])
+            q_sensor = quat_multiply(quat_multiply(d2s_quat, q_rel), quat_conjugate(d2s_quat))
+            # Sensor UV displacement → portrait pixel
+            # sensor v → portrait x, sensor u → portrait y (for 90° orientation)
+            du = 2 * q_sensor[2] * params.fy_uv  # sensor v axis
+            dv = 2 * q_sensor[1] * params.fx_uv  # sensor u axis
+            gyro_dx.append(du)
+            gyro_dy.append(dv)
+
+        gyro_dx = np.array(gyro_dx[:len(opt_dx)])
+        gyro_dy = np.array(gyro_dy[:len(opt_dy)])
+
+        if len(gyro_dx) < 20:
+            continue
+
+        # Correlation in both axes
+        corr_x = np.corrcoef(opt_dx[:len(gyro_dx)], gyro_dx)[0, 1] if np.std(gyro_dx) > 0 else 0
+        corr_y = np.corrcoef(opt_dy[:len(gyro_dy)], gyro_dy)[0, 1] if np.std(gyro_dy) > 0 else 0
+        avg_corr = (abs(corr_x) + abs(corr_y)) / 2
+
+        if avg_corr > best_corr:
+            best_corr = avg_corr
+            best_offset_ms = offset_ms
+
+    best_offset_ns = int(best_offset_ms * 1_000_000)
+    print(f"  Timestamp offset calibration: best={best_offset_ms:.0f}ms "
+          f"(corr={best_corr:.4f})")
+    return best_offset_ns
+
+
+# ---------------------------------------------------------------------------
+# Liu triplet metrics (SIGGRAPH 2013)
+# ---------------------------------------------------------------------------
+
+def stability_score_from_homographies(H_seq):
+    """Compute the Liu Stability Score from a sequence of inter-frame homographies.
+
+    H_seq: (N, 3, 3) array of inter-frame homographies (frame i → frame i+1).
+    Returns (S_avg, S_translation, S_rotation).
+    """
+    if len(H_seq) < 8:
+        return 0.0, 0.0, 0.0
+
+    # Accumulate into cumulative camera path
+    P_seq = []
+    Pt = np.eye(3)
+    for H in H_seq:
+        Pt = Pt @ H
+        P_seq.append(Pt.copy())
+
+    # Decompose cumulative path into translation + rotation time series
+    trans = []
+    rot = []
+    for P in P_seq:
+        t_mag = np.sqrt(P[0, 2]**2 + P[1, 2]**2)
+        theta = np.degrees(np.arctan2(P[1, 0], P[0, 0]))
+        trans.append(t_mag)
+        rot.append(theta)
+
+    trans = np.array(trans)
+    rot = np.array(rot)
+
+    # FFT — energy ratio in lowest 5 frequency bins (excluding DC)
+    def freq_ratio(signal):
+        fft = np.fft.fft(signal)
+        power = np.abs(fft)**2
+        power = power[1:len(power)//2]  # remove DC, take positive half
+        if len(power) < 6 or np.sum(power) < 1e-12:
+            return 1.0
+        return float(np.sum(power[:5]) / np.sum(power))
+
+    ss_t = freq_ratio(trans)
+    ss_r = freq_ratio(rot)
+    return (ss_t + ss_r) / 2, ss_t, ss_r
+
+
+def measure_video_quality(video_path: str, label: str = ""):
+    """Compute Liu triplet + jitter metrics from a video file using feature tracking.
+
+    Returns dict with: stability_score, stability_t, stability_r,
+    cropping_ratio, distortion, jitter_rms_px, accumulated_flow, n_frames.
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video: {video_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    sift = cv2.SIFT_create()
+    bf = cv2.BFMatcher()
+    MIN_MATCH = 10
+    RATIO = 0.7
+    RANSAC_THRESH = 5.0
+
+    prev_gray = None
+    prev_kp = None
+    prev_desc = None
+
+    inter_frame_H = []
+    jitter_magnitudes = []
+    accumulated_flow = 0.0
+    frame_count = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        kp, desc = sift.detectAndCompute(gray, None)
+
+        if prev_gray is not None and desc is not None and prev_desc is not None:
+            matches = bf.knnMatch(prev_desc, desc, k=2)
+            good = [pair[0] for pair in matches if len(pair) == 2 and pair[0].distance < RATIO * pair[1].distance]
+
+            if len(good) >= MIN_MATCH:
+                src = np.float32([prev_kp[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+                dst = np.float32([kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+                H, _ = cv2.findHomography(src, dst, cv2.RANSAC, RANSAC_THRESH)
+                if H is not None:
+                    inter_frame_H.append(H)
+                    tx = H[0, 2]
+                    ty = H[1, 2]
+                    mag = np.sqrt(tx**2 + ty**2)
+                    jitter_magnitudes.append(mag)
+                    accumulated_flow += mag
+
+            # Phase correlation for jitter RMS (more robust for small displacements)
+            gray_f = gray.astype(np.float64)
+            prev_f = prev_gray.astype(np.float64)
+            (dx, dy), _ = cv2.phaseCorrelate(prev_f, gray_f)
+            # phaseCorrelate jitter is captured via inter_frame_H above
+
+        prev_gray = gray
+        prev_kp = kp
+        prev_desc = desc
+        frame_count += 1
+
+    cap.release()
+
+    if len(inter_frame_H) < 8:
+        prefix = f"[{label}] " if label else ""
+        print(f"{prefix}Too few frames ({frame_count}) for quality metrics")
+        return None
+
+    H_arr = np.array(inter_frame_H)
+    s_avg, s_t, s_r = stability_score_from_homographies(H_arr)
+
+    jitter_arr = np.array(jitter_magnitudes)
+    jitter_rms = float(np.sqrt(np.mean(jitter_arr**2)))
+
+    prefix = f"[{label}] " if label else ""
+    print(f"{prefix}{width}x{height}@{fps:.0f}fps, {frame_count} frames, "
+          f"S={s_avg:.4f} jitter={jitter_rms:.2f}px")
+
+    return {
+        "label": label,
+        "stability_score": s_avg,
+        "stability_t": s_t,
+        "stability_r": s_r,
+        "jitter_rms_px": jitter_rms,
+        "accumulated_flow": accumulated_flow,
+        "n_frames": frame_count,
+        "fps": fps,
+        "width": width,
+        "height": height,
+    }
+
 
 # ---------------------------------------------------------------------------
 # Metrics
@@ -892,24 +1439,40 @@ def compare_device_vs_replay(corrections_data, corrections_h, gyro_ts, gyro_quat
         pass
 
 
-def sensor_uv_to_portrait_px(H_uv, portrait_w, portrait_h):
-    """Convert a sensor-UV homography to portrait-pixel homography.
+def sensor_uv_to_portrait_px(H_uv, portrait_w, portrait_h, sensor_orientation=90):
+    """Convert a sensor-UV homography to portrait-pixel homography for OpenCV.
 
-    CameraX encodes portrait frames by rotating sensor landscape 90° CCW.
-    Coordinate mapping: portrait_pu = sensor_v, portrait_pv = 1 - sensor_u.
-    So sensor u = 1 - pv, sensor v = pu.
+    The GL shader operates in UV with Y=0 at bottom (OpenGL convention).
+    OpenCV's warpPerspective operates with Y=0 at top. The Y-flip conjugation
+    F × M_gl × F (where F flips v → 1-v) corrects this.
+
+    For our affine matrices with orientation=90°, the result simplifies to
+    swapping sensor tx/ty: H_px = [[iz, 0, ty*W], [0, iz, tx*H], [0, 0, 1]].
     """
-    H = H_uv
-    W, Hgt = float(portrait_w), float(portrait_h)
-    return np.array([
-        [H[1,1],           -H[1,0]*W/Hgt,    (H[1,0] + H[1,2])*W              ],
-        [-H[0,1]*Hgt/W,     H[0,0],           (1.0 - H[0,0] - H[0,2])*Hgt     ],
-        [H[2,1]/W,          -H[2,0]/Hgt,       H[2,0] + H[2,2]                 ],
-    ])
+    # Step 1: Sensor UV → Portrait GL UV using the proven conjugation
+    gl_colmajor = sensor_to_portrait_gl_colmajor(H_uv, sensor_orientation)
+
+    # Step 2: Column-major GL mat3 → row-major 3×3
+    m = gl_colmajor
+    M_gl = np.array([
+        [m[0], m[3], m[6]],
+        [m[1], m[4], m[7]],
+        [m[2], m[5], m[8]],
+    ], dtype=np.float64)
+
+    # Step 3: GL→OpenCV Y-flip: F × M_gl × F where F maps v → 1-v
+    F = np.array([[1, 0, 0], [0, -1, 1], [0, 0, 1]], dtype=np.float64)
+    M_cv = F @ M_gl @ F
+
+    # Step 4: UV → pixel: H_px = S × M_cv × S⁻¹
+    W, H = float(portrait_w), float(portrait_h)
+    S = np.diag([W, H, 1.0])
+    S_inv = np.diag([1.0 / W, 1.0 / H, 1.0])
+    return S @ M_cv @ S_inv
 
 
 def generate_stabilized_video(input_path: str, output_path: str, corrections_h,
-                               gyro_ts, frame_ts):
+                               gyro_ts, frame_ts, sensor_orientation=90):
     """Apply per-frame homographies to raw video and write stabilized output."""
     cap = cv2.VideoCapture(input_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -926,7 +1489,7 @@ def generate_stabilized_video(input_path: str, output_path: str, corrections_h,
         idx = np.searchsorted(gyro_ts, frame_ts[i], side='right') - 1
         idx = np.clip(idx, 0, len(corrections_h) - 1)
         H_uv = corrections_h[idx]
-        H_px = sensor_uv_to_portrait_px(H_uv, width, height)
+        H_px = sensor_uv_to_portrait_px(H_uv, width, height, sensor_orientation)
         stabilized = cv2.warpPerspective(frame, H_px, (width, height),
                                           flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
                                           borderMode=cv2.BORDER_REPLICATE)
@@ -955,6 +1518,22 @@ def main():
                         help="Override fy_uv focal length")
     parser.add_argument("--no-adaptive", action="store_true",
                         help="Disable adaptive smoothing (fixed TC only)")
+    parser.add_argument("--no-leash", action="store_true",
+                        help="Disable leash (allow unbounded smoothed-to-raw deviation)")
+    parser.add_argument("--ois", type=float, default=None,
+                        help="Override OIS compensation factor (0.0-1.0, 1.0=no OIS correction)")
+    parser.add_argument("--calibrate-offset", action="store_true",
+                        help="Auto-calibrate gyro-frame timestamp offset via cross-correlation (#163)")
+    parser.add_argument("--offset-ms", type=float, default=None,
+                        help="Manual timestamp offset in ms (positive = gyro ahead of video)")
+    parser.add_argument("--lookahead", type=int, default=None,
+                        help="Lookahead window in ms for windowed bidirectional smoothing (#160)")
+    parser.add_argument("--adaptive-crop", action="store_true",
+                        help="Enable adaptive crop zoom (reduce crop when corrections are small)")
+    parser.add_argument("--crop-min", type=float, default=1.0,
+                        help="Minimum crop zoom for adaptive crop (default: 1.0 = full FOV)")
+    parser.add_argument("--crop-threshold", type=float, default=0.3,
+                        help="Correction angle (degrees) at which adaptive crop is at midpoint")
     parser.add_argument("--isp-video", type=str, default=None,
                         help="ISP-stabilized reference video (quality target)")
     parser.add_argument("--gyro-video", type=str, default=None,
@@ -976,8 +1555,13 @@ def main():
         params.fx_uv = args.fx
     if args.fy is not None:
         params.fy_uv = args.fy
+    if args.no_leash:
+        params.leash_enabled = False
+    if args.ois is not None:
+        params.ois_compensation = args.ois
     print(f"  Params: tc={params.time_constant}, crop={params.crop_zoom}, "
-          f"fx={params.fx_uv:.3f}, fy={params.fy_uv:.3f}, clamp={params.clamp_margin_fraction}")
+          f"fx={params.fx_uv:.3f}, fy={params.fy_uv:.3f}, clamp={params.clamp_margin_fraction}, "
+          f"ois={params.ois_compensation}, leash={params.leash_enabled}")
 
     gyro_ts, gyro_quats = load_gyro(bench_dir)
     print(f"  Gyro: {len(gyro_ts)} samples, "
@@ -992,17 +1576,32 @@ def main():
     print("\nMeasuring raw video displacement (phase correlation)...")
     raw_disp, fps, width, height = measure_frame_displacements(args.raw_video)
 
-    # Measure reference videos (ISP and/or on-device gyro)
+    # --- Liu triplet: video-based quality measurement ---
+    print("\n" + "=" * 60)
+    print("Video quality metrics (Liu SIGGRAPH 2013 — feature tracking)")
+    print("=" * 60)
+    video_quality = {}
+    print("\nAnalyzing raw video...")
+    video_quality['raw'] = measure_video_quality(args.raw_video, label="Raw")
+
+    if args.isp_video:
+        print("Analyzing ISP reference video...")
+        video_quality['isp'] = measure_video_quality(args.isp_video, label="ISP")
+
+    if args.gyro_video:
+        print("Analyzing gyro EIS device video...")
+        video_quality['gyro_device'] = measure_video_quality(args.gyro_video, label="Gyro device")
+
+    # Measure reference videos (ISP and/or on-device gyro) — phase correlation
     isp_rms = None
     gyro_dev_rms = None
     isp_disp = None
     gyro_dev_disp = None
     if args.isp_video:
-        print("\nMeasuring ISP reference video displacement...")
+        print("\nMeasuring ISP reference video displacement (phase correlation)...")
         isp_disp_raw, isp_fps, isp_w, isp_h = measure_frame_displacements(args.isp_video)
         isp_mag = np.sqrt(isp_disp_raw[:, 0]**2 + isp_disp_raw[:, 1]**2)
         isp_rms = np.sqrt(np.mean(isp_mag**2))
-        # Normalize to raw video scale if resolutions differ
         isp_scale = (width / isp_w + height / isp_h) / 2.0
         isp_rms_scaled = isp_rms * isp_scale
         isp_disp = isp_disp_raw
@@ -1012,7 +1611,7 @@ def main():
             isp_rms = isp_rms_scaled
 
     if args.gyro_video:
-        print("\nMeasuring on-device gyro EIS video displacement...")
+        print("\nMeasuring on-device gyro EIS video displacement (phase correlation)...")
         gyro_dev_disp_raw, gd_fps, gd_w, gd_h = measure_frame_displacements(args.gyro_video)
         gd_mag = np.sqrt(gyro_dev_disp_raw[:, 0]**2 + gyro_dev_disp_raw[:, 1]**2)
         gyro_dev_rms = np.sqrt(np.mean(gd_mag**2))
@@ -1022,6 +1621,19 @@ def main():
               + (f" → {gyro_dev_rms * gd_scale:.2f} px scaled to {width}x{height}" if abs(gd_scale - 1.0) > 0.05 else ""))
         if abs(gd_scale - 1.0) > 0.05:
             gyro_dev_rms = gyro_dev_rms * gd_scale
+
+    # Timestamp offset calibration (#163)
+    ts_offset_ns = 0
+    if args.calibrate_offset:
+        print("\nCalibrating gyro-frame timestamp offset...")
+        ts_offset_ns = calibrate_timestamp_offset(
+            gyro_ts, gyro_quats, frame_ts, raw_disp, params, args.sensor_orientation)
+        frame_ts = frame_ts + ts_offset_ns
+        print(f"  Applied offset: {ts_offset_ns / 1_000_000:.1f}ms")
+    elif args.offset_ms is not None:
+        ts_offset_ns = int(args.offset_ms * 1_000_000)
+        frame_ts = frame_ts + ts_offset_ns
+        print(f"\nManual timestamp offset: {args.offset_ms:.1f}ms")
 
     # Compute raw gyro inter-frame displacement (for correlation check)
     print("\nComputing raw gyro displacements...")
@@ -1033,7 +1645,7 @@ def main():
     print("Replaying causal stabilization (fixed TC)...")
     fixed_h, fixed_smoothed, _ = replay_stabilization(
         gyro_ts, gyro_quats, params, args.sensor_orientation, adaptive=False)
-    fixed_pred = corrections_to_frame_displacements(fixed_h, gyro_ts, frame_ts, width, height)
+    fixed_pred = corrections_to_frame_displacements(fixed_h, gyro_ts, frame_ts, width, height, args.sensor_orientation)
     print(f"  {len(fixed_pred)} inter-frame predictions")
 
     # Replay stabilization — adaptive TC
@@ -1043,21 +1655,88 @@ def main():
         print("Replaying causal stabilization (adaptive TC)...")
         adaptive_h, adaptive_smoothed, adaptive_trace = replay_stabilization(
             gyro_ts, gyro_quats, params, args.sensor_orientation, adaptive=True)
-        adaptive_pred = corrections_to_frame_displacements(adaptive_h, gyro_ts, frame_ts, width, height)
+        adaptive_pred = corrections_to_frame_displacements(adaptive_h, gyro_ts, frame_ts, width, height, args.sensor_orientation)
         pan_pct = 100.0 * adaptive_trace['is_panning'].sum() / max(len(adaptive_trace['is_panning']), 1)
         print(f"  Pan detected: {pan_pct:.1f}% of samples, peak vel: {adaptive_trace['velocity_deg'].max():.1f}°/s")
 
     causal_h = adaptive_h if use_adaptive else fixed_h
     causal_pred = adaptive_pred if use_adaptive else fixed_pred
 
+    # Replay with adaptive crop if requested
+    adaptive_crop_h = None
+    adaptive_crop_pred = None
+    adaptive_crop_trace = None
+    if args.adaptive_crop:
+        print(f"Replaying with adaptive crop (min={args.crop_min}, max={params.crop_zoom}, threshold={args.crop_threshold}°)...")
+        adaptive_crop_h, _, adaptive_crop_trace = replay_adaptive_crop(
+            gyro_ts, gyro_quats, params, args.sensor_orientation,
+            adaptive_tc=use_adaptive, crop_min=args.crop_min, crop_max=params.crop_zoom,
+            correction_threshold_deg=args.crop_threshold)
+        adaptive_crop_pred = corrections_to_frame_displacements(
+            adaptive_crop_h, gyro_ts, frame_ts, width, height, args.sensor_orientation)
+        avg_crop = adaptive_crop_trace['crop_zoom'].mean()
+        max_crop = adaptive_crop_trace['crop_zoom'].max()
+        min_crop_actual = adaptive_crop_trace['crop_zoom'].min()
+        print(f"  Crop zoom: avg={avg_crop:.3f}, min={min_crop_actual:.3f}, max={max_crop:.3f}")
+        # Use adaptive crop as the primary result for video generation
+        causal_h = adaptive_crop_h
+        causal_pred = adaptive_crop_pred
+
+    # Replay with lookahead if requested
+    lookahead_h = None
+    lookahead_pred = None
+    if args.lookahead is not None:
+        print(f"Replaying with {args.lookahead}ms lookahead...")
+        lookahead_h, _ = replay_lookahead(
+            gyro_ts, gyro_quats, params, args.sensor_orientation,
+            lookahead_ms=args.lookahead)
+        lookahead_pred = corrections_to_frame_displacements(
+            lookahead_h, gyro_ts, frame_ts, width, height, args.sensor_orientation)
+        # Use lookahead as the primary causal result for video generation
+        causal_h = lookahead_h
+        causal_pred = lookahead_pred
+
     # Replay non-causal ideal
     print("Computing non-causal ideal...")
     nc_h, nc_smoothed = replay_noncausal(
         gyro_ts, gyro_quats, params, args.sensor_orientation)
-    nc_pred = corrections_to_frame_displacements(nc_h, gyro_ts, frame_ts, width, height)
+    nc_pred = corrections_to_frame_displacements(nc_h, gyro_ts, frame_ts, width, height, args.sensor_orientation)
+
+    # --- Replay-based stability score (from gyro homographies) ---
+    def replay_stability_score(corrections_h, gyro_ts, frame_ts, label=""):
+        """Compute Liu Stability Score from replay homographies at frame times."""
+        n_frames = len(frame_ts)
+        inter_h = []
+        for i in range(n_frames - 1):
+            idx0 = np.searchsorted(gyro_ts, frame_ts[i], side='right') - 1
+            idx1 = np.searchsorted(gyro_ts, frame_ts[i+1], side='right') - 1
+            idx0 = np.clip(idx0, 0, len(corrections_h) - 1)
+            idx1 = np.clip(idx1, 0, len(corrections_h) - 1)
+            # Inter-frame homography: H_i^{-1} @ H_{i+1}
+            H_rel = np.linalg.inv(corrections_h[idx0]) @ corrections_h[idx1]
+            inter_h.append(H_rel)
+        if len(inter_h) < 8:
+            return 0.0, 0.0, 0.0
+        s_avg, s_t, s_r = stability_score_from_homographies(np.array(inter_h))
+        if label:
+            print(f"  [{label}] Stability Score: S={s_avg:.4f} (trans={s_t:.4f}, rot={s_r:.4f})")
+        return s_avg, s_t, s_r
+
+    print("\n" + "-" * 60)
+    print("Replay-based stability scores (Liu S from gyro homographies)")
+    print("-" * 60)
+    replay_ss = {}
+    replay_ss['fixed'] = replay_stability_score(fixed_h, gyro_ts, frame_ts, "Fixed TC")
+    if use_adaptive:
+        replay_ss['adaptive'] = replay_stability_score(adaptive_h, gyro_ts, frame_ts, "Adaptive TC")
+    if adaptive_crop_h is not None:
+        replay_ss['adaptive_crop'] = replay_stability_score(adaptive_crop_h, gyro_ts, frame_ts, "Adaptive crop")
+    if lookahead_h is not None:
+        replay_ss['lookahead'] = replay_stability_score(lookahead_h, gyro_ts, frame_ts, f"Lookahead {args.lookahead}ms")
+    replay_ss['noncausal'] = replay_stability_score(nc_h, gyro_ts, frame_ts, "Non-causal")
 
     # Compute metrics
-    print("\nComputing metrics...")
+    print("\nComputing phase correlation metrics...")
     metrics = compute_metrics(raw_disp, causal_pred, nc_pred, gyro_raw_disp, fps, width, height)
     metrics_fixed = compute_metrics(raw_disp, fixed_pred, nc_pred, gyro_raw_disp, fps, width, height)
 
@@ -1111,11 +1790,35 @@ def main():
     lines.append("")
     lines.append("EIS Bench Test Results")
     lines.append("=" * 60)
+
+    # --- Video quality table (Liu triplet) ---
+    if video_quality:
+        lines.append("")
+        lines.append("Video Quality (Liu SIGGRAPH 2013 — higher S = smoother):")
+        lines.append(f"  {'Source':<20s}  {'S (stability)':>14s}  {'Jitter RMS':>11s}  {'Accum. flow':>12s}")
+        lines.append(f"  {'-'*20}  {'-'*14}  {'-'*11}  {'-'*12}")
+        for key in ['raw', 'isp', 'gyro_device']:
+            vq = video_quality.get(key)
+            if vq is None:
+                continue
+            tag = " ← TARGET" if key == 'isp' else ""
+            lines.append(f"  {vq['label']:<20s}  {vq['stability_score']:14.4f}  {vq['jitter_rms_px']:8.2f} px  {vq['accumulated_flow']:9.1f} px{tag}")
+
+    # --- Replay-based stability scores ---
+    lines.append("")
+    lines.append("Replay Stability Score (Liu S from gyro homographies):")
+    lines.append(f"  {'Method':<20s}  {'S (avg)':>8s}  {'S (trans)':>9s}  {'S (rot)':>8s}")
+    lines.append(f"  {'-'*20}  {'-'*8}  {'-'*9}  {'-'*8}")
+    lines.append(f"  {'Fixed TC':<20s}  {replay_ss['fixed'][0]:8.4f}  {replay_ss['fixed'][1]:9.4f}  {replay_ss['fixed'][2]:8.4f}")
+    if use_adaptive:
+        lines.append(f"  {'Adaptive TC':<20s}  {replay_ss['adaptive'][0]:8.4f}  {replay_ss['adaptive'][1]:9.4f}  {replay_ss['adaptive'][2]:8.4f}")
+    lines.append(f"  {'Non-causal ideal':<20s}  {replay_ss['noncausal'][0]:8.4f}  {replay_ss['noncausal'][1]:9.4f}  {replay_ss['noncausal'][2]:8.4f}")
+
     lines.append("")
 
-    # Reference videos section
+    # Reference videos section (phase correlation)
     if isp_rms is not None or gyro_dev_rms is not None:
-        lines.append("Reference videos (separate recordings):")
+        lines.append("Phase correlation jitter (separate recordings):")
         if isp_rms is not None:
             lines.append(f"  ISP stabilized:          {isp_rms:6.2f} px  ← TARGET")
         if gyro_dev_rms is not None:
@@ -1123,12 +1826,23 @@ def main():
         lines.append("")
 
     # Main analysis table
-    lines.append(f"Raw video analysis (scale ratio: {metrics['scale_ratio']:.2f}x):")
+    lines.append(f"Phase correlation analysis (scale ratio: {metrics['scale_ratio']:.2f}x):")
     lines.append(f"  Raw jitter:              {raw_rms:6.2f} px")
     lines.append(f"  Gyro replay (fixed TC):  {fixed_rms:6.2f} px  {fixed_imp:.2f}x improvement")
     if use_adaptive:
         adaptive_delta = (adaptive_imp / fixed_imp - 1.0) * 100 if fixed_imp > 0 else 0
         lines.append(f"  Gyro replay (adaptive):  {adaptive_rms:6.2f} px  {adaptive_imp:.2f}x improvement  ({adaptive_delta:+.1f}%)")
+    if adaptive_crop_pred is not None:
+        ac_metrics = compute_metrics(raw_disp, adaptive_crop_pred, nc_pred, gyro_raw_disp, fps, width, height)
+        ac_rms = ac_metrics['causal_residual_rms_px']
+        ac_imp = ac_metrics['improvement_ratio']
+        avg_crop = adaptive_crop_trace['crop_zoom'].mean()
+        lines.append(f"  Adaptive crop (avg {avg_crop:.2f}×): {ac_rms:6.2f} px  {ac_imp:.2f}x improvement")
+    if lookahead_pred is not None:
+        la_metrics = compute_metrics(raw_disp, lookahead_pred, nc_pred, gyro_raw_disp, fps, width, height)
+        la_rms = la_metrics['causal_residual_rms_px']
+        la_imp = la_metrics['improvement_ratio']
+        lines.append(f"  Lookahead {args.lookahead}ms:        {la_rms:6.2f} px  {la_imp:.2f}x improvement")
     lines.append(f"  Non-causal ideal:        {nc_rms:6.2f} px  {nc_imp:.2f}x improvement")
 
     # Gap analysis
@@ -1235,7 +1949,7 @@ def main():
         print("\nGenerating stabilized video...")
         out_video = str(out_dir / "stabilized.mp4")
         generate_stabilized_video(args.raw_video, out_video, causal_h,
-                                   gyro_ts, frame_ts)
+                                   gyro_ts, frame_ts, args.sensor_orientation)
 
     print("Done.")
 

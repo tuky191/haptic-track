@@ -74,5 +74,9 @@ data class TrackingUiState(
     /** Gyro EIS strength 0.0–1.0 (0 = light, 1 = aggressive). */
     val gyroStrength: Float = 0.5f,
     /** Adaptive pan detection for gyro EIS. */
-    val adaptiveEis: Boolean = true
+    val adaptiveEis: Boolean = true,
+    /** Leash: limits smoothed-to-raw deviation. */
+    val leashEnabled: Boolean = true,
+    /** OIS compensation active (scale correction to avoid overcorrecting). */
+    val oisCompensation: Boolean = true
 )

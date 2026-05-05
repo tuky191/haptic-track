@@ -33,7 +33,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
 
     companion object {
         private const val TAG = "GyroStab"
-        private const val DEFAULT_TIME_CONSTANT = 0.50
+        private const val DEFAULT_TIME_CONSTANT = 0.70
         private const val DEFAULT_HFOV_DEGREES = 75.0
         private const val TEL_INTERVAL = 200
         private const val SENSOR_GAP_THRESHOLD_NS = 100_000_000L
@@ -63,14 +63,20 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     private var sensorOrientation: Int = 90
 
     /** Crop zoom applied to absorb warp margins (1.0 = no crop, 1.05 = 5% crop). */
-    var cropZoom: Float = 1.15f
+    var cropZoom: Float = 1.05f
 
     /** Adaptive pan detection: reduces TC during pans, increases during shake. */
     var adaptiveSmoothing: Boolean = true
 
+    /** Leash: limits smoothed-to-raw deviation to prevent corrections exceeding crop margin. */
+    var leashEnabled: Boolean = true
+
     /** OIS compensation: scales correction magnitude when optical stabilization is active.
      *  OIS handles ~20% of shake; without compensation the gyro overcorrects. */
     var oisCompensation: Double = 1.0
+
+    /** RTS lookahead: use bidirectional smoothing for video frames (requires FBO buffer). */
+    var rtsLookahead: Boolean = false
 
     /** Current stabilization matrix in column-major order for GL (mat3). Identity when disabled. */
     private val currentMatrix = AtomicReference(IDENTITY_MATRIX.clone())
@@ -105,6 +111,17 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     @Volatile private var effectiveTc = DEFAULT_TIME_CONSTANT
     @Volatile private var lastLeashActive = false
     @Volatile private var lastCorrAngleDeg = 0.0
+
+    // Ring buffer for raw quaternion history (bidirectional smoothing for video lookahead)
+    private val QUAT_HISTORY_SIZE = 512  // ~2.5s at 200Hz
+    private val historyW = DoubleArray(QUAT_HISTORY_SIZE)
+    private val historyX = DoubleArray(QUAT_HISTORY_SIZE)
+    private val historyY = DoubleArray(QUAT_HISTORY_SIZE)
+    private val historyZ = DoubleArray(QUAT_HISTORY_SIZE)
+    private val historyTs = LongArray(QUAT_HISTORY_SIZE)
+    private var historyHead = 0
+    private var historyCount = 0
+    private val historyLock = Any()
 
     // Session log file (gyro.log in the tracking session directory)
     @Volatile
@@ -285,6 +302,16 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         val nowNs = event.timestamp
         try { benchGyroWriter?.println("$nowNs,${rawQuat.w},${rawQuat.x},${rawQuat.y},${rawQuat.z}") } catch (_: Exception) {}
 
+        synchronized(historyLock) {
+            historyW[historyHead] = rawQuat.w
+            historyX[historyHead] = rawQuat.x
+            historyY[historyHead] = rawQuat.y
+            historyZ[historyHead] = rawQuat.z
+            historyTs[historyHead] = nowNs
+            historyHead = (historyHead + 1) % QUAT_HISTORY_SIZE
+            if (historyCount < QUAT_HISTORY_SIZE) historyCount++
+        }
+
         if (!enabled) {
             currentMatrix.set(IDENTITY_MATRIX.clone())
             return
@@ -343,16 +370,12 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         val alpha = 1.0 - exp(-(1.0 / sampleRate) / effectiveTc)
         smoothedQuat = slerp(smoothedQuat, rawQuat, alpha)
 
-        // Leash: limit how far smoothed can deviate from raw. Without this, the
-        // smoothed path drifts far during handheld walking (34% of samples exceed
-        // the crop margin). The hard clamp that used to follow would truncate 87%
-        // of the correction during peaks, creating visible wobble artifacts.
-        // The leash pulls smoothed toward raw so corrections always fit the margin.
+        // Leash: limit how far smoothed can deviate from raw.
         val cropMargin = 0.5 * (1.0 - 1.0 / cropZoom)
         val maxCorrAngle = cropMargin / maxOf(fxUv, fyUv) / oisCompensation
         val devQuat = smoothedQuat.conjugate() * rawQuat
         val devAngle = 2.0 * acos(devQuat.w.coerceIn(-1.0, 1.0))
-        lastLeashActive = devAngle > maxCorrAngle && devAngle > 1e-6
+        lastLeashActive = leashEnabled && devAngle > maxCorrAngle && devAngle > 1e-6
         if (lastLeashActive) {
             val catchUp = 1.0 - maxCorrAngle / devAngle
             smoothedQuat = slerp(smoothedQuat, rawQuat, catchUp)
@@ -452,6 +475,122 @@ class GyroStabilizer(context: Context) : SensorEventListener {
 
     // Smoothing uses the package-level slerp() below.
 
+
+    /**
+     * Compute a lookahead-smoothed stabilization matrix for a video frame.
+     *
+     * Uses bidirectional SLERP over the quaternion history: forward pass from
+     * past to target, backward pass from future to target, blended 50/50.
+     * The backward pass uses future gyro data that wasn't available causally,
+     * eliminating phase lag and giving zero-phase smoothing.
+     *
+     * Called by StabilizationProcessor for delayed video frames — by the time
+     * the frame is rendered, we have LOOKAHEAD_FRAMES worth of future gyro data.
+     */
+    fun getVideoMatrix(frameTimestampNs: Long): FloatArray {
+        if (!_enabled) return IDENTITY_MATRIX.clone()
+
+        val window = snapshotWindow(frameTimestampNs) ?: return getMatrix()
+        if (window.count < 10) return getMatrix()
+
+        val targetIdx = findClosestIndex(window.timestamps, window.count, frameTimestampNs)
+        val lastIdx = window.count - 1
+
+        // RTS forward-backward smoother:
+        // Forward pass runs through the ENTIRE window, storing result at targetIdx.
+        // Backward pass starts from the forward result at the end (warm/converged),
+        // not from raw — this is the key fix. With only ~133ms of future data
+        // (0.24×TC), starting from raw leaves the backward pass 78% unconverged,
+        // injecting noise into the 50/50 blend.
+        var fwd = Quat(window.w[0], window.x[0], window.y[0], window.z[0])
+        var fwdAtTarget = fwd
+        for (i in 1..lastIdx) {
+            val dt = (window.timestamps[i] - window.timestamps[i - 1]) / 1_000_000_000.0
+            if (dt <= 0.0 || dt > 0.05) { fwd = Quat(window.w[i], window.x[i], window.y[i], window.z[i]); if (i == targetIdx) fwdAtTarget = fwd; continue }
+            val alpha = 1.0 - exp(-dt / timeConstant)
+            fwd = slerp(fwd, Quat(window.w[i], window.x[i], window.y[i], window.z[i]), alpha)
+            if (i == targetIdx) fwdAtTarget = fwd
+        }
+
+        // Backward pass: starts from forward result at end (warm state)
+        var bwd = fwd
+        for (i in (lastIdx - 1) downTo targetIdx) {
+            val dt = (window.timestamps[i + 1] - window.timestamps[i]) / 1_000_000_000.0
+            if (dt <= 0.0 || dt > 0.05) { bwd = Quat(window.w[i], window.x[i], window.y[i], window.z[i]); continue }
+            val alpha = 1.0 - exp(-dt / timeConstant)
+            bwd = slerp(bwd, Quat(window.w[i], window.x[i], window.y[i], window.z[i]), alpha)
+        }
+
+        var smoothed = slerp(fwdAtTarget, bwd, 0.5)
+        val rawAtTarget = Quat(window.w[targetIdx], window.x[targetIdx], window.y[targetIdx], window.z[targetIdx])
+
+        // Leash (same as causal path) — prevent corrections exceeding crop margin
+        val cropMargin = 0.5 * (1.0 - 1.0 / cropZoom)
+        val maxCorrAngle = cropMargin / maxOf(fxUv, fyUv) / oisCompensation
+        val devQuat = smoothed.conjugate() * rawAtTarget
+        val devAngle = 2.0 * acos(devQuat.w.coerceIn(-1.0, 1.0))
+        if (devAngle > maxCorrAngle && devAngle > 1e-6) {
+            val catchUp = 1.0 - maxCorrAngle / devAngle
+            smoothed = slerp(smoothed, rawAtTarget, catchUp)
+        }
+
+        // Correction pipeline (same as causal path)
+        var correctionDevice = smoothed.conjugate() * rawAtTarget
+        if (oisCompensation < 1.0) {
+            correctionDevice = slerp(IDENTITY_QUAT, correctionDevice, oisCompensation)
+        }
+        val correction = deviceToSensorQuat * correctionDevice * deviceToSensorQuat.conjugate()
+        val r = correction.toRotationMatrix()
+        val h = computeHomographyUV(r, fxUv, fyUv, cropZoom.toDouble())
+        return sensorToPortraitGL(h, sensorOrientation)
+    }
+
+    private data class QuatWindow(
+        val w: DoubleArray, val x: DoubleArray, val y: DoubleArray, val z: DoubleArray,
+        val timestamps: LongArray, val count: Int
+    )
+
+    private fun snapshotWindow(targetNs: Long): QuatWindow? {
+        synchronized(historyLock) {
+            if (historyCount < 10) return null
+
+            val pastNs = (3.0 * timeConstant * 1_000_000_000).toLong()
+            val futureNs = 300_000_000L
+            val startNs = targetNs - pastNs
+            val endNs = targetNs + futureNs
+
+            val indices = mutableListOf<Int>()
+            for (i in 0 until historyCount) {
+                val idx = (historyHead - historyCount + i + QUAT_HISTORY_SIZE) % QUAT_HISTORY_SIZE
+                if (historyTs[idx] in startNs..endNs) indices.add(idx)
+            }
+
+            if (indices.size < 10) return null
+
+            val n = indices.size
+            return QuatWindow(
+                w = DoubleArray(n) { historyW[indices[it]] },
+                x = DoubleArray(n) { historyX[indices[it]] },
+                y = DoubleArray(n) { historyY[indices[it]] },
+                z = DoubleArray(n) { historyZ[indices[it]] },
+                timestamps = LongArray(n) { historyTs[indices[it]] },
+                count = n
+            )
+        }
+    }
+
+    private fun findClosestIndex(timestamps: LongArray, count: Int, targetNs: Long): Int {
+        var bestIdx = 0
+        var bestDist = Long.MAX_VALUE
+        for (i in 0 until count) {
+            val dist = abs(timestamps[i] - targetNs)
+            if (dist < bestDist) {
+                bestDist = dist
+                bestIdx = i
+            }
+        }
+        return bestIdx
+    }
 
     /**
      * Compute stabilization as crop zoom + center translation (affine, no perspective).

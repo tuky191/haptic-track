@@ -219,11 +219,12 @@ class CameraManager(private val context: Context) {
 
         val processor = StabilizationProcessor(
             stabMatrixProvider = { gyroStabilizer.getMatrix() },
+            videoMatrixProvider = if (gyroStabilizer.rtsLookahead) ({ ts -> gyroStabilizer.getVideoMatrix(ts) }) else null,
             frameTimestampLogger = { idx, ts -> gyroStabilizer.logFrameTimestamp(idx, ts) }
         )
         stabProcessor = processor
         useCaseGroupBuilder.addEffect(StabilizationEffect(processor))
-        Log.i(TAG, "StabilizationProcessor added (EIS ${if (gyroStabilizer.enabled) "ON" else "OFF — identity pass-through"})")
+        Log.i(TAG, "StabilizationProcessor added (EIS ${if (gyroStabilizer.enabled) "ON" else "OFF — identity pass-through"}, rts=${gyroStabilizer.rtsLookahead})")
 
         val camera = provider.bindToLifecycle(lifecycleOwner, selector, useCaseGroupBuilder.build())
 
