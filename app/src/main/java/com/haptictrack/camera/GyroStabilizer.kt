@@ -63,8 +63,8 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     /** Sensor orientation in degrees — needed to convert sensor-UV homography to portrait UV. */
     private var sensorOrientation: Int = 90
 
-    /** Crop zoom applied to absorb warp margins (1.0 = no crop, 1.05 = 5% crop). */
-    var cropZoom: Float = 1.05f
+    /** Crop zoom applied to absorb warp margins (1.0 = no crop, 1.10 = 10% crop). */
+    var cropZoom: Float = 1.10f
 
     /** Adaptive pan detection: reduces TC during pans, increases during shake. */
     var adaptiveSmoothing: Boolean = true
@@ -76,8 +76,8 @@ class GyroStabilizer(context: Context) : SensorEventListener {
      *  OIS handles ~20% of shake; without compensation the gyro overcorrects. */
     var oisCompensation: Double = 1.0
 
-    /** RTS lookahead: use bidirectional smoothing for video frames (requires FBO buffer). */
-    var rtsLookahead: Boolean = false
+    /** Gaussian kernel smoothing for video frames (400ms output latency, ~95MB FBO buffer). */
+    var rtsLookahead: Boolean = true
 
     /** Current stabilization matrix in column-major order for GL (mat3). Identity when disabled. */
     private val currentMatrix = AtomicReference(IDENTITY_MATRIX.clone())

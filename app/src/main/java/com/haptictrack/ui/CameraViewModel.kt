@@ -51,8 +51,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         private const val TAP_PADDING = 0.03f
         private const val GYRO_TC_MAX = 1.00       // time constant at strength=0 (most laggy)
         private const val GYRO_TC_RANGE = 0.60      // TC swing: 1.00 - 0.60 = 0.40 at strength=1
-        private const val GYRO_CROP_MIN = 1.0f      // crop zoom at strength=0 (no FOV loss)
-        private const val GYRO_CROP_RANGE = 0.25f   // crop swing: 1.0 + 0.25 = 1.25 at strength=1
+        private const val GYRO_CROP_MIN = 1.05f     // crop zoom at strength=0 (minimal FOV loss)
+        private const val GYRO_CROP_RANGE = 0.20f   // crop swing: 1.05 + 0.20 = 1.25 at strength=1
     }
 
     /** Smooths idle detections by keeping objects alive for a few frames after they disappear. */
