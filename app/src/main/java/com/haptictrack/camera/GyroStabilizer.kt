@@ -141,6 +141,12 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     // Measures post-gyro residual displacement from stabilized analysis frames,
     // smooths the cumulative path, applies the difference as a crop offset.
     var translationCorrectionEnabled: Boolean = false
+        set(value) {
+            if (field != value) {
+                field = value
+                if (!value) resetTranslationState()
+            }
+        }
     private val TRANS_TC = 0.15          // smoothing time constant (seconds) — lower = more responsive to shake
     private val TRANS_MARGIN_FRAC = 0.5  // fraction of crop margin reserved for translation
     private val TRANS_DEAD_ZONE_PX = 0.3 // phase correlation noise floor (pixels at raw FBO res)
