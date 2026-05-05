@@ -64,7 +64,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     private var sensorOrientation: Int = 90
 
     /** Crop zoom applied to absorb warp margins (1.0 = no crop, 1.10 = 10% crop). */
-    var cropZoom: Float = 1.10f
+    var cropZoom: Float = 1.15f
 
     /** Adaptive pan detection: reduces TC during pans, increases during shake. */
     var adaptiveSmoothing: Boolean = true
@@ -94,6 +94,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
                 if (!value) {
                     currentMatrix.set(IDENTITY_MATRIX.clone())
                     initialized = false
+                    resetTranslationState()
                 }
             }
         }
@@ -152,8 +153,10 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     @Volatile private var transAppliedUvX = 0f // smoothed correction applied at 200Hz
     @Volatile private var transAppliedUvY = 0f
     @Volatile private var prevGrayMat: org.opencv.core.Mat? = null
-    @Volatile private var prevGyroUvX = 0.0  // previous frame's gyro center offset
+    @Volatile private var prevGyroUvX = 0.0  // previous frame's rotation-only center offset
     @Volatile private var prevGyroUvY = 0.0
+    @Volatile private var rotOnlyUvX = 0.0   // latest rotation-only center offset (no translation)
+    @Volatile private var rotOnlyUvY = 0.0
 
     /**
      * Feed a raw (pre-stabilization) frame for optical-flow translation correction.
@@ -167,19 +170,21 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         if (!translationCorrectionEnabled || !_enabled) return
 
         val mat = org.opencv.core.Mat()
-        org.opencv.android.Utils.bitmapToMat(bitmap, mat)
         val gray = org.opencv.core.Mat()
-        org.opencv.imgproc.Imgproc.cvtColor(mat, gray, org.opencv.imgproc.Imgproc.COLOR_RGBA2GRAY)
-        mat.release()
-
         val smallFloat = org.opencv.core.Mat()
-        gray.convertTo(smallFloat, org.opencv.core.CvType.CV_64F)
-        gray.release()
+        try {
+            org.opencv.android.Utils.bitmapToMat(bitmap, mat)
+            org.opencv.imgproc.Imgproc.cvtColor(mat, gray, org.opencv.imgproc.Imgproc.COLOR_RGBA2GRAY)
+            gray.convertTo(smallFloat, org.opencv.core.CvType.CV_64F)
+        } finally {
+            mat.release()
+            gray.release()
+        }
 
-        // Snapshot the current stab matrix center offset (rotation prediction in UV)
-        val stabMat = currentMatrix.get()
-        val gyroUvX = stabMat[6].toDouble()  // portrait UV u-offset
-        val gyroUvY = stabMat[7].toDouble()  // portrait UV v-offset
+        // Read rotation-only center offset — written by onSensorChanged BEFORE
+        // translation correction is added, so no feedback loop.
+        val gyroUvX = rotOnlyUvX
+        val gyroUvY = rotOnlyUvY
 
         val prev = prevGrayMat
         if (prev != null && prev.size() == smallFloat.size()) {
@@ -190,7 +195,6 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             val dxDs = if (abs(rawDx) < TRANS_DEAD_ZONE_PX) 0.0 else rawDx
             val dyDs = if (abs(rawDy) < TRANS_DEAD_ZONE_PX) 0.0 else rawDy
 
-            // Raw displacement in portrait UV (bitmap is already at raw FBO resolution)
             val portW = bitmap.width.toDouble()
             val portH = bitmap.height.toDouble()
             val rawDispUvX = dxDs / portW
@@ -204,11 +208,10 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             val transDispUvX = rawDispUvX - gyroDispUvX
             val transDispUvY = rawDispUvY - gyroDispUvY
 
-            // Accumulate translation path in UV
             transCumX += transDispUvX
             transCumY += transDispUvY
 
-            val alpha = 1.0 - exp(-1.0 / (30.0 * TRANS_TC))  // ~30fps
+            val alpha = 1.0 - exp(-1.0 / (30.0 * TRANS_TC))
             transSmoothX += alpha * (transCumX - transSmoothX)
             transSmoothY += alpha * (transCumY - transSmoothY)
 
@@ -222,6 +225,14 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             }
             if (abs(devY) > maxCorrUv) {
                 transSmoothY = transCumY - sign(devY) * maxCorrUv
+            }
+
+            // Periodic rebase to prevent unbounded integral drift
+            if (abs(transSmoothX) > 1.0 || abs(transSmoothY) > 1.0) {
+                transCumX -= transSmoothX
+                transCumY -= transSmoothY
+                transSmoothX = 0.0
+                transSmoothY = 0.0
             }
 
             transTargetUvX = (transCumX - transSmoothX).toFloat()
@@ -264,6 +275,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         initialized = false
         currentMatrix.set(IDENTITY_MATRIX.clone())
         resetTelemetry()
+        resetTranslationState()
     }
 
     fun startSessionLog(dir: File) {
@@ -509,8 +521,12 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         val h = computeHomographyUV(r, fxUv, fyUv, cropZoom.toDouble())
 
         val hPortrait = sensorToPortraitGL(h, sensorOrientation)
-        // Smoothly ramp applied translation toward the target at 200Hz to eliminate
-        // step judder from analysis-rate (~10fps) updates.
+        // Capture rotation-only center offset BEFORE adding translation correction.
+        // onRawFrame reads these to subtract gyro-predicted rotation from optical flow,
+        // isolating the translation component. Reading from currentMatrix would include
+        // the previous frame's translation correction → feedback loop.
+        rotOnlyUvX = hPortrait[6].toDouble()
+        rotOnlyUvY = hPortrait[7].toDouble()
         if (translationCorrectionEnabled) {
             val transAlpha = (1.0 - exp(-dtSec * 60.0)).toFloat() // ~17ms ramp
             transAppliedUvX += transAlpha * (transTargetUvX - transAppliedUvX)
@@ -801,6 +817,17 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         smoothedAngularVelocityDeg = 0.0
         highVelocityDurationSec = 0.0
         effectiveTc = timeConstant
+    }
+
+    private fun resetTranslationState() {
+        prevGrayMat?.release()
+        prevGrayMat = null
+        transCumX = 0.0; transCumY = 0.0
+        transSmoothX = 0.0; transSmoothY = 0.0
+        transTargetUvX = 0f; transTargetUvY = 0f
+        transAppliedUvX = 0f; transAppliedUvY = 0f
+        prevGyroUvX = 0.0; prevGyroUvY = 0.0
+        rotOnlyUvX = 0.0; rotOnlyUvY = 0.0
     }
 
     private fun hfovToFocalUv(hfovDegrees: Double): Double {

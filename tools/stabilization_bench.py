@@ -908,7 +908,7 @@ def replay_horizon_lock(gyro_ts, gyro_quats, params: BenchParams, sensor_orienta
 
 
 def replay_gaussian_kernel(gyro_ts, gyro_quats, params: BenchParams, frame_ts,
-                           sensor_orientation=90, sigma_ms=200):
+                           sensor_orientation=90, sigma_ms=400):
     """
     Gaussian kernel smoothing (#160 alternative approach).
 

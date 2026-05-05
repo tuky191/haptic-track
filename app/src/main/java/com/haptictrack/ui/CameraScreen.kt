@@ -419,11 +419,15 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                         gyroStrength = uiState.gyroStrength,
                         adaptiveEnabled = uiState.adaptiveEis,
                         translationEnabled = uiState.translationEis,
+                        leashEnabled = uiState.leashEnabled,
+                        oisEnabled = uiState.oisCompensation,
                         onToggleIsp = { viewModel.toggleIspStabilization() },
                         onToggleGyro = { viewModel.toggleGyroEis() },
                         onGyroStrengthChange = { viewModel.setGyroStrength(it) },
                         onToggleAdaptive = { viewModel.toggleAdaptiveEis() },
                         onToggleTranslation = { viewModel.toggleTranslationEis() },
+                        onToggleLeash = { viewModel.toggleLeash() },
+                        onToggleOis = { viewModel.toggleOisCompensation() },
                         modifier = Modifier
                             .align(Alignment.TopStart)
                             .padding(top = 110.dp, start = 16.dp)
@@ -786,11 +790,15 @@ private fun StabilizationToggles(
     gyroStrength: Float,
     adaptiveEnabled: Boolean,
     translationEnabled: Boolean,
+    leashEnabled: Boolean,
+    oisEnabled: Boolean,
     onToggleIsp: () -> Unit,
     onToggleGyro: () -> Unit,
     onGyroStrengthChange: (Float) -> Unit,
     onToggleAdaptive: () -> Unit,
     onToggleTranslation: () -> Unit,
+    onToggleLeash: () -> Unit,
+    onToggleOis: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -799,6 +807,8 @@ private fun StabilizationToggles(
         if (gyroEnabled) {
             StabToggle("Adapt", adaptiveEnabled, onToggleAdaptive)
             StabToggle("Trans", translationEnabled, onToggleTranslation)
+            StabToggle("Leash", leashEnabled, onToggleLeash)
+            StabToggle("OIS", oisEnabled, onToggleOis)
         }
         if (gyroEnabled) {
             Row(

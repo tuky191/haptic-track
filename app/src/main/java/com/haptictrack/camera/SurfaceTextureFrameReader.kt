@@ -61,6 +61,9 @@ class SurfaceTextureFrameReader(
         private const val RAW_SHORT = 160
     }
 
+    /** When false, skips the raw displacement FBO render even if [onRawFrame] is set. */
+    @Volatile var rawFrameEnabled = false
+
     private var glThread: Thread? = null
     private var processingThread: Thread? = null
     private var surfaceTexture: SurfaceTexture? = null
@@ -181,7 +184,7 @@ class SurfaceTextureFrameReader(
                         st.getTransformMatrix(texMatrix)
 
                         // Render raw (no stabilization) to small FBO for translation measurement
-                        if (onRawFrame != null && rawBitmap != null) {
+                        if (onRawFrame != null && rawBitmap != null && rawFrameEnabled) {
                             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, rawFbo[0])
                             GLES20.glViewport(0, 0, rawW, rawH)
                             GLES20.glUseProgram(program)

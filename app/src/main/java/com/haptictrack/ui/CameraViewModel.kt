@@ -312,7 +312,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     fun toggleTranslationEis() {
         val newValue = !_uiState.value.translationEis
-        cameraManager.gyroStabilizer.translationCorrectionEnabled = newValue
+        cameraManager.setTranslationCorrectionEnabled(newValue)
         _uiState.update { it.copy(translationEis = newValue) }
     }
 

@@ -236,6 +236,11 @@ class CameraManager(private val context: Context) {
         Log.i(TAG, "Bound use cases — preview: $previewRes, frameReader: ${frameReader != null}, gyroVideo: ${stabProcessor != null}")
     }
 
+    fun setTranslationCorrectionEnabled(enabled: Boolean) {
+        gyroStabilizer.translationCorrectionEnabled = enabled
+        frameReader?.rawFrameEnabled = enabled
+    }
+
     fun setZoomRatio(ratio: Float) {
         cameraControl?.setZoomRatio(ratio.coerceIn(getMinZoom(), getMaxZoom()))
     }
