@@ -139,7 +139,6 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 if (isTrackerReady) {
                     tracker.processBitmap(bitmap)
                 } else {
-                    // Before models load we'd leak the bitmap — hand it straight back.
                     cameraManager.releaseAnalysisBitmap(bitmap)
                 }
             }
@@ -311,6 +310,12 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         _uiState.update { it.copy(oisCompensation = newValue) }
     }
 
+    fun toggleTranslationEis() {
+        val newValue = !_uiState.value.translationEis
+        cameraManager.gyroStabilizer.translationCorrectionEnabled = newValue
+        _uiState.update { it.copy(translationEis = newValue) }
+    }
+
     fun setGyroStrength(strength: Float) {
         val clamped = strength.coerceIn(0f, 1f)
         val tc = GYRO_TC_MAX - GYRO_TC_RANGE * clamped
@@ -332,7 +337,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         zoomController.reset()
         hapticManager.updateTrackingStatus(TrackingStatus.IDLE)
         _uiState.update {
-            TrackingUiState(status = TrackingStatus.IDLE, isRecording = it.isRecording, captureMode = it.captureMode, stealthMode = it.stealthMode, isReady = it.isReady, ispStabilization = it.ispStabilization, gyroEis = it.gyroEis, gyroStrength = it.gyroStrength, adaptiveEis = it.adaptiveEis, leashEnabled = it.leashEnabled, oisCompensation = it.oisCompensation)
+            TrackingUiState(status = TrackingStatus.IDLE, isRecording = it.isRecording, captureMode = it.captureMode, stealthMode = it.stealthMode, isReady = it.isReady, ispStabilization = it.ispStabilization, gyroEis = it.gyroEis, gyroStrength = it.gyroStrength, adaptiveEis = it.adaptiveEis, leashEnabled = it.leashEnabled, oisCompensation = it.oisCompensation, translationEis = it.translationEis)
         }
     }
 

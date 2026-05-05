@@ -136,6 +136,106 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     @Volatile
     private var benchCorrWriter: PrintWriter? = null
 
+    // Translation correction: optical flow → position-domain smoothing with leash.
+    // Measures post-gyro residual displacement from stabilized analysis frames,
+    // smooths the cumulative path, applies the difference as a crop offset.
+    var translationCorrectionEnabled: Boolean = false
+    private val TRANS_TC = 0.15          // smoothing time constant (seconds) — lower = more responsive to shake
+    private val TRANS_MARGIN_FRAC = 0.5  // fraction of crop margin reserved for translation
+    private val TRANS_DEAD_ZONE_PX = 0.3 // phase correlation noise floor (pixels at raw FBO res)
+    @Volatile private var transCumX = 0.0    // cumulative translation path (UV)
+    @Volatile private var transCumY = 0.0
+    @Volatile private var transSmoothX = 0.0 // smoothed translation path (UV)
+    @Volatile private var transSmoothY = 0.0
+    @Volatile private var transTargetUvX = 0f  // target correction from GL thread
+    @Volatile private var transTargetUvY = 0f
+    @Volatile private var transAppliedUvX = 0f // smoothed correction applied at 200Hz
+    @Volatile private var transAppliedUvY = 0f
+    @Volatile private var prevGrayMat: org.opencv.core.Mat? = null
+    @Volatile private var prevGyroUvX = 0.0  // previous frame's gyro center offset
+    @Volatile private var prevGyroUvY = 0.0
+
+    /**
+     * Feed a raw (pre-stabilization) frame for optical-flow translation correction.
+     * Called from the GL thread at camera rate (~30fps). The bitmap is reused by
+     * the caller — all OpenCV work must complete before returning.
+     *
+     * Displacement = rotation + translation. We subtract the gyro-predicted rotation
+     * displacement to isolate the translation component.
+     */
+    fun onRawFrame(bitmap: android.graphics.Bitmap) {
+        if (!translationCorrectionEnabled || !_enabled) return
+
+        val mat = org.opencv.core.Mat()
+        org.opencv.android.Utils.bitmapToMat(bitmap, mat)
+        val gray = org.opencv.core.Mat()
+        org.opencv.imgproc.Imgproc.cvtColor(mat, gray, org.opencv.imgproc.Imgproc.COLOR_RGBA2GRAY)
+        mat.release()
+
+        val smallFloat = org.opencv.core.Mat()
+        gray.convertTo(smallFloat, org.opencv.core.CvType.CV_64F)
+        gray.release()
+
+        // Snapshot the current stab matrix center offset (rotation prediction in UV)
+        val stabMat = currentMatrix.get()
+        val gyroUvX = stabMat[6].toDouble()  // portrait UV u-offset
+        val gyroUvY = stabMat[7].toDouble()  // portrait UV v-offset
+
+        val prev = prevGrayMat
+        if (prev != null && prev.size() == smallFloat.size()) {
+            val result = org.opencv.imgproc.Imgproc.phaseCorrelate(prev, smallFloat)
+
+            val rawDx = result.x
+            val rawDy = result.y
+            val dxDs = if (abs(rawDx) < TRANS_DEAD_ZONE_PX) 0.0 else rawDx
+            val dyDs = if (abs(rawDy) < TRANS_DEAD_ZONE_PX) 0.0 else rawDy
+
+            // Raw displacement in portrait UV (bitmap is already at raw FBO resolution)
+            val portW = bitmap.width.toDouble()
+            val portH = bitmap.height.toDouble()
+            val rawDispUvX = dxDs / portW
+            val rawDispUvY = dyDs / portH
+
+            // Gyro-predicted rotation displacement (change since last frame)
+            val gyroDispUvX = gyroUvX - prevGyroUvX
+            val gyroDispUvY = gyroUvY - prevGyroUvY
+
+            // Residual = raw - gyro prediction = translation component
+            val transDispUvX = rawDispUvX - gyroDispUvX
+            val transDispUvY = rawDispUvY - gyroDispUvY
+
+            // Accumulate translation path in UV
+            transCumX += transDispUvX
+            transCumY += transDispUvY
+
+            val alpha = 1.0 - exp(-1.0 / (30.0 * TRANS_TC))  // ~30fps
+            transSmoothX += alpha * (transCumX - transSmoothX)
+            transSmoothY += alpha * (transCumY - transSmoothY)
+
+            // Leash: limit deviation to fraction of crop margin
+            val cropMarginUv = 0.5 * (1.0 - 1.0 / cropZoom)
+            val maxCorrUv = cropMarginUv * TRANS_MARGIN_FRAC
+            val devX = transCumX - transSmoothX
+            val devY = transCumY - transSmoothY
+            if (abs(devX) > maxCorrUv) {
+                transSmoothX = transCumX - sign(devX) * maxCorrUv
+            }
+            if (abs(devY) > maxCorrUv) {
+                transSmoothY = transCumY - sign(devY) * maxCorrUv
+            }
+
+            transTargetUvX = (transCumX - transSmoothX).toFloat()
+            transTargetUvY = (transCumY - transSmoothY).toFloat()
+
+            prev.release()
+        } else {
+            prev?.release()
+        }
+        prevGyroUvX = gyroUvX
+        prevGyroUvY = gyroUvY
+        prevGrayMat = smallFloat
+    }
+
     // Telemetry accumulators (reset every TEL_INTERVAL sensor events)
     private var telFrames = 0
     private var telSumAlpha = 0.0
@@ -283,6 +383,14 @@ class GyroStabilizer(context: Context) : SensorEventListener {
                     }
                 }
                 Log.i(TAG, "Sensor orientation: ${orientation}° → d2s quat=(${deviceToSensorQuat.w}, ${deviceToSensorQuat.x}, ${deviceToSensorQuat.y}, ${deviceToSensorQuat.z})")
+
+                // Check OIS data availability — Camera2 can expose lens displacement samples
+                val oisModes = chars.get(CameraCharacteristics.STATISTICS_INFO_AVAILABLE_OIS_DATA_MODES)
+                if (oisModes != null && oisModes.contains(android.hardware.camera2.CameraMetadata.STATISTICS_OIS_DATA_MODE_ON)) {
+                    Log.i(TAG, "OIS_DATA available — lens displacement samples can be read from CaptureResult")
+                } else {
+                    Log.i(TAG, "OIS_DATA not available on this device (modes=${oisModes?.toList()})")
+                }
                 break
             }
         } catch (e: Exception) {
@@ -401,6 +509,15 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         val h = computeHomographyUV(r, fxUv, fyUv, cropZoom.toDouble())
 
         val hPortrait = sensorToPortraitGL(h, sensorOrientation)
+        // Smoothly ramp applied translation toward the target at 200Hz to eliminate
+        // step judder from analysis-rate (~10fps) updates.
+        if (translationCorrectionEnabled) {
+            val transAlpha = (1.0 - exp(-dtSec * 60.0)).toFloat() // ~17ms ramp
+            transAppliedUvX += transAlpha * (transTargetUvX - transAppliedUvX)
+            transAppliedUvY += transAlpha * (transTargetUvY - transAppliedUvY)
+            hPortrait[6] += transAppliedUvX
+            hPortrait[7] -= transAppliedUvY
+        }
         val rawExcursion = maxCornerExcursion(hPortrait)
         currentMatrix.set(hPortrait)
 

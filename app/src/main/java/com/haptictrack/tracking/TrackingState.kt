@@ -78,5 +78,7 @@ data class TrackingUiState(
     /** Leash: limits smoothed-to-raw deviation. */
     val leashEnabled: Boolean = true,
     /** OIS compensation active (scale correction to avoid overcorrecting). */
-    val oisCompensation: Boolean = true
+    val oisCompensation: Boolean = true,
+    /** Optical-flow translation correction on top of gyro rotation EIS. */
+    val translationEis: Boolean = false
 )

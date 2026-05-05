@@ -1137,6 +1137,116 @@ def calibrate_focal_length(gyro_ts, gyro_quats, frame_ts, raw_displacements,
     return abs(scale_x), abs(scale_y)
 
 
+def replay_hybrid(video_path: str, gyro_ts, gyro_quats, frame_ts, params: BenchParams,
+                  sensor_orientation=90, translation_tc=0.5):
+    """
+    Hybrid stabilizer: gyro rotation + optical flow translation correction.
+
+    Works entirely in the displacement domain (portrait pixels) to avoid
+    coordinate space issues between sensor UV and portrait UV.
+
+    1. Get gyro-only correction displacement per frame pair
+    2. Measure raw optical displacement (phase correlation)
+    3. Post-gyro residual = raw - gyro_correction (translation + gyro error)
+    4. High-pass filter the residual: shake = residual - smoothed(residual)
+    5. Total correction = gyro_correction + shake
+    """
+    # Step 1: Get video dimensions, measure optical flow, get gyro correction
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video: {video_path}")
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    prev_gray = None
+    raw_optical = []
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float64)
+        if prev_gray is not None:
+            (dx, dy), response = cv2.phaseCorrelate(prev_gray, gray)
+            raw_optical.append((dx, dy, response))
+        prev_gray = gray
+    cap.release()
+    raw_optical = np.array(raw_optical)
+
+    rotation_h, _, _ = replay_stabilization(
+        gyro_ts, gyro_quats, params, sensor_orientation, adaptive=True)
+    gyro_correction_disp = corrections_to_frame_displacements(
+        rotation_h, gyro_ts, frame_ts, width, height, sensor_orientation)
+
+    n = min(len(raw_optical), len(gyro_correction_disp))
+    print(f"  Hybrid: {n} frame pairs, fps={fps:.1f}")
+
+    # Step 3: Post-gyro residual = what's left after rotation correction
+    residual = raw_optical[:n, :2] - gyro_correction_disp[:n]
+
+    # Step 4: Position-domain path smoothing with leash.
+    # Build cumulative translation path, smooth it, compute correction.
+    # The leash limits smoothed-to-actual deviation to the crop margin,
+    # same concept as the gyro rotation leash.
+    dt = 1.0 / fps
+    alpha = 1.0 - np.exp(-dt / translation_tc)
+
+    cum_path = np.cumsum(residual, axis=0)
+    cum_path = np.vstack([np.zeros((1, 2)), cum_path])
+
+    # Crop margin for leash (reserve 40% for translation, rest for rotation)
+    margin_x = width * 0.5 * (1.0 - 1.0 / params.crop_zoom) * 0.4
+    margin_y = height * 0.5 * (1.0 - 1.0 / params.crop_zoom) * 0.4
+
+    smoothed_path = np.zeros_like(cum_path)
+    for i in range(1, len(cum_path)):
+        smoothed_path[i] = smoothed_path[i-1] + alpha * (cum_path[i] - smoothed_path[i-1])
+        # Leash: if smoothed deviates too far from actual, pull it back
+        dev = cum_path[i] - smoothed_path[i]
+        if abs(dev[0]) > margin_x:
+            smoothed_path[i, 0] = cum_path[i, 0] - np.sign(dev[0]) * margin_x
+        if abs(dev[1]) > margin_y:
+            smoothed_path[i, 1] = cum_path[i, 1] - np.sign(dev[1]) * margin_y
+
+    # Correction = actual - smoothed (for WARP_INVERSE_MAP)
+    correction = cum_path - smoothed_path
+
+    # Per-frame displacement in the stabilized output = diff of smoothed path
+    smoothed_disp = np.diff(smoothed_path, axis=0)
+
+    # Total correction displacement = gyro + translation correction velocity
+    translation_correction_vel = np.diff(correction, axis=0)[:n]
+    total_correction = gyro_correction_disp[:n] + translation_correction_vel
+
+    residual_rms = np.sqrt(np.mean(residual[:, 0]**2 + residual[:, 1]**2))
+    correction_rms = np.sqrt(np.mean(correction[1:]**2))
+    n_leash = np.sum(np.abs(cum_path[1:] - smoothed_path[1:]) >= np.array([margin_x * 0.99, margin_y * 0.99]), axis=0)
+    print(f"  Post-gyro residual RMS: {residual_rms:.2f} px")
+    print(f"  Translation correction RMS: {correction_rms:.2f} px (max: {np.max(np.abs(correction)):.1f})")
+    print(f"  Leash margin: {margin_x:.1f}x{margin_y:.1f} px, active: X={n_leash[0]}, Y={n_leash[1]} frames")
+
+    # Build combined per-frame portrait-pixel homographies for video output.
+    # Use the leashed position-domain correction (already bounded by crop margin).
+    n_frames = min(len(frame_ts), len(correction))
+    hybrid_frame_warps = []
+    for fi in range(n_frames):
+        idx = np.searchsorted(gyro_ts, frame_ts[fi], side='right') - 1
+        idx = np.clip(idx, 0, len(rotation_h) - 1)
+        H_gyro_px = sensor_uv_to_portrait_px(rotation_h[idx], width, height, sensor_orientation)
+        T = np.eye(3)
+        T[0, 2] = correction[fi, 0]
+        T[1, 2] = correction[fi, 1]
+        H_combined = T @ H_gyro_px
+        hybrid_frame_warps.append(H_combined)
+
+    return total_correction, rotation_h, {
+        'residual': residual,
+        'smoothed_path': smoothed_path,
+        'correction': correction,
+        'frame_warps': hybrid_frame_warps,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Video displacement measurement
 # ---------------------------------------------------------------------------
@@ -1916,6 +2026,31 @@ def generate_stabilized_video(input_path: str, output_path: str, corrections_h,
     print(f"Stabilized video saved to {output_path}")
 
 
+def generate_stabilized_video_px(input_path: str, output_path: str,
+                                  frame_warps: list):
+    """Apply pre-computed portrait-pixel homographies (one per frame) to raw video."""
+    cap = cv2.VideoCapture(input_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+    for i in range(len(frame_warps)):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        stabilized = cv2.warpPerspective(frame, frame_warps[i], (width, height),
+                                          flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                                          borderMode=cv2.BORDER_REPLICATE)
+        writer.write(stabilized)
+
+    cap.release()
+    writer.release()
+    print(f"Stabilized video saved to {output_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="EIS stabilization bench test")
     parser.add_argument("bench_dir", help="Directory with gyro_raw.csv, frames.csv, bench_params.csv")
@@ -1960,6 +2095,10 @@ def main():
                         help="Gaussian kernel sigma in ms for non-causal smoothing (#160 alt)")
     parser.add_argument("--calibrate-focal", action="store_true",
                         help="Auto-calibrate focal length from gyro-video correlation (#158)")
+    parser.add_argument("--hybrid", action="store_true",
+                        help="Enable hybrid stabilization: gyro rotation + optical flow translation")
+    parser.add_argument("--translation-tc", type=float, default=0.5,
+                        help="Translation path smoothing time constant in seconds (default: 0.5)")
     parser.add_argument("--isp-video", type=str, default=None,
                         help="ISP-stabilized reference video (quality target)")
     parser.add_argument("--gyro-video", type=str, default=None,
@@ -2176,6 +2315,17 @@ def main():
         cal_pred = corrections_to_frame_displacements(
             cal_h, gyro_ts, frame_ts, width, height, args.sensor_orientation)
 
+    # Hybrid: gyro rotation + optical flow translation
+    hybrid_h = None
+    hybrid_pred = None
+    hybrid_info = None
+    if args.hybrid:
+        print(f"Replaying hybrid (translation_tc={args.translation_tc}s)...")
+        hybrid_disp, hybrid_h, hybrid_info = replay_hybrid(
+            args.raw_video, gyro_ts, gyro_quats, frame_ts, params,
+            args.sensor_orientation, translation_tc=args.translation_tc)
+        hybrid_pred = hybrid_disp
+
     # Replay non-causal ideal
     print("Computing non-causal ideal...")
     nc_h, nc_smoothed = replay_noncausal(
@@ -2214,11 +2364,15 @@ def main():
     if lookahead_h is not None:
         replay_ss['lookahead'] = replay_stability_score(lookahead_h, gyro_ts, frame_ts, f"Lookahead {args.lookahead}ms")
     replay_ss['noncausal'] = replay_stability_score(nc_h, gyro_ts, frame_ts, "Non-causal")
+    if hybrid_h is not None:
+        replay_ss['hybrid'] = replay_stability_score(hybrid_h, gyro_ts, frame_ts, "Hybrid")
 
     # Compute metrics
     print("\nComputing phase correlation metrics...")
     metrics = compute_metrics(raw_disp, causal_pred, nc_pred, gyro_raw_disp, fps, width, height)
     metrics_fixed = compute_metrics(raw_disp, fixed_pred, nc_pred, gyro_raw_disp, fps, width, height)
+    if hybrid_pred is not None:
+        metrics_hybrid = compute_metrics(raw_disp, hybrid_pred, nc_pred, gyro_raw_disp, fps, width, height)
 
     # Axis alignment diagnostic — raw quaternion components, high-confidence frames only
     n_diag = min(len(raw_disp), len(frame_ts) - 1)
@@ -2338,6 +2492,10 @@ def main():
         cf_rms = cf_metrics['causal_residual_rms_px']
         cf_imp = cf_metrics['improvement_ratio']
         lines.append(f"  Calibrated focal:        {cf_rms:6.2f} px  {cf_imp:.2f}x improvement")
+    if hybrid_pred is not None:
+        hy_rms = metrics_hybrid['causal_residual_rms_px']
+        hy_imp = metrics_hybrid['improvement_ratio']
+        lines.append(f"  Hybrid (tc={args.translation_tc}s):   {hy_rms:6.2f} px  {hy_imp:.2f}x improvement")
     lines.append(f"  Non-causal ideal:        {nc_rms:6.2f} px  {nc_imp:.2f}x improvement")
 
     # Gap analysis
@@ -2439,12 +2597,44 @@ def main():
     else:
         print("\nNo corrections.csv found — capture a new session with the updated build for device-vs-replay comparison")
 
-    # Generate stabilized video
+    # Generate stabilized video + measure actual video jitter
     if args.output_video:
-        print("\nGenerating stabilized video...")
-        out_video = str(out_dir / "stabilized.mp4")
+        print("\nGenerating stabilized videos...")
+        out_video = str(out_dir / "stabilized_gyro.mp4")
         generate_stabilized_video(args.raw_video, out_video, causal_h,
                                    gyro_ts, frame_ts, args.sensor_orientation)
+        videos_to_measure = [
+            (args.raw_video, "Raw"),
+            (out_video, "Gyro-only"),
+        ]
+        if hybrid_info is not None and 'frame_warps' in hybrid_info:
+            out_hybrid = str(out_dir / "stabilized_hybrid.mp4")
+            generate_stabilized_video_px(args.raw_video, out_hybrid,
+                                          hybrid_info['frame_warps'])
+            videos_to_measure.append((out_hybrid, "Hybrid"))
+
+        print("\nActual video jitter (phase correlation on rendered output):")
+        raw_jitter_actual = None
+        for vpath, vlabel in videos_to_measure:
+            cap = cv2.VideoCapture(vpath)
+            disps = []
+            prev_g = None
+            while True:
+                ret, f = cap.read()
+                if not ret:
+                    break
+                g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY).astype(np.float64)
+                if prev_g is not None:
+                    (dx, dy), _ = cv2.phaseCorrelate(prev_g, g)
+                    disps.append((dx, dy))
+                prev_g = g
+            cap.release()
+            d = np.array(disps)
+            rms = np.sqrt(np.mean(d[:, 0]**2 + d[:, 1]**2))
+            if raw_jitter_actual is None:
+                raw_jitter_actual = rms
+            ratio = raw_jitter_actual / rms if rms > 0 else float('inf')
+            print(f"  {vlabel:<12s}: {rms:6.2f} px  ({ratio:.2f}x)")
 
     print("Done.")
 
