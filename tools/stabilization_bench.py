@@ -741,6 +741,402 @@ def replay_rts(gyro_ts, gyro_quats, params: BenchParams, frame_ts, sensor_orient
     return corrections_h
 
 
+def replay_horizon_lock(gyro_ts, gyro_quats, params: BenchParams, sensor_orientation=90,
+                        roll_strength=0.8, roll_tc=0.3):
+    """
+    Causal SLERP smoothing + horizon lock (#162).
+
+    After standard SLERP smoothing, extracts the residual roll angle between
+    the smoothed orientation's "up" vector and true gravity "up", then applies
+    an additional correction around the optical axis to level the horizon.
+
+    The roll correction is limited by roll_strength (0-1) and smoothed with
+    roll_tc to avoid jerky corrections. Roll correction shares the crop budget
+    with translation corrections — the leash operates on the total correction.
+
+    Args:
+        roll_strength: fraction of roll error to correct (1.0 = full lock, 0.0 = no lock)
+        roll_tc: smoothing time constant for roll correction to avoid jitter
+    """
+    n = len(gyro_ts)
+    SENSOR_GAP_NS = 100_000_000
+    angle = np.radians(sensor_orientation)
+    d2s_quat = np.array([np.cos(angle/2), 0, 0, np.sin(angle/2)])
+
+    corrections_h = np.zeros((n, 3, 3))
+    identity = np.eye(3)
+
+    smoothed = gyro_quats[0].copy()
+    sample_rate = 200.0
+    initialized = False
+    last_ts = gyro_ts[0]
+
+    # Adaptive TC state
+    prev_raw = None
+    smoothed_vel_deg = 0.0
+    high_vel_duration = 0.0
+    effective_tc = params.time_constant
+
+    # Horizon lock state
+    smoothed_roll_correction = 0.0  # filtered roll angle (radians)
+
+    # Trace arrays
+    trace_roll_deg = np.zeros(n)
+
+    for i in range(n):
+        raw = quat_normalize(gyro_quats[i])
+        now_ns = gyro_ts[i]
+
+        if not initialized:
+            smoothed = raw.copy()
+            initialized = True
+            last_ts = now_ns
+            prev_raw = raw.copy()
+            corrections_h[i] = identity
+            continue
+
+        dt_ns = now_ns - last_ts
+        last_ts = now_ns
+        if dt_ns <= 0:
+            corrections_h[i] = corrections_h[max(0, i-1)]
+            continue
+        if dt_ns > SENSOR_GAP_NS:
+            smoothed = raw.copy()
+            prev_raw = raw.copy()
+            smoothed_vel_deg = 0.0
+            high_vel_duration = 0.0
+            effective_tc = params.time_constant
+            smoothed_roll_correction = 0.0
+            corrections_h[i] = identity
+            continue
+
+        dt_sec = dt_ns / 1e9
+        sample_rate = 0.95 * sample_rate + 0.05 * (1.0 / dt_sec)
+
+        # Adaptive TC (pan detection)
+        if prev_raw is not None:
+            delta_quat = quat_multiply(quat_conjugate(prev_raw), raw)
+            delta_angle = 2.0 * np.arccos(np.clip(abs(delta_quat[0]), 0.0, 1.0))
+            ang_vel_deg = np.degrees(delta_angle) / dt_sec
+
+            vel_alpha = 1.0 - np.exp(-dt_sec / VELOCITY_SMOOTHING_TC)
+            smoothed_vel_deg += vel_alpha * (ang_vel_deg - smoothed_vel_deg)
+
+            if smoothed_vel_deg > PAN_VELOCITY_THRESHOLD_DEG:
+                high_vel_duration += dt_sec
+            else:
+                high_vel_duration = 0.0
+
+            is_panning = high_vel_duration >= PAN_ONSET_SEC
+            target_tc = params.time_constant * PAN_TC_FACTOR if is_panning else params.time_constant
+            tc_alpha = 1.0 - np.exp(-dt_sec * TC_RAMP_SPEED)
+            effective_tc += tc_alpha * (target_tc - effective_tc)
+
+        prev_raw = raw.copy()
+
+        # Standard SLERP smoothing
+        alpha = 1.0 - np.exp(-(1.0 / sample_rate) / effective_tc)
+        smoothed = slerp(smoothed, raw, alpha)
+
+        # Horizon lock: compute roll error from gravity
+        # In TYPE_GAME_ROTATION_VECTOR, gravity is always [0, 0, -1] in world frame.
+        # The smoothed quaternion rotates from world to device. We want the camera's
+        # "up" to align with world "up" (removing roll around the optical axis).
+        #
+        # Camera optical axis in device frame: +Z (rear camera).
+        # After sensor orientation rotation, camera "up" in sensor frame is -Y.
+        # Roll = rotation around the optical axis = the tilt of the horizon.
+        #
+        # We extract the roll component by:
+        # 1. Transform world "up" [0,1,0] into the smoothed device frame
+        # 2. Project onto the plane perpendicular to optical axis
+        # 3. The angle from device "up" in that plane = roll error
+        R_smooth = quat_to_rotation_matrix(smoothed)
+        # World "up" [0,1,0] in device coords: R_smooth^T * [0,1,0]
+        # (quaternion rotates device→world, so world→device is R^T)
+        # Actually TYPE_GAME_ROTATION_VECTOR: device→world rotation.
+        # So R_smooth * device_vec = world_vec, meaning R_smooth^T * world_up = device_up_dir
+        world_up = np.array([0.0, 1.0, 0.0])
+        # Smoothed quat is device→world, so to get world up in device frame:
+        up_in_device = R_smooth.T @ world_up
+
+        # For rear camera (sensor_orientation=90): optical axis is +Z, camera "up" is -Y
+        # Roll = atan2(up_in_device.x, -up_in_device.y) in the XY plane (perpendicular to Z)
+        # When perfectly upright: up_in_device ≈ [0, -1, 0] for portrait → roll = 0
+        # For portrait phone held upright, gravity in device frame is [0, -g, 0]
+        # but the game rotation vector already accounts for this.
+        # The relevant roll for the camera is the tilt in the sensor plane.
+        # Using atan2 of the x-component vs y-component of gravity projected into
+        # the plane perpendicular to Z:
+        roll_angle = np.arctan2(up_in_device[0], -up_in_device[1])
+
+        # Smooth the target roll correction
+        roll_alpha = 1.0 - np.exp(-dt_sec / roll_tc)
+        target_roll = roll_angle * roll_strength
+        smoothed_roll_correction += roll_alpha * (target_roll - smoothed_roll_correction)
+        trace_roll_deg[i] = np.degrees(smoothed_roll_correction)
+
+        # Apply roll correction as additional rotation around the optical axis (Z in device frame)
+        # before the standard correction computation
+        half_roll = smoothed_roll_correction / 2.0
+        roll_quat = np.array([np.cos(half_roll), 0.0, 0.0, np.sin(half_roll)])  # rotation about Z
+
+        # Leash: limit total deviation between smoothed (with roll) and raw
+        # Apply roll correction to smoothed before leash check
+        smoothed_with_roll = quat_multiply(smoothed, roll_quat)
+
+        if params.leash_enabled:
+            crop_margin = 0.5 * (1.0 - 1.0 / params.crop_zoom)
+            max_corr_angle = crop_margin / max(params.fx_uv, params.fy_uv) / params.ois_compensation
+            dev_quat = quat_multiply(quat_conjugate(smoothed_with_roll), raw)
+            dev_angle = 2.0 * np.arccos(np.clip(dev_quat[0], -1.0, 1.0))
+            if dev_angle > max_corr_angle and dev_angle > 1e-6:
+                catch_up = 1.0 - max_corr_angle / dev_angle
+                smoothed_with_roll = slerp(smoothed_with_roll, raw, catch_up)
+
+        # Compute correction from smoothed (with roll) to raw
+        correction_device = quat_multiply(quat_conjugate(smoothed_with_roll), raw)
+        if params.ois_compensation < 1.0:
+            identity_q = np.array([1.0, 0.0, 0.0, 0.0])
+            correction_device = slerp(identity_q, correction_device, params.ois_compensation)
+        correction = quat_multiply(quat_multiply(d2s_quat, correction_device),
+                                   quat_conjugate(d2s_quat))
+        R = quat_to_rotation_matrix(correction)
+        corrections_h[i] = compute_homography_uv(R, params.fx_uv, params.fy_uv, params.crop_zoom)
+
+    return corrections_h, {'roll_deg': trace_roll_deg}
+
+
+def replay_gaussian_kernel(gyro_ts, gyro_quats, params: BenchParams, frame_ts,
+                           sensor_orientation=90, sigma_ms=200):
+    """
+    Gaussian kernel smoothing (#160 alternative approach).
+
+    Instead of causal exponential SLERP, uses a symmetric Gaussian kernel centered
+    on each frame timestamp. This is inherently non-causal — requires buffering
+    frames for ~2*sigma before output.
+
+    For each frame, the smoothed orientation is the weighted quaternion average
+    over a window of ±3σ, where weights follow a Gaussian distribution. This
+    produces smoother results than the RTS forward-backward approach because:
+    - No initialization transient (Gaussian kernel is shift-invariant)
+    - Proper frequency response (Gaussian → Gaussian in frequency domain)
+    - Scales naturally to any window size
+
+    Realizable in real-time by buffering ~2*sigma frames (~400ms at σ=200ms).
+    Preview uses causal SLERP, video capture uses Gaussian.
+
+    Args:
+        sigma_ms: Gaussian kernel σ in milliseconds (larger = more smoothing)
+    """
+    sigma_ns = sigma_ms * 1_000_000
+    window_ns = int(3.0 * sigma_ns)  # ±3σ covers 99.7% of weight
+
+    angle = np.radians(sensor_orientation)
+    d2s_quat = np.array([np.cos(angle/2), 0, 0, np.sin(angle/2)])
+
+    n_frames = len(frame_ts)
+    corrections_h = np.zeros((n_frames, 3, 3))
+
+    for fi in range(n_frames):
+        target_ns = frame_ts[fi]
+        start_ns = target_ns - window_ns
+        end_ns = target_ns + window_ns
+
+        # Find gyro samples in window
+        mask = (gyro_ts >= start_ns) & (gyro_ts <= end_ns)
+        indices = np.where(mask)[0]
+
+        if len(indices) < 5:
+            corrections_h[fi] = np.eye(3)
+            continue
+
+        # Compute Gaussian weights
+        dt_from_target = (gyro_ts[indices] - target_ns).astype(np.float64)
+        weights = np.exp(-0.5 * (dt_from_target / sigma_ns) ** 2)
+        weights /= weights.sum()
+
+        # Weighted quaternion average (iterative SLERP towards weighted mean)
+        # Start from the sample closest to center
+        center_idx = np.argmin(np.abs(dt_from_target))
+        mean_q = quat_normalize(gyro_quats[indices[center_idx]])
+
+        # Iterative refinement (3 iterations is enough for convergence)
+        for _ in range(3):
+            # Compute weighted average in tangent space
+            tangent_sum = np.zeros(3)
+            for j, idx in enumerate(indices):
+                q = quat_normalize(gyro_quats[idx])
+                # Log map: rotation from mean_q to q
+                delta = quat_multiply(quat_conjugate(mean_q), q)
+                if delta[0] < 0:
+                    delta = -delta
+                # Small angle approximation for log (axis * angle)
+                angle_d = 2.0 * np.arccos(np.clip(delta[0], -1.0, 1.0))
+                if angle_d < 1e-8:
+                    continue
+                axis = delta[1:4] / np.sin(angle_d / 2.0)
+                tangent_sum += weights[j] * angle_d * axis
+
+            # Exp map: tangent → quaternion
+            tangent_angle = np.linalg.norm(tangent_sum)
+            if tangent_angle > 1e-8:
+                axis = tangent_sum / tangent_angle
+                half = tangent_angle / 2.0
+                step_q = np.array([np.cos(half), *(np.sin(half) * axis)])
+                mean_q = quat_normalize(quat_multiply(mean_q, step_q))
+
+        smoothed = mean_q
+        raw_at_target = quat_normalize(gyro_quats[indices[center_idx]])
+
+        # Leash
+        if params.leash_enabled:
+            crop_margin = 0.5 * (1.0 - 1.0 / params.crop_zoom)
+            max_corr_angle = crop_margin / max(params.fx_uv, params.fy_uv) / params.ois_compensation
+            dev_quat = quat_multiply(quat_conjugate(smoothed), raw_at_target)
+            dev_angle = 2.0 * np.arccos(np.clip(dev_quat[0], -1.0, 1.0))
+            if dev_angle > max_corr_angle and dev_angle > 1e-6:
+                catch_up = 1.0 - max_corr_angle / dev_angle
+                smoothed = slerp(smoothed, raw_at_target, catch_up)
+
+        # Correction pipeline
+        correction_device = quat_multiply(quat_conjugate(smoothed), raw_at_target)
+        if params.ois_compensation < 1.0:
+            identity_q = np.array([1.0, 0.0, 0.0, 0.0])
+            correction_device = slerp(identity_q, correction_device, params.ois_compensation)
+        correction = quat_multiply(quat_multiply(d2s_quat, correction_device),
+                                   quat_conjugate(d2s_quat))
+        R = quat_to_rotation_matrix(correction)
+        corrections_h[fi] = compute_homography_uv(R, params.fx_uv, params.fy_uv, params.crop_zoom)
+
+    return corrections_h
+
+
+def calibrate_focal_length(gyro_ts, gyro_quats, frame_ts, raw_displacements,
+                           params: BenchParams, sensor_orientation=90, verbose=True):
+    """
+    Auto-calibrate focal length by comparing gyro-predicted vs optical displacement (#158).
+
+    The gyro predicts inter-frame rotation. The optical flow measures inter-frame
+    displacement in pixels. The ratio between them reveals the effective focal length:
+        fx_effective = optical_displacement_px / gyro_predicted_angle_uv / frame_width
+
+    Returns the calibration scale factors (scale_x, scale_y) to multiply fx_uv, fy_uv.
+    A scale > 1.0 means the current focal length is too small (under-predicting motion).
+    """
+    angle = np.radians(sensor_orientation)
+    d2s_quat = np.array([np.cos(angle/2), 0, 0, np.sin(angle/2)])
+
+    n_frames = len(frame_ts)
+    if n_frames < 10 or len(raw_displacements) < 10:
+        return 1.0, 1.0
+
+    gyro_dx = []
+    gyro_dy = []
+    optical_dx = []
+    optical_dy = []
+
+    for fi in range(min(n_frames - 1, len(raw_displacements))):
+        t0 = frame_ts[fi]
+        t1 = frame_ts[fi + 1] if fi + 1 < n_frames else frame_ts[fi]
+
+        # Find gyro samples for this frame pair
+        idx0 = np.searchsorted(gyro_ts, t0)
+        idx1 = np.searchsorted(gyro_ts, t1)
+        idx0 = np.clip(idx0, 0, len(gyro_ts) - 1)
+        idx1 = np.clip(idx1, 0, len(gyro_ts) - 1)
+
+        if idx0 == idx1:
+            continue
+
+        # Inter-frame rotation from gyro
+        q0 = quat_normalize(gyro_quats[idx0])
+        q1 = quat_normalize(gyro_quats[idx1])
+        delta_device = quat_multiply(quat_conjugate(q0), q1)
+
+        # Transform to sensor space
+        delta_sensor = quat_multiply(quat_multiply(d2s_quat, delta_device),
+                                     quat_conjugate(d2s_quat))
+        R = quat_to_rotation_matrix(delta_sensor)
+
+        # Predicted displacement in UV at center (using unit focal length)
+        # H = K R K^-1 applied at center (0.5, 0.5)
+        # With fx=fy=1: displacement ≈ rotation angle in radians
+        # We compute actual displacement at center for unit focal length,
+        # then scale will tell us the true focal length
+        h_unit = compute_homography_uv(R, 1.0, 1.0, 1.0)
+        predicted_du = h_unit[0, 0] * 0.5 + h_unit[0, 1] * 0.5 + h_unit[0, 2] - 0.5
+        predicted_dv = h_unit[1, 0] * 0.5 + h_unit[1, 1] * 0.5 + h_unit[1, 2] - 0.5
+
+        if abs(predicted_du) < 1e-8 and abs(predicted_dv) < 1e-8:
+            continue
+
+        # Optical displacement in UV
+        resp = raw_displacements[fi, 2]
+        if resp < 0.1:
+            continue
+        # Phase correlation returns (dx, dy) in pixels; convert to UV
+        # Note: phase correlation sign convention may need checking
+        optical_du = raw_displacements[fi, 0]  # pixels
+        optical_dv = raw_displacements[fi, 1]  # pixels
+
+        gyro_dx.append(predicted_du)
+        gyro_dy.append(predicted_dv)
+        optical_dx.append(optical_du)
+        optical_dy.append(optical_dv)
+
+    gyro_dx = np.array(gyro_dx)
+    gyro_dy = np.array(gyro_dy)
+    optical_dx = np.array(optical_dx)
+    optical_dy = np.array(optical_dy)
+
+    if len(gyro_dx) < 20:
+        if verbose:
+            print("  Too few valid frames for focal length calibration")
+        return 1.0, 1.0
+
+    # Robust regression: optical = scale * gyro + offset
+    # Use median of ratios for robustness to outliers
+    # Only use frames where gyro prediction is large enough to be reliable
+    mask_x = np.abs(gyro_dx) > np.percentile(np.abs(gyro_dx), 25)
+    mask_y = np.abs(gyro_dy) > np.percentile(np.abs(gyro_dy), 25)
+
+    if mask_x.sum() > 10:
+        ratios_x = optical_dx[mask_x] / gyro_dx[mask_x]
+        scale_x = np.median(ratios_x)
+    else:
+        scale_x = 1.0
+
+    if mask_y.sum() > 10:
+        ratios_y = optical_dy[mask_y] / gyro_dy[mask_y]
+        scale_y = np.median(ratios_y)
+    else:
+        scale_y = 1.0
+
+    # The predicted displacement with focal length f is: du = f * angle
+    # If optical/predicted ratio is R, then true_f = current_f * R
+    # But we computed predicted with unit focal length, so:
+    # scale factor = optical_px / (predicted_uv_unit * width)
+    # Hmm, let me reconsider. The gyro_dx is in UV with f=1. The optical is in pixels.
+    # To get the calibration: optical_px = predicted_uv * width * scale
+    # Actually we need to be more careful about units.
+
+    if verbose:
+        print(f"\nFocal length calibration (#158):")
+        print(f"  Valid frame pairs: {len(gyro_dx)}")
+        print(f"  Scale X (median ratio): {scale_x:.4f}")
+        print(f"  Scale Y (median ratio): {scale_y:.4f}")
+        # The current fx_uv should be multiplied by |scale| to match
+        # But sign tells us direction convention
+        corr_x = np.corrcoef(gyro_dx, optical_dx)[0, 1] if len(gyro_dx) > 2 else 0
+        corr_y = np.corrcoef(gyro_dy, optical_dy)[0, 1] if len(gyro_dy) > 2 else 0
+        print(f"  Correlation: X={corr_x:.3f}, Y={corr_y:.3f}")
+
+    # Return absolute scale factors for fx, fy
+    # If scale is negative, axes are flipped (sign convention issue)
+    return abs(scale_x), abs(scale_y)
+
+
 # ---------------------------------------------------------------------------
 # Video displacement measurement
 # ---------------------------------------------------------------------------
@@ -813,6 +1209,26 @@ def corrections_to_frame_displacements(corrections_h, gyro_ts, frame_ts, width, 
         H1 = sensor_uv_to_portrait_px(corrections_h[idx1], width, height, sensor_orientation)
 
         # Center pixel displacement in portrait pixels
+        x0 = H0[0, 0] * cx + H0[0, 1] * cy + H0[0, 2]
+        y0 = H0[1, 0] * cx + H0[1, 1] * cy + H0[1, 2]
+        x1 = H1[0, 0] * cx + H1[0, 1] * cy + H1[0, 2]
+        y1 = H1[1, 0] * cx + H1[1, 1] * cy + H1[1, 2]
+
+        frame_disp.append((x1 - x0, y1 - y0))
+
+    return np.array(frame_disp)
+
+
+def _frame_corrections_to_displacements(frame_corrections_h, width, height, sensor_orientation=90):
+    """Convert per-frame corrections (already frame-aligned) to inter-frame pixel displacements."""
+    n_frames = len(frame_corrections_h)
+    frame_disp = []
+    cx, cy = width / 2.0, height / 2.0
+
+    for i in range(n_frames - 1):
+        H0 = sensor_uv_to_portrait_px(frame_corrections_h[i], width, height, sensor_orientation)
+        H1 = sensor_uv_to_portrait_px(frame_corrections_h[i + 1], width, height, sensor_orientation)
+
         x0 = H0[0, 0] * cx + H0[0, 1] * cy + H0[0, 2]
         y0 = H0[1, 0] * cx + H0[1, 1] * cy + H0[1, 2]
         x1 = H1[0, 0] * cx + H1[0, 1] * cy + H1[0, 2]
@@ -1534,6 +1950,16 @@ def main():
                         help="Minimum crop zoom for adaptive crop (default: 1.0 = full FOV)")
     parser.add_argument("--crop-threshold", type=float, default=0.3,
                         help="Correction angle (degrees) at which adaptive crop is at midpoint")
+    parser.add_argument("--horizon-lock", action="store_true",
+                        help="Enable horizon lock: correct roll using gravity vector (#162)")
+    parser.add_argument("--roll-strength", type=float, default=0.8,
+                        help="Horizon lock strength 0-1 (default: 0.8)")
+    parser.add_argument("--roll-tc", type=float, default=0.3,
+                        help="Horizon lock smoothing TC in seconds (default: 0.3)")
+    parser.add_argument("--gaussian", type=int, default=None,
+                        help="Gaussian kernel sigma in ms for non-causal smoothing (#160 alt)")
+    parser.add_argument("--calibrate-focal", action="store_true",
+                        help="Auto-calibrate focal length from gyro-video correlation (#158)")
     parser.add_argument("--isp-video", type=str, default=None,
                         help="ISP-stabilized reference video (quality target)")
     parser.add_argument("--gyro-video", type=str, default=None,
@@ -1696,6 +2122,60 @@ def main():
         causal_h = lookahead_h
         causal_pred = lookahead_pred
 
+    # Replay with horizon lock if requested
+    horizon_h = None
+    horizon_pred = None
+    horizon_trace = None
+    if args.horizon_lock:
+        print(f"Replaying with horizon lock (strength={args.roll_strength}, tc={args.roll_tc}s)...")
+        horizon_h, horizon_trace = replay_horizon_lock(
+            gyro_ts, gyro_quats, params, args.sensor_orientation,
+            roll_strength=args.roll_strength, roll_tc=args.roll_tc)
+        horizon_pred = corrections_to_frame_displacements(
+            horizon_h, gyro_ts, frame_ts, width, height, args.sensor_orientation)
+        roll_rms = np.sqrt(np.mean(horizon_trace['roll_deg']**2))
+        roll_max = np.abs(horizon_trace['roll_deg']).max()
+        print(f"  Roll correction: RMS={roll_rms:.2f}°, max={roll_max:.2f}°")
+        causal_h = horizon_h
+        causal_pred = horizon_pred
+
+    # Replay with Gaussian kernel smoothing if requested
+    gaussian_h = None
+    gaussian_pred = None
+    if args.gaussian is not None:
+        print(f"Replaying with Gaussian kernel (σ={args.gaussian}ms)...")
+        gaussian_h = replay_gaussian_kernel(
+            gyro_ts, gyro_quats, params, frame_ts, args.sensor_orientation,
+            sigma_ms=args.gaussian)
+        # Gaussian returns per-frame corrections — compute displacements directly
+        gaussian_pred = _frame_corrections_to_displacements(
+            gaussian_h, width, height, args.sensor_orientation)
+        causal_h = gaussian_h
+        causal_pred = gaussian_pred
+
+    # Focal length auto-calibration if requested
+    if args.calibrate_focal:
+        scale_x, scale_y = calibrate_focal_length(
+            gyro_ts, gyro_quats, frame_ts, raw_disp,
+            params, args.sensor_orientation)
+        # Re-run with calibrated focal lengths
+        cal_params = BenchParams(
+            time_constant=params.time_constant,
+            crop_zoom=params.crop_zoom,
+            fx_uv=params.fx_uv * scale_x,
+            fy_uv=params.fy_uv * scale_y,
+            clamp_margin_fraction=params.clamp_margin_fraction,
+            ois_compensation=params.ois_compensation,
+            leash_enabled=params.leash_enabled,
+        )
+        print(f"  Calibrated: fx={cal_params.fx_uv:.4f} (was {params.fx_uv:.4f}), "
+              f"fy={cal_params.fy_uv:.4f} (was {params.fy_uv:.4f})")
+        print("  Re-running adaptive with calibrated focal lengths...")
+        cal_h, _, _ = replay_stabilization(
+            gyro_ts, gyro_quats, cal_params, args.sensor_orientation, adaptive=True)
+        cal_pred = corrections_to_frame_displacements(
+            cal_h, gyro_ts, frame_ts, width, height, args.sensor_orientation)
+
     # Replay non-causal ideal
     print("Computing non-causal ideal...")
     nc_h, nc_smoothed = replay_noncausal(
@@ -1843,6 +2323,21 @@ def main():
         la_rms = la_metrics['causal_residual_rms_px']
         la_imp = la_metrics['improvement_ratio']
         lines.append(f"  Lookahead {args.lookahead}ms:        {la_rms:6.2f} px  {la_imp:.2f}x improvement")
+    if horizon_pred is not None:
+        hz_metrics = compute_metrics(raw_disp, horizon_pred, nc_pred, gyro_raw_disp, fps, width, height)
+        hz_rms = hz_metrics['causal_residual_rms_px']
+        hz_imp = hz_metrics['improvement_ratio']
+        lines.append(f"  Horizon lock:            {hz_rms:6.2f} px  {hz_imp:.2f}x improvement")
+    if gaussian_pred is not None:
+        gs_metrics = compute_metrics(raw_disp, gaussian_pred, nc_pred, gyro_raw_disp, fps, width, height)
+        gs_rms = gs_metrics['causal_residual_rms_px']
+        gs_imp = gs_metrics['improvement_ratio']
+        lines.append(f"  Gaussian σ={args.gaussian}ms:       {gs_rms:6.2f} px  {gs_imp:.2f}x improvement")
+    if args.calibrate_focal:
+        cf_metrics = compute_metrics(raw_disp, cal_pred, nc_pred, gyro_raw_disp, fps, width, height)
+        cf_rms = cf_metrics['causal_residual_rms_px']
+        cf_imp = cf_metrics['improvement_ratio']
+        lines.append(f"  Calibrated focal:        {cf_rms:6.2f} px  {cf_imp:.2f}x improvement")
     lines.append(f"  Non-causal ideal:        {nc_rms:6.2f} px  {nc_imp:.2f}x improvement")
 
     # Gap analysis

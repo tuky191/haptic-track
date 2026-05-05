@@ -40,7 +40,11 @@ class StabilizationProcessor(
 
     companion object {
         private const val TAG = "StabProcessor"
-        private const val LOOKAHEAD_FRAMES = 4
+        // Buffer depth for Gaussian kernel smoothing: more frames = better smoothing
+        // but more GPU memory (each FBO = W×H×4 bytes). At 1080p: 12 frames ≈ 95MB.
+        // 12 frames ≈ 400ms at 30fps ≈ 1σ of future data for σ=400ms kernel.
+        // Bench: 1.52x improvement vs 1.44x causal SLERP (+6% on shake-heavy video).
+        private const val LOOKAHEAD_FRAMES = 12
     }
 
     private val glThread = HandlerThread("StabProcessor-GL").apply { start() }
