@@ -91,12 +91,17 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
                 val targetZoom = if (lockedObject != null) {
                     zoomController.resetLossCounter()
+                    cameraManager.gyroStabilizer.onTrackingUpdate(
+                        lockedObject.boundingBox.centerX(),
+                        lockedObject.boundingBox.centerY()
+                    )
                     zoomController.calculateZoom(
                         lockedObject.boundingBox,
                         cameraManager.getMinZoom(),
                         cameraManager.getMaxZoom()
                     ).also { cameraManager.setZoomRatio(it) }
                 } else if (status == TrackingStatus.LOST) {
+                    cameraManager.gyroStabilizer.clearTracking()
                     // Gradual zoom-out: delays 5 frames then pulls back 15% per frame.
                     // Gives reacquisition a chance at the original zoom before widening FOV.
                     zoomController.zoomOutForSearchGradual(

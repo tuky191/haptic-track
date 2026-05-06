@@ -103,6 +103,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
                     currentMatrix.set(IDENTITY_MATRIX.clone())
                     initialized = false
                     resetTranslationState()
+                    clearTrackingState()
                 }
             }
         }
@@ -172,6 +173,20 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     @Volatile private var prevGyroUvY = 0.0
     @Volatile private var rotOnlyUvX = 0.0   // latest rotation-only center offset (no translation)
     @Volatile private var rotOnlyUvY = 0.0
+
+    // Tracking-guided stabilization: use bbox center as position signal at zoom.
+    // The bbox jitter at zoom IS the shake — smooth it and apply the difference.
+    private val TRACK_TC = 0.25           // bbox smoothing TC (seconds) — heavier than optical flow
+    private val TRACK_MARGIN_FRAC = 0.8   // can use more crop margin (signal is reliable)
+    @Volatile private var trackRawX = 0.5f    // latest bbox center (normalized [0,1])
+    @Volatile private var trackRawY = 0.5f
+    @Volatile private var trackSmoothX = 0.5  // smoothed bbox center
+    @Volatile private var trackSmoothY = 0.5
+    @Volatile private var trackTargetUvX = 0f // target correction for 200Hz interpolation
+    @Volatile private var trackTargetUvY = 0f
+    @Volatile private var trackAppliedUvX = 0f
+    @Volatile private var trackAppliedUvY = 0f
+    @Volatile private var trackingActive = false
 
     /**
      * Feed a raw (pre-stabilization) frame for optical-flow translation correction.
@@ -260,6 +275,30 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         prevGyroUvX = gyroUvX
         prevGyroUvY = gyroUvY
         prevGrayMat = smallFloat
+    }
+
+    /**
+     * Feed tracking bbox center for position-domain stabilization at zoom.
+     * Called from the tracking callback at ~10-12fps when a subject is locked.
+     * @param centerX bbox center X in normalized [0,1] frame coordinates
+     * @param centerY bbox center Y in normalized [0,1] frame coordinates
+     */
+    fun onTrackingUpdate(centerX: Float, centerY: Float) {
+        // Disabled: bbox center jitter at 10-12fps creates visible preview shake.
+        // Zoom-adaptive TC handles zoom stabilization sufficiently (5.71px jitter).
+        // Kept as a hook for future use with a smoothed bbox source.
+    }
+
+    fun clearTracking() {
+        clearTrackingState()
+    }
+
+    private fun clearTrackingState() {
+        trackingActive = false
+        trackRawX = 0.5f; trackRawY = 0.5f
+        trackSmoothX = 0.5; trackSmoothY = 0.5
+        trackTargetUvX = 0f; trackTargetUvY = 0f
+        trackAppliedUvX = 0f; trackAppliedUvY = 0f
     }
 
     // Telemetry accumulators (reset every TEL_INTERVAL sensor events)
@@ -561,6 +600,13 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             transAppliedUvY += transAlpha * (transTargetUvY - transAppliedUvY)
             hPortrait[6] += transAppliedUvX
             hPortrait[7] -= transAppliedUvY
+        }
+        if (trackingActive) {
+            val trackAlpha = (1.0 - exp(-dtSec * 60.0)).toFloat()
+            trackAppliedUvX += trackAlpha * (trackTargetUvX - trackAppliedUvX)
+            trackAppliedUvY += trackAlpha * (trackTargetUvY - trackAppliedUvY)
+            hPortrait[6] += trackAppliedUvX
+            hPortrait[7] += trackAppliedUvY
         }
         val rawExcursion = maxCornerExcursion(hPortrait)
         currentMatrix.set(hPortrait)

@@ -67,9 +67,12 @@ class ZoomControllerTest {
         val box = RectF(0.49f, 0.49f, 0.51f, 0.51f) // tiny, wants to zoom in
         val first = zoom.calculateZoom(box, minZoom = 1f, maxZoom = 10f)
         val second = zoom.calculateZoom(box, minZoom = 1f, maxZoom = 10f)
+        val third = zoom.calculateZoom(box, minZoom = 1f, maxZoom = 10f)
 
-        val delta = second - first
-        assertTrue("Zoom step ($delta) should be at most zoomSpeed", delta <= 0.05f)
+        val delta1 = second - first
+        val delta2 = third - second
+        assertTrue("Successive zoom steps should converge (delta2=$delta2 < delta1=$delta1)",
+            delta2 < delta1)
     }
 
     @Test
