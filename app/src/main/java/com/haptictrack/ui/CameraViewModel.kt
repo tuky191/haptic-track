@@ -99,7 +99,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                         lockedObject.boundingBox,
                         cameraManager.getMinZoom(),
                         cameraManager.getMaxZoom()
-                    ).also { cameraManager.setZoomRatio(it) }
+                    ).also { cameraManager.setZoomTarget(it) }
                 } else if (status == TrackingStatus.LOST) {
                     cameraManager.gyroStabilizer.clearTracking()
                     // Gradual zoom-out: delays 5 frames then pulls back 15% per frame.
@@ -107,7 +107,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     zoomController.zoomOutForSearchGradual(
                         cameraManager.getMinZoom(),
                         cameraManager.getMaxZoom()
-                    ).also { cameraManager.setZoomRatio(it) }
+                    ).also { cameraManager.setZoomTarget(it) }
                 } else null
 
                 hapticManager.updateTrackingStatus(status, edgeProximity)
@@ -217,7 +217,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         val appliedZoom = zoomController.setManualZoom(
             newZoom, cameraManager.getMinZoom(), cameraManager.getMaxZoom()
         )
-        cameraManager.setZoomRatio(appliedZoom)
+        cameraManager.setZoomImmediate(appliedZoom)
         _uiState.update { it.copy(currentZoomRatio = appliedZoom, showZoomIndicator = true) }
     }
 

@@ -84,6 +84,18 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     /** Current camera zoom ratio — used to scale TC (more smoothing at zoom). */
     @Volatile var zoomRatio: Float = 1f
 
+    // Zoom interpolation: target set at 10-12fps by tracker, applied at 200Hz
+    @Volatile private var zoomTarget: Float = 1f
+    @Volatile private var zoomApplied: Float = 1f
+    private var lastZoomDispatchNs: Long = 0L
+
+    /** Callback to apply interpolated zoom to CameraX. Called at ~60Hz from sensor thread. */
+    var onZoomApply: ((Float) -> Unit)? = null
+
+    fun setZoomTarget(target: Float) {
+        zoomTarget = target
+    }
+
     /** Gaussian kernel smoothing for video frames (400ms output latency, ~95MB FBO buffer). */
     var rtsLookahead: Boolean = true
 
@@ -104,6 +116,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
                     initialized = false
                     resetTranslationState()
                     clearTrackingState()
+                    zoomApplied = zoomTarget
                 }
             }
         }
@@ -330,6 +343,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         currentMatrix.set(IDENTITY_MATRIX.clone())
         resetTelemetry()
         resetTranslationState()
+        zoomApplied = zoomTarget
     }
 
     fun startSessionLog(dir: File) {
@@ -513,6 +527,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             smoothFastQuat = rawQuat
             prevRawQuat = rawQuat
             resetAdaptiveState()
+            zoomApplied = zoomTarget
             return
         }
 
@@ -610,6 +625,15 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         }
         val rawExcursion = maxCornerExcursion(hPortrait)
         currentMatrix.set(hPortrait)
+
+        // Zoom interpolation: ramp toward target at 200Hz, dispatch to CameraX at ~60Hz
+        val zoomAlpha = (1.0 - exp(-dtSec * 25.0)).toFloat()
+        zoomApplied += zoomAlpha * (zoomTarget - zoomApplied)
+        zoomRatio = zoomApplied
+        if (nowNs - lastZoomDispatchNs >= 16_000_000L) {
+            lastZoomDispatchNs = nowNs
+            onZoomApply?.invoke(zoomApplied)
+        }
 
         // --- Telemetry ---
         val corrAngleDeg = 2.0 * acos(correction.w.coerceIn(-1.0, 1.0)) * (180.0 / PI)

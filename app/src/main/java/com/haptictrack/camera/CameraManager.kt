@@ -239,6 +239,11 @@ class CameraManager(private val context: Context) {
         cameraControl = camera.cameraControl
         cameraInfo = camera.cameraInfo
 
+        gyroStabilizer.onZoomApply = { ratio ->
+            val clamped = ratio.coerceIn(getMinZoom(), getMaxZoom())
+            cameraControl?.setZoomRatio(clamped)
+        }
+
         val previewRes = preview.resolutionInfo?.resolution
         Log.i(TAG, "Bound use cases — preview: $previewRes, frameReader: ${frameReader != null}, gyroVideo: ${stabProcessor != null}")
     }
@@ -248,10 +253,16 @@ class CameraManager(private val context: Context) {
         frameReader?.rawFrameEnabled = enabled
     }
 
-    fun setZoomRatio(ratio: Float) {
+    fun setZoomTarget(ratio: Float) {
+        val clamped = ratio.coerceIn(getMinZoom(), getMaxZoom())
+        gyroStabilizer.setZoomTarget(clamped)
+    }
+
+    fun setZoomImmediate(ratio: Float) {
         val clamped = ratio.coerceIn(getMinZoom(), getMaxZoom())
         cameraControl?.setZoomRatio(clamped)
         gyroStabilizer.zoomRatio = clamped
+        gyroStabilizer.setZoomTarget(clamped)
     }
 
     fun getMinZoom(): Float = cameraInfo?.zoomState?.value?.minZoomRatio ?: 1f

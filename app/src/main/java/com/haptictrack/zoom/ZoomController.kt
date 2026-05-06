@@ -26,7 +26,7 @@ class ZoomController(
         /** Frames to wait before starting zoom-out on loss (~270ms at 30fps). */
         private const val ZOOM_OUT_DELAY_FRAMES = 8
         /** Exponential smoothing factor per frame (0.05 = slow/smooth, 0.20 = fast). */
-        private const val ZOOM_SMOOTH_ALPHA = 0.07f
+        private const val ZOOM_SMOOTH_ALPHA = 0.05f
         /** Faster smoothing for zoom-out when clipped (avoid losing the subject). */
         private const val ZOOM_SMOOTH_ALPHA_CLIP = 0.15f
         /** Smoothing factor for bbox area input (filters detector jitter). */
