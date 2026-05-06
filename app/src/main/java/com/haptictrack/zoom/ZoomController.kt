@@ -1,6 +1,7 @@
 package com.haptictrack.zoom
 
 import android.graphics.RectF
+import kotlin.math.sqrt
 
 class ZoomController(
     private val targetFrameOccupancy: Float = 0.15f,
@@ -24,6 +25,15 @@ class ZoomController(
         private const val MANUAL_OVERRIDE_DURATION_MS = 2000L
         /** Frames to wait before starting zoom-out on loss (~270ms at 30fps). */
         private const val ZOOM_OUT_DELAY_FRAMES = 8
+        /** Exponential smoothing factor per frame (0.05 = slow/smooth, 0.20 = fast). */
+        private const val ZOOM_SMOOTH_ALPHA = 0.05f
+        /** Faster smoothing for zoom-out when clipped (avoid losing the subject). */
+        private const val ZOOM_SMOOTH_ALPHA_CLIP = 0.15f
+        /** Smoothing factor for bbox area input (filters detector jitter). */
+        private const val AREA_SMOOTH_ALPHA = 0.15f
+        /** Dead zone: hold zoom if area ratio is within this range of target. */
+        private const val DEAD_ZONE_LOW = 0.70f   // area is 70% of target → slightly too small
+        private const val DEAD_ZONE_HIGH = 1.40f   // area is 140% of target → slightly too large
     }
 
     /** Counts frames since tracking was lost, for gradual zoom-out delay. */
@@ -31,6 +41,8 @@ class ZoomController(
     /** Zoom level when the object was last locked — floor for search zoom-out.
      *  Prevents zooming all the way to 1x which makes small objects undetectable. */
     private var lockedZoom = 1f
+    /** Smoothed bbox area — filters detector noise before computing ideal zoom. */
+    private var smoothedArea = -1f
 
     /**
      * Set zoom directly from a pinch gesture.
@@ -46,39 +58,51 @@ class ZoomController(
     /**
      * Calculate the desired zoom ratio based on the subject's bounding box.
      *
-     * @param boundingBox Normalized bounding box (0..1 coordinates)
-     * @param minZoom Minimum zoom ratio supported by the camera
-     * @param maxZoom Maximum zoom ratio supported by the camera
-     * @return Target zoom ratio
+     * Computes an ideal zoom from the area ratio (sqrt because zoom scales
+     * linearly while area scales quadratically), then exponentially smooths
+     * toward it. Edge/clip guards override the ideal when the subject is
+     * near or past the frame boundary.
      */
     fun calculateZoom(boundingBox: RectF, minZoom: Float, maxZoom: Float): Float {
-        // Check if manual override has expired
         if (manualOverride && System.currentTimeMillis() > manualOverrideExpiry) {
             manualOverride = false
         }
         if (manualOverride) return currentZoom
 
-        val boxArea = boundingBox.width() * boundingBox.height()
-        val targetArea = targetFrameOccupancy
+        val rawArea = boundingBox.width() * boundingBox.height()
 
-        // Check if the object is clipped or near the edge of the frame
+        // Smooth the bbox area to filter detector jitter before computing ideal zoom.
+        if (smoothedArea < 0f) smoothedArea = rawArea
+        smoothedArea += AREA_SMOOTH_ALPHA * (rawArea - smoothedArea)
+        val boxArea = smoothedArea
+
         val clipped = boundingBox.left <= CLIP_THRESHOLD || boundingBox.top <= CLIP_THRESHOLD ||
                       boundingBox.right >= 1f - CLIP_THRESHOLD || boundingBox.bottom >= 1f - CLIP_THRESHOLD
         val nearEdge = boundingBox.left < EDGE_MARGIN || boundingBox.top < EDGE_MARGIN ||
                        boundingBox.right > 1f - EDGE_MARGIN || boundingBox.bottom > 1f - EDGE_MARGIN
 
-        val zoomAdjustment = when {
-            // Object is being cropped — zoom out immediately
-            clipped -> -zoomSpeed
-            // Object near edge — don't zoom in, hold steady or zoom out if too large
-            nearEdge -> if (boxArea > targetArea * 1.5f) -zoomSpeed else 0f
-            // Normal: adjust based on area
-            boxArea < targetArea * 0.5f -> zoomSpeed
-            boxArea > targetArea * 1.5f -> -zoomSpeed
-            else -> 0f
+        // Dead zone: if the smoothed area is within ±30% of target, hold steady.
+        val areaRatio = if (boxArea > 1e-6f) targetFrameOccupancy / boxArea else 1f
+        val idealZoom = if (areaRatio in DEAD_ZONE_LOW..DEAD_ZONE_HIGH) {
+            currentZoom
+        } else if (boxArea > 1e-6f) {
+            (currentZoom * sqrt(areaRatio)).coerceIn(minZoom, maxZoom)
+        } else {
+            currentZoom
         }
 
-        currentZoom = (currentZoom + zoomAdjustment).coerceIn(minZoom, maxZoom)
+        val targetZoom = when {
+            clipped -> {
+                val emergencyTarget = (currentZoom - zoomSpeed).coerceAtLeast(minZoom)
+                minOf(idealZoom, emergencyTarget)
+            }
+            nearEdge -> minOf(idealZoom, currentZoom)
+            else -> idealZoom
+        }
+
+        val alpha = if (clipped) ZOOM_SMOOTH_ALPHA_CLIP else ZOOM_SMOOTH_ALPHA
+        currentZoom += alpha * (targetZoom - currentZoom)
+        currentZoom = currentZoom.coerceIn(minZoom, maxZoom)
         return currentZoom
     }
 
@@ -115,9 +139,6 @@ class ZoomController(
     fun zoomOutForSearchGradual(minZoom: Float, maxZoom: Float): Float {
         lossFrameCount++
         if (lossFrameCount >= ZOOM_OUT_DELAY_FRAMES) {
-            // Don't zoom out below 50% of the locked zoom — keeps the subject
-            // large enough for detection. Zooming to 1x makes small objects
-            // (mouse, cup) undetectable and creates a vicious cycle.
             val searchFloor = maxOf(minZoom, lockedZoom * 0.5f)
             val pullback = 0.08f
             currentZoom = (currentZoom - (currentZoom - searchFloor) * pullback).coerceIn(searchFloor, maxZoom)
@@ -135,6 +156,7 @@ class ZoomController(
         currentZoom = 1f
         manualOverride = false
         lossFrameCount = 0
+        smoothedArea = -1f
     }
 
     /** Current zoom level (for pinch gesture to use as baseline). */

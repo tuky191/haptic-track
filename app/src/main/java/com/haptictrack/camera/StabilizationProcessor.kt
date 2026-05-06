@@ -26,14 +26,25 @@ import java.util.concurrent.Executor
  *
  * Applies the gyro stabilization homography (mat3) to video frames in a GL shader
  * before they reach the encoder. Runs on its own GL thread.
+ *
+ * When [videoMatrixProvider] is set, enables lookahead mode: frames are buffered
+ * in FBOs for [LOOKAHEAD_FRAMES] frames (~133ms at 30fps), then rendered with a
+ * bidirectional-smoothed matrix that uses future gyro data for zero-phase smoothing.
+ * Preview stays causal (handled by SurfaceTextureFrameReader).
  */
 class StabilizationProcessor(
     private val stabMatrixProvider: () -> FloatArray,
+    private val videoMatrixProvider: ((Long) -> FloatArray)? = null,
     private val frameTimestampLogger: ((Long, Long) -> Unit)? = null
 ) : SurfaceProcessor, SurfaceTexture.OnFrameAvailableListener {
 
     companion object {
         private const val TAG = "StabProcessor"
+        // Buffer depth for Gaussian kernel smoothing: more frames = better smoothing
+        // but more GPU memory (each FBO = W×H×4 bytes). At 1080p: 12 frames ≈ 95MB.
+        // 12 frames ≈ 400ms at 30fps ≈ 1σ of future data for σ=400ms kernel.
+        // Bench: 1.52x improvement vs 1.44x causal SLERP (+6% on shake-heavy video).
+        private const val LOOKAHEAD_FRAMES = 12
     }
 
     private val glThread = HandlerThread("StabProcessor-GL").apply { start() }
@@ -59,8 +70,18 @@ class StabilizationProcessor(
     private var outputWidth: Int = 0
     private var outputHeight: Int = 0
 
-    // GL program
-    private var program: Int = 0
+    // GL programs
+    private var causalProgram: Int = 0
+    private var copyProgram: Int = 0
+    private var renderProgram: Int = 0
+
+    // FBO ring buffer for lookahead
+    private val fboTextureIds = IntArray(LOOKAHEAD_FRAMES)
+    private val fboIds = IntArray(LOOKAHEAD_FRAMES)
+    private var fboInitialized = false
+    private var fboWriteIdx = 0
+    private data class BufferedFrame(val fboIndex: Int, val timestampNs: Long)
+    private val frameRing = ArrayDeque<BufferedFrame>()
 
     // Matrices
     private val texMatrix = FloatArray(16)
@@ -85,7 +106,11 @@ class StabilizationProcessor(
             }
             inputSurface = Surface(inputSurfaceTexture)
 
-            if (program == 0) program = createShaderProgram()
+            if (causalProgram == 0) causalProgram = createCausalProgram()
+            if (videoMatrixProvider != null) {
+                if (copyProgram == 0) copyProgram = createCopyProgram()
+                if (renderProgram == 0) renderProgram = createRenderProgram()
+            }
 
             request.provideSurface(inputSurface!!, executor) {
                 Log.d(TAG, "Input surface released by CameraX")
@@ -132,31 +157,96 @@ class StabilizationProcessor(
         if (outputSurfaceOutput == null) return
 
         surfaceTexture.updateTexImage()
-        frameTimestampLogger?.invoke(frameCount, surfaceTexture.timestamp)
+        val frameTs = surfaceTexture.timestamp
+        frameTimestampLogger?.invoke(frameCount, frameTs)
         surfaceTexture.getTransformMatrix(texMatrix)
 
-        EGL14.eglMakeCurrent(eglDisplay, eglSurf, eglSurf, eglContext)
-        GLES20.glViewport(0, 0, outputWidth, outputHeight)
-        GLES20.glUseProgram(program)
-
-        val texMatLoc = GLES20.glGetUniformLocation(program, "uTexMatrix")
-        GLES20.glUniformMatrix4fv(texMatLoc, 1, false, texMatrix, 0)
-
-        val stabMatLoc = GLES20.glGetUniformLocation(program, "uStabMatrix")
-        GLES20.glUniformMatrix3fv(stabMatLoc, 1, false, stabMatrixProvider(), 0)
-
-        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, inputTextureId)
-        GLES20.glUniform1i(GLES20.glGetUniformLocation(program, "sTexture"), 0)
-
-        drawQuad()
-
-        EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurf, surfaceTexture.timestamp)
-        EGL14.eglSwapBuffers(eglDisplay, eglSurf)
+        if (videoMatrixProvider != null) {
+            renderLookahead(eglSurf, frameTs)
+        } else {
+            renderCausal(eglSurf, frameTs)
+        }
 
         frameCount++
         if (frameCount % 300 == 0L) {
-            Log.d(TAG, "Processed $frameCount video frames (${outputWidth}x${outputHeight})")
+            Log.d(TAG, "Processed $frameCount video frames (${outputWidth}x${outputHeight})" +
+                if (videoMatrixProvider != null) " [lookahead=$LOOKAHEAD_FRAMES]" else "")
+        }
+    }
+
+    private fun renderCausal(eglSurf: EGLSurface, frameTs: Long) {
+        EGL14.eglMakeCurrent(eglDisplay, eglSurf, eglSurf, eglContext)
+        GLES20.glViewport(0, 0, outputWidth, outputHeight)
+        GLES20.glUseProgram(causalProgram)
+
+        GLES20.glUniformMatrix4fv(
+            GLES20.glGetUniformLocation(causalProgram, "uTexMatrix"), 1, false, texMatrix, 0
+        )
+        GLES20.glUniformMatrix3fv(
+            GLES20.glGetUniformLocation(causalProgram, "uStabMatrix"), 1, false, stabMatrixProvider(), 0
+        )
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, inputTextureId)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(causalProgram, "sTexture"), 0)
+        drawQuad(causalProgram)
+
+        EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurf, frameTs)
+        EGL14.eglSwapBuffers(eglDisplay, eglSurf)
+    }
+
+    private fun renderLookahead(eglSurf: EGLSurface, frameTs: Long) {
+        if (!fboInitialized) initFBOs()
+        if (!fboInitialized) { renderCausal(eglSurf, frameTs); return }
+
+        // Step 1: Copy OES texture → FBO (applying texMatrix, no stabilization)
+        EGL14.eglMakeCurrent(eglDisplay, eglSurf, eglSurf, eglContext)
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fboIds[fboWriteIdx])
+        GLES20.glViewport(0, 0, outputWidth, outputHeight)
+        GLES20.glUseProgram(copyProgram)
+
+        GLES20.glUniformMatrix4fv(
+            GLES20.glGetUniformLocation(copyProgram, "uTexMatrix"), 1, false, texMatrix, 0
+        )
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, inputTextureId)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(copyProgram, "sTexture"), 0)
+        drawQuad(copyProgram)
+
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+
+        frameRing.addLast(BufferedFrame(fboWriteIdx, frameTs))
+        fboWriteIdx = (fboWriteIdx + 1) % LOOKAHEAD_FRAMES
+
+        // Step 2: If enough frames buffered, render the oldest with lookahead matrix
+        if (frameRing.size > LOOKAHEAD_FRAMES) {
+            val oldest = frameRing.removeFirst()
+            renderFromFBO(eglSurf, oldest)
+        }
+    }
+
+    private fun renderFromFBO(eglSurf: EGLSurface, frame: BufferedFrame) {
+        val stabMatrix = videoMatrixProvider!!(frame.timestampNs)
+
+        EGL14.eglMakeCurrent(eglDisplay, eglSurf, eglSurf, eglContext)
+        GLES20.glViewport(0, 0, outputWidth, outputHeight)
+        GLES20.glUseProgram(renderProgram)
+
+        GLES20.glUniformMatrix3fv(
+            GLES20.glGetUniformLocation(renderProgram, "uStabMatrix"), 1, false, stabMatrix, 0
+        )
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fboTextureIds[frame.fboIndex])
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(renderProgram, "sTexture"), 0)
+        drawQuad(renderProgram)
+
+        EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurf, frame.timestampNs)
+        EGL14.eglSwapBuffers(eglDisplay, eglSurf)
+    }
+
+    private fun flushBufferedFrames(eglSurf: EGLSurface) {
+        while (frameRing.isNotEmpty()) {
+            val frame = frameRing.removeFirst()
+            renderFromFBO(eglSurf, frame)
         }
     }
 
@@ -165,10 +255,10 @@ class StabilizationProcessor(
         glHandler.post {
             cleanupInput()
             cleanupOutput()
-            if (program != 0) {
-                GLES20.glDeleteProgram(program)
-                program = 0
-            }
+            if (causalProgram != 0) { GLES20.glDeleteProgram(causalProgram); causalProgram = 0 }
+            if (copyProgram != 0) { GLES20.glDeleteProgram(copyProgram); copyProgram = 0 }
+            if (renderProgram != 0) { GLES20.glDeleteProgram(renderProgram); renderProgram = 0 }
+            cleanupFBOs()
             releaseEGL()
             glThread.quitSafely()
         }
@@ -229,6 +319,9 @@ class StabilizationProcessor(
     }
 
     private fun cleanupOutput() {
+        if (fboInitialized && outputEglSurface != EGL14.EGL_NO_SURFACE && videoMatrixProvider != null) {
+            flushBufferedFrames(outputEglSurface)
+        }
         if (outputEglSurface != EGL14.EGL_NO_SURFACE) {
             EGL14.eglDestroySurface(eglDisplay, outputEglSurface)
             outputEglSurface = EGL14.EGL_NO_SURFACE
@@ -236,6 +329,59 @@ class StabilizationProcessor(
         outputSurface = null
         outputSurfaceOutput?.close()
         outputSurfaceOutput = null
+    }
+
+    // --- FBO management ---
+
+    private fun initFBOs() {
+        if (fboInitialized || outputWidth == 0) return
+
+        GLES20.glGenFramebuffers(LOOKAHEAD_FRAMES, fboIds, 0)
+        GLES20.glGenTextures(LOOKAHEAD_FRAMES, fboTextureIds, 0)
+
+        for (i in 0 until LOOKAHEAD_FRAMES) {
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fboTextureIds[i])
+            GLES20.glTexImage2D(
+                GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA,
+                outputWidth, outputHeight, 0,
+                GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null
+            )
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fboIds[i])
+            GLES20.glFramebufferTexture2D(
+                GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0,
+                GLES20.GL_TEXTURE_2D, fboTextureIds[i], 0
+            )
+
+            val status = GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER)
+            if (status != GLES20.GL_FRAMEBUFFER_COMPLETE) {
+                Log.e(TAG, "FBO $i incomplete: $status")
+                cleanupFBOs()
+                return
+            }
+        }
+
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+
+        fboInitialized = true
+        val mbPerFbo = outputWidth.toLong() * outputHeight * 4 / (1024 * 1024)
+        Log.i(TAG, "FBO ring: ${LOOKAHEAD_FRAMES}x ${outputWidth}x${outputHeight} (${mbPerFbo}MB each, ${mbPerFbo * LOOKAHEAD_FRAMES}MB total)")
+    }
+
+    private fun cleanupFBOs() {
+        if (!fboInitialized) return
+        GLES20.glDeleteFramebuffers(LOOKAHEAD_FRAMES, fboIds, 0)
+        GLES20.glDeleteTextures(LOOKAHEAD_FRAMES, fboTextureIds, 0)
+        fboIds.fill(0)
+        fboTextureIds.fill(0)
+        fboInitialized = false
+        fboWriteIdx = 0
+        frameRing.clear()
     }
 
     // --- GL ---
@@ -251,7 +397,8 @@ class StabilizationProcessor(
         return textures[0]
     }
 
-    private val vertexShaderSource = """
+    // Causal shader: OES texture + stabMatrix + texMatrix (original one-pass pipeline)
+    private val causalVertexSource = """
         attribute vec4 aPosition;
         attribute vec2 aTexCoord;
         uniform mat4 uTexMatrix;
@@ -259,13 +406,12 @@ class StabilizationProcessor(
         varying vec2 vTexCoord;
         void main() {
             gl_Position = aPosition;
-            // .xy discards w — valid because the homography keeps w≈1 for small rotations
             vec2 stabUV = (uStabMatrix * vec3(aTexCoord, 1.0)).xy;
             vTexCoord = (uTexMatrix * vec4(stabUV, 0.0, 1.0)).xy;
         }
     """.trimIndent()
 
-    private val fragmentShaderSource = """
+    private val oesFragmentSource = """
         #extension GL_OES_EGL_image_external : require
         precision mediump float;
         varying vec2 vTexCoord;
@@ -275,9 +421,46 @@ class StabilizationProcessor(
         }
     """.trimIndent()
 
-    private fun createShaderProgram(): Int {
-        val vs = loadShader(GLES20.GL_VERTEX_SHADER, vertexShaderSource)
-        val fs = loadShader(GLES20.GL_FRAGMENT_SHADER, fragmentShaderSource)
+    // Copy shader: OES texture + texMatrix only (no stabilization) → FBO
+    private val copyVertexSource = """
+        attribute vec4 aPosition;
+        attribute vec2 aTexCoord;
+        uniform mat4 uTexMatrix;
+        varying vec2 vTexCoord;
+        void main() {
+            gl_Position = aPosition;
+            vTexCoord = (uTexMatrix * vec4(aTexCoord, 0.0, 1.0)).xy;
+        }
+    """.trimIndent()
+
+    // Render shader: 2D texture + stabMatrix (FBO → output)
+    private val renderVertexSource = """
+        attribute vec4 aPosition;
+        attribute vec2 aTexCoord;
+        uniform mat3 uStabMatrix;
+        varying vec2 vTexCoord;
+        void main() {
+            gl_Position = aPosition;
+            vTexCoord = (uStabMatrix * vec3(aTexCoord, 1.0)).xy;
+        }
+    """.trimIndent()
+
+    private val tex2dFragmentSource = """
+        precision mediump float;
+        varying vec2 vTexCoord;
+        uniform sampler2D sTexture;
+        void main() {
+            gl_FragColor = texture2D(sTexture, vTexCoord);
+        }
+    """.trimIndent()
+
+    private fun createCausalProgram() = buildProgram(causalVertexSource, oesFragmentSource)
+    private fun createCopyProgram() = buildProgram(copyVertexSource, oesFragmentSource)
+    private fun createRenderProgram() = buildProgram(renderVertexSource, tex2dFragmentSource)
+
+    private fun buildProgram(vertexSource: String, fragmentSource: String): Int {
+        val vs = loadShader(GLES20.GL_VERTEX_SHADER, vertexSource)
+        val fs = loadShader(GLES20.GL_FRAGMENT_SHADER, fragmentSource)
         val prog = GLES20.glCreateProgram()
         GLES20.glAttachShader(prog, vs)
         GLES20.glAttachShader(prog, fs)
@@ -312,9 +495,9 @@ class StabilizationProcessor(
         .asFloatBuffer()
         .apply { put(quadVertices); position(0) }
 
-    private fun drawQuad() {
-        val posLoc = GLES20.glGetAttribLocation(program, "aPosition")
-        val texLoc = GLES20.glGetAttribLocation(program, "aTexCoord")
+    private fun drawQuad(prog: Int) {
+        val posLoc = GLES20.glGetAttribLocation(prog, "aPosition")
+        val texLoc = GLES20.glGetAttribLocation(prog, "aTexCoord")
 
         quadBuffer.position(0)
         GLES20.glVertexAttribPointer(posLoc, 2, GLES20.GL_FLOAT, false, 16, quadBuffer)

@@ -33,10 +33,11 @@ class GyroStabilizer(context: Context) : SensorEventListener {
 
     companion object {
         private const val TAG = "GyroStab"
-        private const val DEFAULT_TIME_CONSTANT = 0.50
+        private const val DEFAULT_TIME_CONSTANT = 0.70
         private const val DEFAULT_HFOV_DEGREES = 75.0
         private const val TEL_INTERVAL = 200
         private const val SENSOR_GAP_THRESHOLD_NS = 100_000_000L
+        private const val GAUSSIAN_SIGMA_MS = 400.0  // σ for video Gaussian kernel (bench: optimal at 400ms)
 
         // Adaptive smoothing: pan detection → dynamic TC
         private const val PAN_VELOCITY_THRESHOLD_DEG = 15.0
@@ -44,6 +45,11 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         private const val PAN_TC_FACTOR = 0.30
         private const val VELOCITY_SMOOTHING_TC = 0.05
         private const val TC_RAMP_SPEED = 5.0
+        private const val OIS_FAST_TC = 0.03      // fast-tracker TC when OIS is off (full correction)
+        private const val OIS_FAST_TC_CALM = 0.06 // fast TC during calm holding — OIS handles more, filter more out
+        private const val OIS_FAST_TC_SWAY = 0.02 // fast TC during sway — OIS handles less, let more through
+        private const val OIS_ADAPT_VEL_LOW = 3.0  // °/s below which OIS handles nearly everything
+        private const val OIS_ADAPT_VEL_HIGH = 15.0 // °/s above which OIS struggles with sway
     }
 
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
@@ -62,15 +68,45 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     /** Sensor orientation in degrees — needed to convert sensor-UV homography to portrait UV. */
     private var sensorOrientation: Int = 90
 
-    /** Crop zoom applied to absorb warp margins (1.0 = no crop, 1.05 = 5% crop). */
-    var cropZoom: Float = 1.15f
+    /** Crop zoom applied to absorb warp margins (1.0 = no crop, 1.10 = 10% crop). */
+    var cropZoom: Float = 1.30f
 
     /** Adaptive pan detection: reduces TC during pans, increases during shake. */
     var adaptiveSmoothing: Boolean = true
 
+    /** Leash: limits smoothed-to-raw deviation to prevent corrections exceeding crop margin. */
+    var leashEnabled: Boolean = true
+
     /** OIS compensation: scales correction magnitude when optical stabilization is active.
      *  OIS handles ~20% of shake; without compensation the gyro overcorrects. */
     var oisCompensation: Double = 1.0
+
+    /** Current camera zoom ratio — used to scale TC (more smoothing at zoom). */
+    @Volatile var zoomRatio: Float = 1f
+
+    /** Zoom interpolation: target set at 10-12fps by tracker, interpolated at 200Hz. */
+    @Volatile private var zoomTarget: Float = 1f   // desired zoom from auto-zoom controller
+    @Volatile private var zoomApplied: Float = 1f  // interpolated zoom dispatched to CameraX
+    private var lastZoomDispatchNs: Long = 0L
+    private val ZOOM_INTERP_RATE = 25.0   // interpolation speed (~40ms TC)
+    private val ZOOM_DISPATCH_NS = 16_000_000L  // CameraX dispatch throttle (~60Hz)
+
+    /** Callback to apply interpolated zoom to CameraX. Called at ~60Hz from sensor thread. */
+    var onZoomApply: ((Float) -> Unit)? = null
+
+    fun setZoomTarget(target: Float) {
+        zoomTarget = target
+    }
+
+    /** Snap zoom immediately (for pinch gesture). Sets all three zoom fields to avoid race. */
+    fun setZoomImmediate(ratio: Float) {
+        zoomTarget = ratio
+        zoomApplied = ratio
+        zoomRatio = ratio
+    }
+
+    /** Gaussian kernel smoothing for video frames (400ms output latency, ~95MB FBO buffer). */
+    var rtsLookahead: Boolean = true
 
     /** Current stabilization matrix in column-major order for GL (mat3). Identity when disabled. */
     private val currentMatrix = AtomicReference(IDENTITY_MATRIX.clone())
@@ -87,6 +123,9 @@ class GyroStabilizer(context: Context) : SensorEventListener {
                 if (!value) {
                     currentMatrix.set(IDENTITY_MATRIX.clone())
                     initialized = false
+                    resetTranslationState()
+                    clearTrackingState()
+                    zoomApplied = zoomTarget
                 }
             }
         }
@@ -94,6 +133,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     private val IDENTITY_QUAT = Quat(1.0, 0.0, 0.0, 0.0)
     @Volatile private var rawQuat = Quat(1.0, 0.0, 0.0, 0.0)
     @Volatile private var smoothedQuat = Quat(1.0, 0.0, 0.0, 0.0)
+    @Volatile private var smoothFastQuat = Quat(1.0, 0.0, 0.0, 0.0)
     @Volatile private var initialized = false
     private var lastTimestampNs = 0L
     private var sampleRate = 200.0
@@ -106,6 +146,17 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     @Volatile private var lastLeashActive = false
     @Volatile private var lastCorrAngleDeg = 0.0
 
+    // Ring buffer for raw quaternion history (Gaussian kernel smoothing for video)
+    private val QUAT_HISTORY_SIZE = 1024  // ~5s at 200Hz (covers ±3σ for σ=400ms with margin)
+    private val historyW = DoubleArray(QUAT_HISTORY_SIZE)
+    private val historyX = DoubleArray(QUAT_HISTORY_SIZE)
+    private val historyY = DoubleArray(QUAT_HISTORY_SIZE)
+    private val historyZ = DoubleArray(QUAT_HISTORY_SIZE)
+    private val historyTs = LongArray(QUAT_HISTORY_SIZE)
+    private var historyHead = 0
+    private var historyCount = 0
+    private val historyLock = Any()
+
     // Session log file (gyro.log in the tracking session directory)
     @Volatile
     private var sessionWriter: PrintWriter? = null
@@ -117,6 +168,182 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     private var benchFrameWriter: PrintWriter? = null
     @Volatile
     private var benchCorrWriter: PrintWriter? = null
+
+    // Translation correction: optical flow → position-domain smoothing with leash.
+    // Measures post-gyro residual displacement from stabilized analysis frames,
+    // smooths the cumulative path, applies the difference as a crop offset.
+    var translationCorrectionEnabled: Boolean = true
+        set(value) {
+            if (field != value) {
+                field = value
+                if (!value) resetTranslationState()
+            }
+        }
+    private val TRANS_TC = 0.15          // smoothing time constant (seconds) — lower = more responsive to shake
+    private val TRANS_MARGIN_FRAC = 0.5  // fraction of crop margin reserved for translation
+    private val TRANS_DEAD_ZONE_PX = 0.3 // phase correlation noise floor (pixels at raw FBO res)
+    @Volatile private var transCumX = 0.0    // cumulative translation path (UV)
+    @Volatile private var transCumY = 0.0
+    @Volatile private var transSmoothX = 0.0 // smoothed translation path (UV)
+    @Volatile private var transSmoothY = 0.0
+    @Volatile private var transTargetUvX = 0f  // target correction from GL thread
+    @Volatile private var transTargetUvY = 0f
+    @Volatile private var transAppliedUvX = 0f // smoothed correction applied at 200Hz
+    @Volatile private var transAppliedUvY = 0f
+    @Volatile private var prevGrayMat: org.opencv.core.Mat? = null
+    @Volatile private var prevGyroUvX = 0.0  // previous frame's rotation-only center offset
+    @Volatile private var prevGyroUvY = 0.0
+    @Volatile private var rotOnlyUvX = 0.0   // latest rotation-only center offset (no translation)
+    @Volatile private var rotOnlyUvY = 0.0
+
+    // Subject centering: nudge the crop toward the locked subject's bbox center.
+    // Smooths the bbox center heavily to avoid detector jitter, then drifts the
+    // crop offset so the subject moves toward frame center.
+    private val CENTER_BBOX_TC = 0.50     // bbox center smoothing (seconds) — heavy to filter detector noise
+    private val CENTER_MARGIN_FRAC = 0.5  // fraction of crop margin available for centering
+    @Volatile private var trackSmoothX = 0.5  // smoothed bbox center
+    @Volatile private var trackSmoothY = 0.5
+    @Volatile private var trackTargetUvX = 0f // target centering offset
+    @Volatile private var trackTargetUvY = 0f
+    @Volatile private var trackAppliedUvX = 0f
+    @Volatile private var trackAppliedUvY = 0f
+    @Volatile private var trackingActive = false
+
+    /**
+     * Feed a raw (pre-stabilization) frame for optical-flow translation correction.
+     * Called from the GL thread at camera rate (~30fps). The bitmap is reused by
+     * the caller — all OpenCV work must complete before returning.
+     *
+     * Displacement = rotation + translation. We subtract the gyro-predicted rotation
+     * displacement to isolate the translation component.
+     */
+    fun onRawFrame(bitmap: android.graphics.Bitmap) {
+        if (!translationCorrectionEnabled || !_enabled) return
+
+        val mat = org.opencv.core.Mat()
+        val gray = org.opencv.core.Mat()
+        val smallFloat = org.opencv.core.Mat()
+        try {
+            org.opencv.android.Utils.bitmapToMat(bitmap, mat)
+            org.opencv.imgproc.Imgproc.cvtColor(mat, gray, org.opencv.imgproc.Imgproc.COLOR_RGBA2GRAY)
+            gray.convertTo(smallFloat, org.opencv.core.CvType.CV_64F)
+        } finally {
+            mat.release()
+            gray.release()
+        }
+
+        // Read rotation-only center offset — written by onSensorChanged BEFORE
+        // translation correction is added, so no feedback loop.
+        val gyroUvX = rotOnlyUvX
+        val gyroUvY = rotOnlyUvY
+
+        val prev = prevGrayMat
+        if (prev != null && prev.size() == smallFloat.size()) {
+            val result = org.opencv.imgproc.Imgproc.phaseCorrelate(prev, smallFloat)
+
+            val rawDx = result.x
+            val rawDy = result.y
+            val dxDs = if (abs(rawDx) < TRANS_DEAD_ZONE_PX) 0.0 else rawDx
+            val dyDs = if (abs(rawDy) < TRANS_DEAD_ZONE_PX) 0.0 else rawDy
+
+            val portW = bitmap.width.toDouble()
+            val portH = bitmap.height.toDouble()
+            val rawDispUvX = dxDs / portW
+            val rawDispUvY = dyDs / portH
+
+            // Gyro-predicted rotation displacement (change since last frame)
+            val gyroDispUvX = gyroUvX - prevGyroUvX
+            val gyroDispUvY = gyroUvY - prevGyroUvY
+
+            // Residual = raw - gyro prediction = translation component
+            val transDispUvX = rawDispUvX - gyroDispUvX
+            val transDispUvY = rawDispUvY - gyroDispUvY
+
+            transCumX += transDispUvX
+            transCumY += transDispUvY
+
+            val alpha = 1.0 - exp(-1.0 / (30.0 * TRANS_TC))
+            transSmoothX += alpha * (transCumX - transSmoothX)
+            transSmoothY += alpha * (transCumY - transSmoothY)
+
+            // Leash: limit deviation to fraction of crop margin
+            val cropMarginUv = 0.5 * (1.0 - 1.0 / cropZoom)
+            val maxCorrUv = cropMarginUv * TRANS_MARGIN_FRAC
+            val devX = transCumX - transSmoothX
+            val devY = transCumY - transSmoothY
+            if (abs(devX) > maxCorrUv) {
+                transSmoothX = transCumX - sign(devX) * maxCorrUv
+            }
+            if (abs(devY) > maxCorrUv) {
+                transSmoothY = transCumY - sign(devY) * maxCorrUv
+            }
+
+            // Periodic rebase to prevent unbounded integral drift
+            if (abs(transSmoothX) > 1.0 || abs(transSmoothY) > 1.0) {
+                transCumX -= transSmoothX
+                transCumY -= transSmoothY
+                transSmoothX = 0.0
+                transSmoothY = 0.0
+            }
+
+            transTargetUvX = (transCumX - transSmoothX).toFloat()
+            transTargetUvY = (transCumY - transSmoothY).toFloat()
+
+            prev.release()
+        } else {
+            prev?.release()
+        }
+        prevGyroUvX = gyroUvX
+        prevGyroUvY = gyroUvY
+        prevGrayMat = smallFloat
+    }
+
+    /**
+     * Feed tracking bbox center for position-domain stabilization at zoom.
+     * Called from the tracking callback at ~10-12fps when a subject is locked.
+     * @param centerX bbox center X in normalized [0,1] frame coordinates
+     * @param centerY bbox center Y in normalized [0,1] frame coordinates
+     * @param bboxArea bbox area in normalized [0,1] coordinates (width*height)
+     */
+    fun onTrackingUpdate(centerX: Float, centerY: Float, bboxArea: Float) {
+        if (!_enabled) {
+            if (trackingActive) clearTrackingState()
+            return
+        }
+        if (!trackingActive) {
+            trackSmoothX = centerX.toDouble()
+            trackSmoothY = centerY.toDouble()
+            trackingActive = true
+            return
+        }
+        // Smooth the bbox center heavily to filter detector noise
+        val alpha = 1.0 - exp(-1.0 / (12.0 * CENTER_BBOX_TC))
+        trackSmoothX += alpha * (centerX - trackSmoothX)
+        trackSmoothY += alpha * (centerY - trackSmoothY)
+
+        // Scale centering by how small the subject is — large bbox = noisy center, less useful
+        val areaScale = (1.0 - bboxArea).coerceIn(0.0, 1.0)
+
+        // Centering offset: how far from center, clamped by available crop margin
+        val cropMarginUv = 0.5 * (1.0 - 1.0 / cropZoom)
+        val maxCenterUv = cropMarginUv * CENTER_MARGIN_FRAC
+        val offsetX = ((0.5 - trackSmoothX) * areaScale).coerceIn(-maxCenterUv, maxCenterUv)
+        val offsetY = ((0.5 - trackSmoothY) * areaScale).coerceIn(-maxCenterUv, maxCenterUv)
+
+        trackTargetUvX = offsetX.toFloat()
+        trackTargetUvY = offsetY.toFloat()
+    }
+
+    fun clearTracking() {
+        clearTrackingState()
+    }
+
+    private fun clearTrackingState() {
+        trackingActive = false
+        trackSmoothX = 0.5; trackSmoothY = 0.5
+        trackTargetUvX = 0f; trackTargetUvY = 0f
+        trackAppliedUvX = 0f; trackAppliedUvY = 0f
+    }
 
     // Telemetry accumulators (reset every TEL_INTERVAL sensor events)
     private var telFrames = 0
@@ -146,6 +373,8 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         initialized = false
         currentMatrix.set(IDENTITY_MATRIX.clone())
         resetTelemetry()
+        resetTranslationState()
+        zoomApplied = zoomTarget
     }
 
     fun startSessionLog(dir: File) {
@@ -265,6 +494,14 @@ class GyroStabilizer(context: Context) : SensorEventListener {
                     }
                 }
                 Log.i(TAG, "Sensor orientation: ${orientation}° → d2s quat=(${deviceToSensorQuat.w}, ${deviceToSensorQuat.x}, ${deviceToSensorQuat.y}, ${deviceToSensorQuat.z})")
+
+                // Check OIS data availability — Camera2 can expose lens displacement samples
+                val oisModes = chars.get(CameraCharacteristics.STATISTICS_INFO_AVAILABLE_OIS_DATA_MODES)
+                if (oisModes != null && oisModes.contains(android.hardware.camera2.CameraMetadata.STATISTICS_OIS_DATA_MODE_ON)) {
+                    Log.i(TAG, "OIS_DATA available — lens displacement samples can be read from CaptureResult")
+                } else {
+                    Log.i(TAG, "OIS_DATA not available on this device (modes=${oisModes?.toList()})")
+                }
                 break
             }
         } catch (e: Exception) {
@@ -285,6 +522,16 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         val nowNs = event.timestamp
         try { benchGyroWriter?.println("$nowNs,${rawQuat.w},${rawQuat.x},${rawQuat.y},${rawQuat.z}") } catch (_: Exception) {}
 
+        synchronized(historyLock) {
+            historyW[historyHead] = rawQuat.w
+            historyX[historyHead] = rawQuat.x
+            historyY[historyHead] = rawQuat.y
+            historyZ[historyHead] = rawQuat.z
+            historyTs[historyHead] = nowNs
+            historyHead = (historyHead + 1) % QUAT_HISTORY_SIZE
+            if (historyCount < QUAT_HISTORY_SIZE) historyCount++
+        }
+
         if (!enabled) {
             currentMatrix.set(IDENTITY_MATRIX.clone())
             return
@@ -292,6 +539,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
 
         if (!initialized) {
             smoothedQuat = rawQuat
+            smoothFastQuat = rawQuat
             initialized = true
             lastTimestampNs = nowNs
             prevRawQuat = rawQuat
@@ -307,8 +555,10 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             Log.w(TAG, warn)
             try { sessionWriter?.println("${System.currentTimeMillis()} WARN $warn") } catch (_: Exception) {}
             smoothedQuat = rawQuat
+            smoothFastQuat = rawQuat
             prevRawQuat = rawQuat
             resetAdaptiveState()
+            zoomApplied = zoomTarget
             return
         }
 
@@ -330,12 +580,14 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         }
 
         val isPanning = highVelocityDurationSec >= PAN_ONSET_SEC
+        val zoomTcScale = sqrt(zoomRatio.toDouble().coerceAtLeast(1.0))
         if (adaptiveSmoothing) {
-            val targetTc = if (isPanning) timeConstant * PAN_TC_FACTOR else timeConstant
+            val baseTc = timeConstant * zoomTcScale
+            val targetTc = if (isPanning) baseTc * PAN_TC_FACTOR else baseTc
             val tcAlpha = 1.0 - exp(-dtSec * TC_RAMP_SPEED)
             effectiveTc += tcAlpha * (targetTc - effectiveTc)
         } else {
-            effectiveTc = timeConstant
+            effectiveTc = timeConstant * zoomTcScale
         }
         prevRawQuat = rawQuat
 
@@ -343,31 +595,36 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         val alpha = 1.0 - exp(-(1.0 / sampleRate) / effectiveTc)
         smoothedQuat = slerp(smoothedQuat, rawQuat, alpha)
 
-        // Leash: limit how far smoothed can deviate from raw. Without this, the
-        // smoothed path drifts far during handheld walking (34% of samples exceed
-        // the crop margin). The hard clamp that used to follow would truncate 87%
-        // of the correction during peaks, creating visible wobble artifacts.
-        // The leash pulls smoothed toward raw so corrections always fit the margin.
+        // Fast-tracking filter: follows the device closely, filtering out
+        // high-frequency vibration that OIS handles optically. The correction
+        // smoothHeavy⁻¹ × smoothFast contains only sway OIS misses.
+        // Adaptive: during calm holding OIS handles more → raise TC to filter more.
+        // During walking sway OIS struggles → lower TC to let more correction through.
+        val vel = smoothedAngularVelocityDeg
+        val adaptFastTc = if (oisCompensation < 1.0) {
+            val t = ((vel - OIS_ADAPT_VEL_LOW) / (OIS_ADAPT_VEL_HIGH - OIS_ADAPT_VEL_LOW)).coerceIn(0.0, 1.0)
+            OIS_FAST_TC_CALM + t * (OIS_FAST_TC_SWAY - OIS_FAST_TC_CALM)
+        } else OIS_FAST_TC
+        val fastAlpha = 1.0 - exp(-(1.0 / sampleRate) / adaptFastTc)
+        smoothFastQuat = slerp(smoothFastQuat, rawQuat, fastAlpha)
+
+        // Leash: limit how far smoothed can deviate from raw.
         val cropMargin = 0.5 * (1.0 - 1.0 / cropZoom)
-        val maxCorrAngle = cropMargin / maxOf(fxUv, fyUv) / oisCompensation
+        val maxCorrAngle = cropMargin / maxOf(fxUv, fyUv)
         val devQuat = smoothedQuat.conjugate() * rawQuat
         val devAngle = 2.0 * acos(devQuat.w.coerceIn(-1.0, 1.0))
-        lastLeashActive = devAngle > maxCorrAngle && devAngle > 1e-6
+        lastLeashActive = leashEnabled && devAngle > maxCorrAngle && devAngle > 1e-6
         if (lastLeashActive) {
             val catchUp = 1.0 - maxCorrAngle / devAngle
             smoothedQuat = slerp(smoothedQuat, rawQuat, catchUp)
         }
 
-        // Correction: for each output pixel (in the smoothed frame), find where to
-        // sample in the raw (shaky) input texture. That's smooth⁻¹ × raw.
-        var correctionDevice = smoothedQuat.conjugate() * rawQuat
-
-        // Scale correction when OIS is active — OIS handles part of the shake,
-        // so full correction overcorrects. slerp(identity, corr, factor) scales the
-        // rotation angle by factor.
-        if (oisCompensation < 1.0) {
-            correctionDevice = slerp(IDENTITY_QUAT, correctionDevice, oisCompensation)
-        }
+        // Correction: smoothHeavy⁻¹ × reference.
+        // When OIS is active (oisCompensation < 1.0), use smoothFast as the reference
+        // so we only correct the low-frequency sway that OIS can't handle mechanically.
+        // When OIS is off, use raw for full correction.
+        val corrReference = if (oisCompensation < 1.0) smoothFastQuat else rawQuat
+        val correctionDevice = smoothedQuat.conjugate() * corrReference
 
         // Rotate correction from device coordinate space into camera sensor space.
         val correction = deviceToSensorQuat * correctionDevice * deviceToSensorQuat.conjugate()
@@ -377,8 +634,32 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         val h = computeHomographyUV(r, fxUv, fyUv, cropZoom.toDouble())
 
         val hPortrait = sensorToPortraitGL(h, sensorOrientation)
+        // Capture rotation-only center offset BEFORE adding translation correction.
+        // onRawFrame reads these to subtract gyro-predicted rotation from optical flow,
+        // isolating the translation component. Reading from currentMatrix would include
+        // the previous frame's translation correction → feedback loop.
+        rotOnlyUvX = hPortrait[6].toDouble()
+        rotOnlyUvY = hPortrait[7].toDouble()
+        if (translationCorrectionEnabled) {
+            val transAlpha = (1.0 - exp(-dtSec * 60.0)).toFloat() // ~17ms ramp
+            transAppliedUvX += transAlpha * (transTargetUvX - transAppliedUvX)
+            transAppliedUvY += transAlpha * (transTargetUvY - transAppliedUvY)
+            hPortrait[6] += transAppliedUvX
+            hPortrait[7] -= transAppliedUvY
+        }
+        // Subject centering not applied — bbox center at 10-12fps is too noisy.
+        // onTrackingUpdate() still computes offsets for future use (VT-based center).
         val rawExcursion = maxCornerExcursion(hPortrait)
         currentMatrix.set(hPortrait)
+
+        // Zoom interpolation: ramp toward target at 200Hz, dispatch to CameraX at ~60Hz
+        val zoomAlpha = (1.0 - exp(-dtSec * ZOOM_INTERP_RATE)).toFloat()
+        zoomApplied += zoomAlpha * (zoomTarget - zoomApplied)
+        zoomRatio = zoomApplied
+        if (nowNs - lastZoomDispatchNs >= ZOOM_DISPATCH_NS) {
+            lastZoomDispatchNs = nowNs
+            onZoomApply?.invoke(zoomApplied)
+        }
 
         // --- Telemetry ---
         val corrAngleDeg = 2.0 * acos(correction.w.coerceIn(-1.0, 1.0)) * (180.0 / PI)
@@ -405,7 +686,8 @@ class GyroStabilizer(context: Context) : SensorEventListener {
                 "tc=${"%.3f".format(timeConstant)}→${"%.3f".format(telSumEffTc / telFrames)} " +
                 "vel=${"%.1f".format(telSumVel / telFrames)}/${"%.1f".format(telPeakVel)}°/s " +
                 "pan=${"%.0f".format(100.0 * telPanFrames / telFrames)}% " +
-                "crop=${"%.2f".format(cropZoom)}"
+                "crop=${"%.2f".format(cropZoom)} zoom=${"%.1f".format(zoomRatio)}" +
+                if (trackingActive) " center=${"%.3f".format(trackAppliedUvX)}/${"%.3f".format(trackAppliedUvY)}" else ""
             Log.d(TAG, line)
             try { sessionWriter?.println("${System.currentTimeMillis()} $line") } catch (_: Exception) {}
             resetTelemetry()
@@ -452,6 +734,141 @@ class GyroStabilizer(context: Context) : SensorEventListener {
 
     // Smoothing uses the package-level slerp() below.
 
+
+    /**
+     * Compute a Gaussian-kernel-smoothed stabilization matrix for a video frame.
+     *
+     * Uses a symmetric Gaussian kernel (σ = GAUSSIAN_SIGMA_MS) centered on the
+     * frame timestamp. The weighted quaternion average is computed iteratively
+     * in the tangent space (log-map / exp-map). This produces better smoothing
+     * than the RTS forward-backward SLERP because:
+     * - No initialization transient (shift-invariant kernel)
+     * - Proper frequency response (Gaussian → Gaussian in frequency domain)
+     * - Intrinsically handles pans (symmetric weighting = zero phase lag)
+     *
+     * Bench result: 1.69x improvement vs 1.44x causal SLERP (σ=400ms, crop=1.20).
+     *
+     * Called by StabilizationProcessor for delayed video frames — by the time
+     * the frame is rendered, we have LOOKAHEAD_FRAMES worth of future gyro data.
+     */
+    fun getVideoMatrix(frameTimestampNs: Long): FloatArray {
+        if (!_enabled) return IDENTITY_MATRIX.clone()
+
+        val window = snapshotWindow(frameTimestampNs) ?: return getMatrix()
+        if (window.count < 10) return getMatrix()
+
+        val targetIdx = findClosestIndex(window.timestamps, window.count, frameTimestampNs)
+        val sigmaNs = GAUSSIAN_SIGMA_MS * 1_000_000.0
+
+        // Compute Gaussian weights
+        var weightSum = 0.0
+        val weights = DoubleArray(window.count)
+        for (i in 0 until window.count) {
+            val dt = (window.timestamps[i] - frameTimestampNs).toDouble()
+            val w = exp(-0.5 * (dt / sigmaNs) * (dt / sigmaNs))
+            weights[i] = w
+            weightSum += w
+        }
+        for (i in 0 until window.count) weights[i] /= weightSum
+
+        // Weighted quaternion average via iterative tangent-space refinement
+        var meanQ = Quat(window.w[targetIdx], window.x[targetIdx], window.y[targetIdx], window.z[targetIdx])
+
+        for (iter in 0..2) {
+            var tx = 0.0; var ty = 0.0; var tz = 0.0
+            val meanConj = meanQ.conjugate()
+            for (i in 0 until window.count) {
+                val q = Quat(window.w[i], window.x[i], window.y[i], window.z[i])
+                var delta = meanConj * q
+                if (delta.w < 0.0) delta = Quat(-delta.w, -delta.x, -delta.y, -delta.z)
+                val angle = 2.0 * acos(delta.w.coerceIn(-1.0, 1.0))
+                if (angle < 1e-8) continue
+                val sinHalf = sin(angle / 2.0)
+                val scale = weights[i] * angle / sinHalf
+                tx += scale * delta.x
+                ty += scale * delta.y
+                tz += scale * delta.z
+            }
+            val tangentAngle = sqrt(tx * tx + ty * ty + tz * tz)
+            if (tangentAngle > 1e-8) {
+                val ax = tx / tangentAngle
+                val ay = ty / tangentAngle
+                val az = tz / tangentAngle
+                val half = tangentAngle / 2.0
+                val sinH = sin(half)
+                val stepQ = Quat(cos(half), sinH * ax, sinH * ay, sinH * az)
+                meanQ = (meanQ * stepQ).normalized()
+            }
+        }
+
+        var smoothed = meanQ
+        val rawAtTarget = Quat(window.w[targetIdx], window.x[targetIdx], window.y[targetIdx], window.z[targetIdx])
+
+        // Leash (same as causal path) — prevent corrections exceeding crop margin
+        val cropMargin = 0.5 * (1.0 - 1.0 / cropZoom)
+        val maxCorrAngle = cropMargin / maxOf(fxUv, fyUv)
+        val devQuat = smoothed.conjugate() * rawAtTarget
+        val devAngle = 2.0 * acos(devQuat.w.coerceIn(-1.0, 1.0))
+        if (leashEnabled && devAngle > maxCorrAngle && devAngle > 1e-6) {
+            val catchUp = 1.0 - maxCorrAngle / devAngle
+            smoothed = slerp(smoothed, rawAtTarget, catchUp)
+        }
+
+        // Correction pipeline (same as causal path) — band-split when OIS active
+        val corrRef = if (oisCompensation < 1.0) smoothFastQuat else rawAtTarget
+        val correctionDevice = smoothed.conjugate() * corrRef
+        val correction = deviceToSensorQuat * correctionDevice * deviceToSensorQuat.conjugate()
+        val r = correction.toRotationMatrix()
+        val h = computeHomographyUV(r, fxUv, fyUv, cropZoom.toDouble())
+        return sensorToPortraitGL(h, sensorOrientation)
+    }
+
+    private data class QuatWindow(
+        val w: DoubleArray, val x: DoubleArray, val y: DoubleArray, val z: DoubleArray,
+        val timestamps: LongArray, val count: Int
+    )
+
+    private fun snapshotWindow(targetNs: Long): QuatWindow? {
+        synchronized(historyLock) {
+            if (historyCount < 10) return null
+
+            // Window covers ±3σ of the Gaussian kernel
+            val windowNs = (3.0 * GAUSSIAN_SIGMA_MS * 1_000_000).toLong()
+            val startNs = targetNs - windowNs
+            val endNs = targetNs + windowNs
+
+            val indices = mutableListOf<Int>()
+            for (i in 0 until historyCount) {
+                val idx = (historyHead - historyCount + i + QUAT_HISTORY_SIZE) % QUAT_HISTORY_SIZE
+                if (historyTs[idx] in startNs..endNs) indices.add(idx)
+            }
+
+            if (indices.size < 10) return null
+
+            val n = indices.size
+            return QuatWindow(
+                w = DoubleArray(n) { historyW[indices[it]] },
+                x = DoubleArray(n) { historyX[indices[it]] },
+                y = DoubleArray(n) { historyY[indices[it]] },
+                z = DoubleArray(n) { historyZ[indices[it]] },
+                timestamps = LongArray(n) { historyTs[indices[it]] },
+                count = n
+            )
+        }
+    }
+
+    private fun findClosestIndex(timestamps: LongArray, count: Int, targetNs: Long): Int {
+        var bestIdx = 0
+        var bestDist = Long.MAX_VALUE
+        for (i in 0 until count) {
+            val dist = abs(timestamps[i] - targetNs)
+            if (dist < bestDist) {
+                bestDist = dist
+                bestIdx = i
+            }
+        }
+        return bestIdx
+    }
 
     /**
      * Compute stabilization as crop zoom + center translation (affine, no perspective).
@@ -523,6 +940,17 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         smoothedAngularVelocityDeg = 0.0
         highVelocityDurationSec = 0.0
         effectiveTc = timeConstant
+    }
+
+    private fun resetTranslationState() {
+        prevGrayMat?.release()
+        prevGrayMat = null
+        transCumX = 0.0; transCumY = 0.0
+        transSmoothX = 0.0; transSmoothY = 0.0
+        transTargetUvX = 0f; transTargetUvY = 0f
+        transAppliedUvX = 0f; transAppliedUvY = 0f
+        prevGyroUvX = 0.0; prevGyroUvY = 0.0
+        rotOnlyUvX = 0.0; rotOnlyUvY = 0.0
     }
 
     private fun hfovToFocalUv(hfovDegrees: Double): Double {

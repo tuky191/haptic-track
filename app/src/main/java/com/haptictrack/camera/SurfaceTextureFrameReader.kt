@@ -45,7 +45,10 @@ class SurfaceTextureFrameReader(
     /** Called on GL thread at camera rate (~29fps) for viewfinder display. */
     private val onViewfinderFrame: ((Bitmap) -> Unit)? = null,
     /** Provides a 3×3 stabilization matrix (column-major, 9 floats) each frame. */
-    private val stabMatrixProvider: (() -> FloatArray)? = null
+    private val stabMatrixProvider: (() -> FloatArray)? = null,
+    /** Called on GL thread at camera rate with a small raw (pre-stabilization) bitmap
+     *  for translation displacement measurement. Bitmap is reused — do not retain. */
+    private val onRawFrame: ((Bitmap) -> Unit)? = null
 ) {
 
     companion object {
@@ -54,7 +57,12 @@ class SurfaceTextureFrameReader(
         private const val TIMING_LOG_INTERVAL = 60
         /** Bitmaps in each ring. 3 is enough to absorb one-frame hiccups on either side. */
         private const val POOL_SIZE = 3
+        /** Raw displacement FBO short edge — 160x120 is enough for phase correlation. */
+        private const val RAW_SHORT = 160
     }
+
+    /** When false, skips the raw displacement FBO render even if [onRawFrame] is set. */
+    @Volatile var rawFrameEnabled = true
 
     private var glThread: Thread? = null
     private var processingThread: Thread? = null
@@ -136,6 +144,29 @@ class SurfaceTextureFrameReader(
                 var pboRead = 1   // PBO whose previous-frame data we map for the CPU
                 var haveLastFrame = false  // first iteration has nothing in pboRead yet
 
+                // Small raw (pre-stabilization) FBO for translation displacement measurement.
+                // Renders with identity stab matrix so optical flow sees true camera motion.
+                val rawW = RAW_SHORT
+                val rawH = (RAW_SHORT.toFloat() * outputHeight / outputWidth).toInt()
+                val rawFbo = IntArray(1)
+                val rawTex = IntArray(1)
+                val rawBuf = ByteBuffer.allocateDirect(rawW * rawH * 4).order(ByteOrder.nativeOrder())
+                var rawBitmap: Bitmap? = null
+                if (onRawFrame != null) {
+                    GLES20.glGenFramebuffers(1, rawFbo, 0)
+                    GLES20.glGenTextures(1, rawTex, 0)
+                    GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, rawTex[0])
+                    GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA,
+                        rawW, rawH, 0, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null)
+                    GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+                    GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+                    GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, rawFbo[0])
+                    GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0,
+                        GLES20.GL_TEXTURE_2D, rawTex[0], 0)
+                    rawBitmap = Bitmap.createBitmap(rawW, rawH, Bitmap.Config.ARGB_8888)
+                    Log.i(TAG, "Raw displacement FBO: ${rawW}x${rawH}")
+                }
+
                 val program = createShaderProgram()
 
                 Log.i(TAG, "GL thread started, output=${outputWidth}x${outputHeight}")
@@ -151,6 +182,26 @@ class SurfaceTextureFrameReader(
                         val frameStart = System.nanoTime()
                         st.updateTexImage()
                         st.getTransformMatrix(texMatrix)
+
+                        // Render raw (no stabilization) to small FBO for translation measurement
+                        if (onRawFrame != null && rawBitmap != null && rawFrameEnabled) {
+                            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, rawFbo[0])
+                            GLES20.glViewport(0, 0, rawW, rawH)
+                            GLES20.glUseProgram(program)
+                            val rTexMatLoc = GLES20.glGetUniformLocation(program, "uTexMatrix")
+                            GLES20.glUniformMatrix4fv(rTexMatLoc, 1, false, texMatrix, 0)
+                            val rStabLoc = GLES20.glGetUniformLocation(program, "uStabMatrix")
+                            GLES20.glUniformMatrix3fv(rStabLoc, 1, false, IDENTITY_MAT3, 0)
+                            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+                            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
+                            GLES20.glUniform1i(GLES20.glGetUniformLocation(program, "sTexture"), 0)
+                            drawQuad(program)
+                            rawBuf.clear()
+                            GLES20.glReadPixels(0, 0, rawW, rawH, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, rawBuf)
+                            rawBuf.rewind()
+                            rawBitmap!!.copyPixelsFromBuffer(rawBuf)
+                            onRawFrame.invoke(rawBitmap!!)
+                        }
 
                         // Render external texture to FBO at output resolution
                         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fbo[0])
@@ -248,6 +299,10 @@ class SurfaceTextureFrameReader(
                 Log.i(TAG, "GL thread produced $glFrameCount frames")
 
                 // Cleanup
+                if (onRawFrame != null) {
+                    GLES20.glDeleteFramebuffers(1, rawFbo, 0)
+                    GLES20.glDeleteTextures(1, rawTex, 0)
+                }
                 GLES30.glDeleteBuffers(2, pbos, 0)
                 GLES20.glDeleteFramebuffers(1, fbo, 0)
                 GLES20.glDeleteTextures(1, renderTex, 0)

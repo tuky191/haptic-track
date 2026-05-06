@@ -2,6 +2,7 @@ package com.haptictrack.camera
 
 import android.content.Context
 import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CameraManager as Camera2Manager
 import android.util.Log
@@ -47,7 +48,7 @@ class CameraManager(private val context: Context) {
     val gyroStabilizer = GyroStabilizer(context)
 
     /** Whether to request ISP-level preview stabilization on next bind. */
-    var ispStabilizationEnabled: Boolean = true
+    var ispStabilizationEnabled: Boolean = false
 
     /** Current lens facing — back by default. */
     var isFrontCamera: Boolean = false
@@ -96,6 +97,7 @@ class CameraManager(private val context: Context) {
 
     init {
         opticalZoomMax = detectOpticalZoomMax()
+        checkOisDataSupport()
         gyroStabilizer.readCameraIntrinsics(context)
     }
 
@@ -176,8 +178,13 @@ class CameraManager(private val context: Context) {
                 CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
                 CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON
             )
-        gyroStabilizer.oisCompensation = 0.80
-        Log.i(TAG, "OIS enabled (gyro corrections scaled to ${gyroStabilizer.oisCompensation})")
+        if (gyroStabilizer.enabled) {
+            gyroStabilizer.oisCompensation = 0.40
+            Log.i(TAG, "OIS + gyro EIS: oisCompensation=${gyroStabilizer.oisCompensation}")
+        } else {
+            gyroStabilizer.oisCompensation = 1.0
+            Log.i(TAG, "OIS only, no gyro correction")
+        }
         gyroStabilizer.readCameraIntrinsics(context, frontFacing = isFrontCamera)
         Log.i(TAG, "Gyro EIS ${if (gyroStabilizer.enabled) "ON" else "OFF"}")
         preview = previewBuilder.build()
@@ -204,7 +211,8 @@ class CameraManager(private val context: Context) {
                 outputHeight = outH,
                 onFrame = { bitmap -> onAnalysisFrame?.invoke(bitmap) },
                 onViewfinderFrame = { bitmap -> onViewfinderFrame?.invoke(bitmap) },
-                stabMatrixProvider = { gyroStabilizer.getMatrix() }
+                stabMatrixProvider = { gyroStabilizer.getMatrix() },
+                onRawFrame = { bitmap -> gyroStabilizer.onRawFrame(bitmap) }
             )
             val readerSurface = reader.start()
             frameReader = reader
@@ -219,23 +227,41 @@ class CameraManager(private val context: Context) {
 
         val processor = StabilizationProcessor(
             stabMatrixProvider = { gyroStabilizer.getMatrix() },
+            videoMatrixProvider = if (gyroStabilizer.rtsLookahead) ({ ts -> gyroStabilizer.getVideoMatrix(ts) }) else null,
             frameTimestampLogger = { idx, ts -> gyroStabilizer.logFrameTimestamp(idx, ts) }
         )
         stabProcessor = processor
         useCaseGroupBuilder.addEffect(StabilizationEffect(processor))
-        Log.i(TAG, "StabilizationProcessor added (EIS ${if (gyroStabilizer.enabled) "ON" else "OFF — identity pass-through"})")
+        Log.i(TAG, "StabilizationProcessor added (EIS ${if (gyroStabilizer.enabled) "ON" else "OFF — identity pass-through"}, rts=${gyroStabilizer.rtsLookahead})")
 
         val camera = provider.bindToLifecycle(lifecycleOwner, selector, useCaseGroupBuilder.build())
 
         cameraControl = camera.cameraControl
         cameraInfo = camera.cameraInfo
 
+        gyroStabilizer.onZoomApply = { ratio ->
+            val clamped = ratio.coerceIn(getMinZoom(), getMaxZoom())
+            cameraControl?.setZoomRatio(clamped)
+        }
+
         val previewRes = preview.resolutionInfo?.resolution
         Log.i(TAG, "Bound use cases — preview: $previewRes, frameReader: ${frameReader != null}, gyroVideo: ${stabProcessor != null}")
     }
 
-    fun setZoomRatio(ratio: Float) {
-        cameraControl?.setZoomRatio(ratio.coerceIn(getMinZoom(), getMaxZoom()))
+    fun setTranslationCorrectionEnabled(enabled: Boolean) {
+        gyroStabilizer.translationCorrectionEnabled = enabled
+        frameReader?.rawFrameEnabled = enabled
+    }
+
+    fun setZoomTarget(ratio: Float) {
+        val clamped = ratio.coerceIn(getMinZoom(), getMaxZoom())
+        gyroStabilizer.setZoomTarget(clamped)
+    }
+
+    fun setZoomImmediate(ratio: Float) {
+        val clamped = ratio.coerceIn(getMinZoom(), getMaxZoom())
+        cameraControl?.setZoomRatio(clamped)
+        gyroStabilizer.setZoomImmediate(clamped)
     }
 
     fun getMinZoom(): Float = cameraInfo?.zoomState?.value?.minZoomRatio ?: 1f
@@ -254,6 +280,22 @@ class CameraManager(private val context: Context) {
      * physical camera focal lengths. The ratio of the longest to the shortest
      * focal length gives the optical zoom range.
      */
+    private fun checkOisDataSupport() {
+        try {
+            val cam2 = context.getSystemService(Context.CAMERA_SERVICE) as Camera2Manager
+            for (cameraId in cam2.cameraIdList) {
+                val chars = cam2.getCameraCharacteristics(cameraId)
+                val facing = chars.get(CameraCharacteristics.LENS_FACING)
+                if (facing != CameraCharacteristics.LENS_FACING_BACK) continue
+                val modes = chars.get(CameraCharacteristics.STATISTICS_INFO_AVAILABLE_OIS_DATA_MODES)
+                val hasOisData = modes != null && modes.contains(CameraMetadata.STATISTICS_OIS_DATA_MODE_ON)
+                Log.i(TAG, "Camera $cameraId OIS data modes: ${modes?.toList()}, supported=$hasOisData")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to check OIS data support: ${e.message}")
+        }
+    }
+
     private fun detectOpticalZoomMax(): Float {
         return try {
             val cam2 = context.getSystemService(Context.CAMERA_SERVICE) as Camera2Manager

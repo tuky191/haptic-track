@@ -49,10 +49,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         private const val TAG = "CameraVM"
         /** Tap target padding in normalized coordinates (~3% of screen on each side). */
         private const val TAP_PADDING = 0.03f
-        private const val GYRO_TC_MAX = 0.80       // time constant at strength=0 (most laggy)
-        private const val GYRO_TC_RANGE = 0.50      // TC swing: 0.80 - 0.50 = 0.30 at strength=1
-        private const val GYRO_CROP_MIN = 1.05f     // crop zoom at strength=0
-        private const val GYRO_CROP_RANGE = 0.20f   // crop swing: 1.05 + 0.20 = 1.25 at strength=1
+        private const val GYRO_TC_MAX = 1.00       // time constant at strength=0 (most laggy)
+        private const val GYRO_TC_RANGE = 0.60      // TC swing: 1.00 - 0.60 = 0.40 at strength=1
+        private const val GYRO_CROP_MIN = 1.15f     // crop zoom at strength=0 (light stabilization)
+        private const val GYRO_CROP_RANGE = 0.30f   // crop swing: 1.15 + 0.30 = 1.45 at strength=1
     }
 
     /** Smooths idle detections by keeping objects alive for a few frames after they disappear. */
@@ -91,18 +91,24 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
                 val targetZoom = if (lockedObject != null) {
                     zoomController.resetLossCounter()
+                    cameraManager.gyroStabilizer.onTrackingUpdate(
+                        lockedObject.boundingBox.centerX(),
+                        lockedObject.boundingBox.centerY(),
+                        lockedObject.boundingBox.width() * lockedObject.boundingBox.height()
+                    )
                     zoomController.calculateZoom(
                         lockedObject.boundingBox,
                         cameraManager.getMinZoom(),
                         cameraManager.getMaxZoom()
-                    ).also { cameraManager.setZoomRatio(it) }
+                    ).also { cameraManager.setZoomTarget(it) }
                 } else if (status == TrackingStatus.LOST) {
+                    cameraManager.gyroStabilizer.clearTracking()
                     // Gradual zoom-out: delays 5 frames then pulls back 15% per frame.
                     // Gives reacquisition a chance at the original zoom before widening FOV.
                     zoomController.zoomOutForSearchGradual(
                         cameraManager.getMinZoom(),
                         cameraManager.getMaxZoom()
-                    ).also { cameraManager.setZoomRatio(it) }
+                    ).also { cameraManager.setZoomTarget(it) }
                 } else null
 
                 hapticManager.updateTrackingStatus(status, edgeProximity)
@@ -139,7 +145,6 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 if (isTrackerReady) {
                     tracker.processBitmap(bitmap)
                 } else {
-                    // Before models load we'd leak the bitmap — hand it straight back.
                     cameraManager.releaseAnalysisBitmap(bitmap)
                 }
             }
@@ -213,7 +218,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         val appliedZoom = zoomController.setManualZoom(
             newZoom, cameraManager.getMinZoom(), cameraManager.getMaxZoom()
         )
-        cameraManager.setZoomRatio(appliedZoom)
+        cameraManager.setZoomImmediate(appliedZoom)
         _uiState.update { it.copy(currentZoomRatio = appliedZoom, showZoomIndicator = true) }
     }
 
@@ -290,6 +295,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     fun toggleGyroEis() {
         val newValue = !_uiState.value.gyroEis
         cameraManager.gyroStabilizer.enabled = newValue
+        applyOisCompensation(gyroEis = newValue, oisToggle = _uiState.value.oisCompensation)
         _uiState.update { it.copy(gyroEis = newValue) }
     }
 
@@ -297,6 +303,28 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         val newValue = !_uiState.value.adaptiveEis
         cameraManager.gyroStabilizer.adaptiveSmoothing = newValue
         _uiState.update { it.copy(adaptiveEis = newValue) }
+    }
+
+    fun toggleLeash() {
+        val newValue = !_uiState.value.leashEnabled
+        cameraManager.gyroStabilizer.leashEnabled = newValue
+        _uiState.update { it.copy(leashEnabled = newValue) }
+    }
+
+    fun toggleOisCompensation() {
+        val newValue = !_uiState.value.oisCompensation
+        applyOisCompensation(gyroEis = _uiState.value.gyroEis, oisToggle = newValue)
+        _uiState.update { it.copy(oisCompensation = newValue) }
+    }
+
+    private fun applyOisCompensation(gyroEis: Boolean, oisToggle: Boolean) {
+        cameraManager.gyroStabilizer.oisCompensation = if (gyroEis && oisToggle) 0.40 else 1.0
+    }
+
+    fun toggleTranslationEis() {
+        val newValue = !_uiState.value.translationEis
+        cameraManager.setTranslationCorrectionEnabled(newValue)
+        _uiState.update { it.copy(translationEis = newValue) }
     }
 
     fun setGyroStrength(strength: Float) {
@@ -316,11 +344,15 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     fun clearTracking() {
         if (!isTrackerReady) return
+        if (recordingManager.isRecording) {
+            recordingManager.stopRecording()
+            cameraManager.gyroStabilizer.endBenchCapture()
+        }
         objectTracker.clearLock()
         zoomController.reset()
         hapticManager.updateTrackingStatus(TrackingStatus.IDLE)
         _uiState.update {
-            TrackingUiState(status = TrackingStatus.IDLE, isRecording = it.isRecording, captureMode = it.captureMode, stealthMode = it.stealthMode, isReady = it.isReady, ispStabilization = it.ispStabilization, gyroEis = it.gyroEis, gyroStrength = it.gyroStrength, adaptiveEis = it.adaptiveEis)
+            TrackingUiState(status = TrackingStatus.IDLE, isRecording = false, captureMode = it.captureMode, stealthMode = it.stealthMode, isReady = it.isReady, ispStabilization = it.ispStabilization, gyroEis = it.gyroEis, gyroStrength = it.gyroStrength, adaptiveEis = it.adaptiveEis, leashEnabled = it.leashEnabled, oisCompensation = it.oisCompensation, translationEis = it.translationEis)
         }
     }
 
