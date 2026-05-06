@@ -84,16 +84,25 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     /** Current camera zoom ratio — used to scale TC (more smoothing at zoom). */
     @Volatile var zoomRatio: Float = 1f
 
-    // Zoom interpolation: target set at 10-12fps by tracker, applied at 200Hz
-    @Volatile private var zoomTarget: Float = 1f
-    @Volatile private var zoomApplied: Float = 1f
+    /** Zoom interpolation: target set at 10-12fps by tracker, interpolated at 200Hz. */
+    @Volatile private var zoomTarget: Float = 1f   // desired zoom from auto-zoom controller
+    @Volatile private var zoomApplied: Float = 1f  // interpolated zoom dispatched to CameraX
     private var lastZoomDispatchNs: Long = 0L
+    private val ZOOM_INTERP_RATE = 25.0   // interpolation speed (~40ms TC)
+    private val ZOOM_DISPATCH_NS = 16_000_000L  // CameraX dispatch throttle (~60Hz)
 
     /** Callback to apply interpolated zoom to CameraX. Called at ~60Hz from sensor thread. */
     var onZoomApply: ((Float) -> Unit)? = null
 
     fun setZoomTarget(target: Float) {
         zoomTarget = target
+    }
+
+    /** Snap zoom immediately (for pinch gesture). Sets all three zoom fields to avoid race. */
+    fun setZoomImmediate(ratio: Float) {
+        zoomTarget = ratio
+        zoomApplied = ratio
+        zoomRatio = ratio
     }
 
     /** Gaussian kernel smoothing for video frames (400ms output latency, ~95MB FBO buffer). */
@@ -192,7 +201,6 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     // crop offset so the subject moves toward frame center.
     private val CENTER_BBOX_TC = 0.50     // bbox center smoothing (seconds) — heavy to filter detector noise
     private val CENTER_MARGIN_FRAC = 0.5  // fraction of crop margin available for centering
-    private val CENTER_RAMP_RATE = 10.0   // 200Hz interpolation speed (~100ms TC)
     @Volatile private var trackSmoothX = 0.5  // smoothed bbox center
     @Volatile private var trackSmoothY = 0.5
     @Volatile private var trackTargetUvX = 0f // target centering offset
@@ -639,24 +647,16 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             hPortrait[6] += transAppliedUvX
             hPortrait[7] -= transAppliedUvY
         }
-        // Subject centering disabled — oscillating bbox center adds ±0.058 UV jitter
-        // that dominates the gyro correction and kills EIS effectiveness.
-        // TODO: revisit with much heavier smoothing (TC≥2s) or VT-based center.
-        // if (trackingActive) {
-        //     val trackAlpha = (1.0 - exp(-dtSec * CENTER_RAMP_RATE)).toFloat()
-        //     trackAppliedUvX += trackAlpha * (trackTargetUvX - trackAppliedUvX)
-        //     trackAppliedUvY += trackAlpha * (trackTargetUvY - trackAppliedUvY)
-        //     hPortrait[6] += trackAppliedUvX
-        //     hPortrait[7] += trackAppliedUvY
-        // }
+        // Subject centering not applied — bbox center at 10-12fps is too noisy.
+        // onTrackingUpdate() still computes offsets for future use (VT-based center).
         val rawExcursion = maxCornerExcursion(hPortrait)
         currentMatrix.set(hPortrait)
 
         // Zoom interpolation: ramp toward target at 200Hz, dispatch to CameraX at ~60Hz
-        val zoomAlpha = (1.0 - exp(-dtSec * 25.0)).toFloat()
+        val zoomAlpha = (1.0 - exp(-dtSec * ZOOM_INTERP_RATE)).toFloat()
         zoomApplied += zoomAlpha * (zoomTarget - zoomApplied)
         zoomRatio = zoomApplied
-        if (nowNs - lastZoomDispatchNs >= 16_000_000L) {
+        if (nowNs - lastZoomDispatchNs >= ZOOM_DISPATCH_NS) {
             lastZoomDispatchNs = nowNs
             onZoomApply?.invoke(zoomApplied)
         }

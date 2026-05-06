@@ -261,8 +261,7 @@ class CameraManager(private val context: Context) {
     fun setZoomImmediate(ratio: Float) {
         val clamped = ratio.coerceIn(getMinZoom(), getMaxZoom())
         cameraControl?.setZoomRatio(clamped)
-        gyroStabilizer.zoomRatio = clamped
-        gyroStabilizer.setZoomTarget(clamped)
+        gyroStabilizer.setZoomImmediate(clamped)
     }
 
     fun getMinZoom(): Float = cameraInfo?.zoomState?.value?.minZoomRatio ?: 1f

@@ -295,7 +295,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     fun toggleGyroEis() {
         val newValue = !_uiState.value.gyroEis
         cameraManager.gyroStabilizer.enabled = newValue
-        cameraManager.gyroStabilizer.oisCompensation = if (newValue) 0.40 else 1.0
+        applyOisCompensation(gyroEis = newValue, oisToggle = _uiState.value.oisCompensation)
         _uiState.update { it.copy(gyroEis = newValue) }
     }
 
@@ -313,8 +313,12 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     fun toggleOisCompensation() {
         val newValue = !_uiState.value.oisCompensation
-        cameraManager.gyroStabilizer.oisCompensation = if (newValue) 0.40 else 1.0
+        applyOisCompensation(gyroEis = _uiState.value.gyroEis, oisToggle = newValue)
         _uiState.update { it.copy(oisCompensation = newValue) }
+    }
+
+    private fun applyOisCompensation(gyroEis: Boolean, oisToggle: Boolean) {
+        cameraManager.gyroStabilizer.oisCompensation = if (gyroEis && oisToggle) 0.40 else 1.0
     }
 
     fun toggleTranslationEis() {
