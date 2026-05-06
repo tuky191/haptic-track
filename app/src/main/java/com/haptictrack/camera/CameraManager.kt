@@ -176,8 +176,13 @@ class CameraManager(private val context: Context) {
                 CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
                 CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON
             )
-        gyroStabilizer.oisCompensation = 0.80
-        Log.i(TAG, "OIS enabled (gyro corrections scaled to ${gyroStabilizer.oisCompensation})")
+        if (gyroStabilizer.enabled) {
+            gyroStabilizer.oisCompensation = 0.40
+            Log.i(TAG, "OIS + gyro EIS: oisCompensation=${gyroStabilizer.oisCompensation}")
+        } else {
+            gyroStabilizer.oisCompensation = 1.0
+            Log.i(TAG, "OIS only, no gyro correction")
+        }
         gyroStabilizer.readCameraIntrinsics(context, frontFacing = isFrontCamera)
         Log.i(TAG, "Gyro EIS ${if (gyroStabilizer.enabled) "ON" else "OFF"}")
         preview = previewBuilder.build()

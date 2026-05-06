@@ -64,7 +64,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     private var sensorOrientation: Int = 90
 
     /** Crop zoom applied to absorb warp margins (1.0 = no crop, 1.10 = 10% crop). */
-    var cropZoom: Float = 1.15f
+    var cropZoom: Float = 1.30f
 
     /** Adaptive pan detection: reduces TC during pans, increases during shake. */
     var adaptiveSmoothing: Boolean = true
