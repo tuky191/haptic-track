@@ -187,15 +187,15 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     @Volatile private var rotOnlyUvX = 0.0   // latest rotation-only center offset (no translation)
     @Volatile private var rotOnlyUvY = 0.0
 
-    // Tracking-guided stabilization: use bbox center as position signal at zoom.
-    // The bbox jitter at zoom IS the shake — smooth it and apply the difference.
-    private val TRACK_TC = 0.25           // bbox smoothing TC (seconds) — heavier than optical flow
-    private val TRACK_MARGIN_FRAC = 0.8   // can use more crop margin (signal is reliable)
-    @Volatile private var trackRawX = 0.5f    // latest bbox center (normalized [0,1])
-    @Volatile private var trackRawY = 0.5f
+    // Subject centering: nudge the crop toward the locked subject's bbox center.
+    // Smooths the bbox center heavily to avoid detector jitter, then drifts the
+    // crop offset so the subject moves toward frame center.
+    private val CENTER_BBOX_TC = 0.50     // bbox center smoothing (seconds) — heavy to filter detector noise
+    private val CENTER_MARGIN_FRAC = 0.5  // fraction of crop margin available for centering
+    private val CENTER_RAMP_RATE = 10.0   // 200Hz interpolation speed (~100ms TC)
     @Volatile private var trackSmoothX = 0.5  // smoothed bbox center
     @Volatile private var trackSmoothY = 0.5
-    @Volatile private var trackTargetUvX = 0f // target correction for 200Hz interpolation
+    @Volatile private var trackTargetUvX = 0f // target centering offset
     @Volatile private var trackTargetUvY = 0f
     @Volatile private var trackAppliedUvX = 0f
     @Volatile private var trackAppliedUvY = 0f
@@ -295,11 +295,35 @@ class GyroStabilizer(context: Context) : SensorEventListener {
      * Called from the tracking callback at ~10-12fps when a subject is locked.
      * @param centerX bbox center X in normalized [0,1] frame coordinates
      * @param centerY bbox center Y in normalized [0,1] frame coordinates
+     * @param bboxArea bbox area in normalized [0,1] coordinates (width*height)
      */
-    fun onTrackingUpdate(centerX: Float, centerY: Float) {
-        // Disabled: bbox center jitter at 10-12fps creates visible preview shake.
-        // Zoom-adaptive TC handles zoom stabilization sufficiently (5.71px jitter).
-        // Kept as a hook for future use with a smoothed bbox source.
+    fun onTrackingUpdate(centerX: Float, centerY: Float, bboxArea: Float) {
+        if (!_enabled) {
+            if (trackingActive) clearTrackingState()
+            return
+        }
+        if (!trackingActive) {
+            trackSmoothX = centerX.toDouble()
+            trackSmoothY = centerY.toDouble()
+            trackingActive = true
+            return
+        }
+        // Smooth the bbox center heavily to filter detector noise
+        val alpha = 1.0 - exp(-1.0 / (12.0 * CENTER_BBOX_TC))
+        trackSmoothX += alpha * (centerX - trackSmoothX)
+        trackSmoothY += alpha * (centerY - trackSmoothY)
+
+        // Scale centering by how small the subject is — large bbox = noisy center, less useful
+        val areaScale = (1.0 - bboxArea).coerceIn(0.0, 1.0)
+
+        // Centering offset: how far from center, clamped by available crop margin
+        val cropMarginUv = 0.5 * (1.0 - 1.0 / cropZoom)
+        val maxCenterUv = cropMarginUv * CENTER_MARGIN_FRAC
+        val offsetX = ((0.5 - trackSmoothX) * areaScale).coerceIn(-maxCenterUv, maxCenterUv)
+        val offsetY = ((0.5 - trackSmoothY) * areaScale).coerceIn(-maxCenterUv, maxCenterUv)
+
+        trackTargetUvX = offsetX.toFloat()
+        trackTargetUvY = offsetY.toFloat()
     }
 
     fun clearTracking() {
@@ -308,7 +332,6 @@ class GyroStabilizer(context: Context) : SensorEventListener {
 
     private fun clearTrackingState() {
         trackingActive = false
-        trackRawX = 0.5f; trackRawY = 0.5f
         trackSmoothX = 0.5; trackSmoothY = 0.5
         trackTargetUvX = 0f; trackTargetUvY = 0f
         trackAppliedUvX = 0f; trackAppliedUvY = 0f
@@ -549,7 +572,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         }
 
         val isPanning = highVelocityDurationSec >= PAN_ONSET_SEC
-        val zoomTcScale = zoomRatio.toDouble().coerceAtLeast(1.0)
+        val zoomTcScale = sqrt(zoomRatio.toDouble().coerceAtLeast(1.0))
         if (adaptiveSmoothing) {
             val baseTc = timeConstant * zoomTcScale
             val targetTc = if (isPanning) baseTc * PAN_TC_FACTOR else baseTc
@@ -616,13 +639,16 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             hPortrait[6] += transAppliedUvX
             hPortrait[7] -= transAppliedUvY
         }
-        if (trackingActive) {
-            val trackAlpha = (1.0 - exp(-dtSec * 60.0)).toFloat()
-            trackAppliedUvX += trackAlpha * (trackTargetUvX - trackAppliedUvX)
-            trackAppliedUvY += trackAlpha * (trackTargetUvY - trackAppliedUvY)
-            hPortrait[6] += trackAppliedUvX
-            hPortrait[7] += trackAppliedUvY
-        }
+        // Subject centering disabled — oscillating bbox center adds ±0.058 UV jitter
+        // that dominates the gyro correction and kills EIS effectiveness.
+        // TODO: revisit with much heavier smoothing (TC≥2s) or VT-based center.
+        // if (trackingActive) {
+        //     val trackAlpha = (1.0 - exp(-dtSec * CENTER_RAMP_RATE)).toFloat()
+        //     trackAppliedUvX += trackAlpha * (trackTargetUvX - trackAppliedUvX)
+        //     trackAppliedUvY += trackAlpha * (trackTargetUvY - trackAppliedUvY)
+        //     hPortrait[6] += trackAppliedUvX
+        //     hPortrait[7] += trackAppliedUvY
+        // }
         val rawExcursion = maxCornerExcursion(hPortrait)
         currentMatrix.set(hPortrait)
 
@@ -660,7 +686,8 @@ class GyroStabilizer(context: Context) : SensorEventListener {
                 "tc=${"%.3f".format(timeConstant)}→${"%.3f".format(telSumEffTc / telFrames)} " +
                 "vel=${"%.1f".format(telSumVel / telFrames)}/${"%.1f".format(telPeakVel)}°/s " +
                 "pan=${"%.0f".format(100.0 * telPanFrames / telFrames)}% " +
-                "crop=${"%.2f".format(cropZoom)} zoom=${"%.1f".format(zoomRatio)}"
+                "crop=${"%.2f".format(cropZoom)} zoom=${"%.1f".format(zoomRatio)}" +
+                if (trackingActive) " center=${"%.3f".format(trackAppliedUvX)}/${"%.3f".format(trackAppliedUvY)}" else ""
             Log.d(TAG, line)
             try { sessionWriter?.println("${System.currentTimeMillis()} $line") } catch (_: Exception) {}
             resetTelemetry()

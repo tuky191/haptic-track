@@ -93,7 +93,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     zoomController.resetLossCounter()
                     cameraManager.gyroStabilizer.onTrackingUpdate(
                         lockedObject.boundingBox.centerX(),
-                        lockedObject.boundingBox.centerY()
+                        lockedObject.boundingBox.centerY(),
+                        lockedObject.boundingBox.width() * lockedObject.boundingBox.height()
                     )
                     zoomController.calculateZoom(
                         lockedObject.boundingBox,
@@ -339,11 +340,15 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     fun clearTracking() {
         if (!isTrackerReady) return
+        if (recordingManager.isRecording) {
+            recordingManager.stopRecording()
+            cameraManager.gyroStabilizer.endBenchCapture()
+        }
         objectTracker.clearLock()
         zoomController.reset()
         hapticManager.updateTrackingStatus(TrackingStatus.IDLE)
         _uiState.update {
-            TrackingUiState(status = TrackingStatus.IDLE, isRecording = it.isRecording, captureMode = it.captureMode, stealthMode = it.stealthMode, isReady = it.isReady, ispStabilization = it.ispStabilization, gyroEis = it.gyroEis, gyroStrength = it.gyroStrength, adaptiveEis = it.adaptiveEis, leashEnabled = it.leashEnabled, oisCompensation = it.oisCompensation, translationEis = it.translationEis)
+            TrackingUiState(status = TrackingStatus.IDLE, isRecording = false, captureMode = it.captureMode, stealthMode = it.stealthMode, isReady = it.isReady, ispStabilization = it.ispStabilization, gyroEis = it.gyroEis, gyroStrength = it.gyroStrength, adaptiveEis = it.adaptiveEis, leashEnabled = it.leashEnabled, oisCompensation = it.oisCompensation, translationEis = it.translationEis)
         }
     }
 
