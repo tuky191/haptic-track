@@ -45,6 +45,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         private const val PAN_TC_FACTOR = 0.30
         private const val VELOCITY_SMOOTHING_TC = 0.05
         private const val TC_RAMP_SPEED = 5.0
+        private const val OIS_FAST_TC = 0.03  // fast-tracker TC for OIS band-split (~33Hz cutoff)
     }
 
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
@@ -102,6 +103,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     private val IDENTITY_QUAT = Quat(1.0, 0.0, 0.0, 0.0)
     @Volatile private var rawQuat = Quat(1.0, 0.0, 0.0, 0.0)
     @Volatile private var smoothedQuat = Quat(1.0, 0.0, 0.0, 0.0)
+    @Volatile private var smoothFastQuat = Quat(1.0, 0.0, 0.0, 0.0)
     @Volatile private var initialized = false
     private var lastTimestampNs = 0L
     private var sampleRate = 200.0
@@ -446,6 +448,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
 
         if (!initialized) {
             smoothedQuat = rawQuat
+            smoothFastQuat = rawQuat
             initialized = true
             lastTimestampNs = nowNs
             prevRawQuat = rawQuat
@@ -461,6 +464,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             Log.w(TAG, warn)
             try { sessionWriter?.println("${System.currentTimeMillis()} WARN $warn") } catch (_: Exception) {}
             smoothedQuat = rawQuat
+            smoothFastQuat = rawQuat
             prevRawQuat = rawQuat
             resetAdaptiveState()
             return
@@ -497,9 +501,17 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         val alpha = 1.0 - exp(-(1.0 / sampleRate) / effectiveTc)
         smoothedQuat = slerp(smoothedQuat, rawQuat, alpha)
 
+        // Fast-tracking filter (TC=0.03s, ~33Hz cutoff): follows the device closely,
+        // only removing the highest-frequency vibration that OIS handles well.
+        // Used as the correction reference when OIS is active — the difference
+        // smoothHeavy⁻¹ × smoothFast is the low-frequency sway OIS misses.
+        val fastTc = OIS_FAST_TC
+        val fastAlpha = 1.0 - exp(-(1.0 / sampleRate) / fastTc)
+        smoothFastQuat = slerp(smoothFastQuat, rawQuat, fastAlpha)
+
         // Leash: limit how far smoothed can deviate from raw.
         val cropMargin = 0.5 * (1.0 - 1.0 / cropZoom)
-        val maxCorrAngle = cropMargin / maxOf(fxUv, fyUv) / oisCompensation
+        val maxCorrAngle = cropMargin / maxOf(fxUv, fyUv)
         val devQuat = smoothedQuat.conjugate() * rawQuat
         val devAngle = 2.0 * acos(devQuat.w.coerceIn(-1.0, 1.0))
         lastLeashActive = leashEnabled && devAngle > maxCorrAngle && devAngle > 1e-6
@@ -508,16 +520,12 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             smoothedQuat = slerp(smoothedQuat, rawQuat, catchUp)
         }
 
-        // Correction: for each output pixel (in the smoothed frame), find where to
-        // sample in the raw (shaky) input texture. That's smooth⁻¹ × raw.
-        var correctionDevice = smoothedQuat.conjugate() * rawQuat
-
-        // Scale correction when OIS is active — OIS handles part of the shake,
-        // so full correction overcorrects. slerp(identity, corr, factor) scales the
-        // rotation angle by factor.
-        if (oisCompensation < 1.0) {
-            correctionDevice = slerp(IDENTITY_QUAT, correctionDevice, oisCompensation)
-        }
+        // Correction: smoothHeavy⁻¹ × reference.
+        // When OIS is active (oisCompensation < 1.0), use smoothFast as the reference
+        // so we only correct the low-frequency sway that OIS can't handle mechanically.
+        // When OIS is off, use raw for full correction.
+        val corrReference = if (oisCompensation < 1.0) smoothFastQuat else rawQuat
+        val correctionDevice = smoothedQuat.conjugate() * corrReference
 
         // Rotate correction from device coordinate space into camera sensor space.
         val correction = deviceToSensorQuat * correctionDevice * deviceToSensorQuat.conjugate()

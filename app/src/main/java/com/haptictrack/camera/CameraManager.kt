@@ -2,6 +2,7 @@ package com.haptictrack.camera
 
 import android.content.Context
 import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CameraManager as Camera2Manager
 import android.util.Log
@@ -96,6 +97,7 @@ class CameraManager(private val context: Context) {
 
     init {
         opticalZoomMax = detectOpticalZoomMax()
+        checkOisDataSupport()
         gyroStabilizer.readCameraIntrinsics(context)
     }
 
@@ -266,6 +268,22 @@ class CameraManager(private val context: Context) {
      * physical camera focal lengths. The ratio of the longest to the shortest
      * focal length gives the optical zoom range.
      */
+    private fun checkOisDataSupport() {
+        try {
+            val cam2 = context.getSystemService(Context.CAMERA_SERVICE) as Camera2Manager
+            for (cameraId in cam2.cameraIdList) {
+                val chars = cam2.getCameraCharacteristics(cameraId)
+                val facing = chars.get(CameraCharacteristics.LENS_FACING)
+                if (facing != CameraCharacteristics.LENS_FACING_BACK) continue
+                val modes = chars.get(CameraCharacteristics.STATISTICS_INFO_AVAILABLE_OIS_DATA_MODES)
+                val hasOisData = modes != null && modes.contains(CameraMetadata.STATISTICS_OIS_DATA_MODE_ON)
+                Log.i(TAG, "Camera $cameraId OIS data modes: ${modes?.toList()}, supported=$hasOisData")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to check OIS data support: ${e.message}")
+        }
+    }
+
     private fun detectOpticalZoomMax(): Float {
         return try {
             val cam2 = context.getSystemService(Context.CAMERA_SERVICE) as Camera2Manager
