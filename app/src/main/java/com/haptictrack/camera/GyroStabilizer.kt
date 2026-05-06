@@ -45,7 +45,11 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         private const val PAN_TC_FACTOR = 0.30
         private const val VELOCITY_SMOOTHING_TC = 0.05
         private const val TC_RAMP_SPEED = 5.0
-        private const val OIS_FAST_TC = 0.03  // fast-tracker TC for OIS band-split (~33Hz cutoff)
+        private const val OIS_FAST_TC = 0.03      // fast-tracker TC when OIS is off (full correction)
+        private const val OIS_FAST_TC_CALM = 0.06 // fast TC during calm holding — OIS handles more, filter more out
+        private const val OIS_FAST_TC_SWAY = 0.02 // fast TC during sway — OIS handles less, let more through
+        private const val OIS_ADAPT_VEL_LOW = 3.0  // °/s below which OIS handles nearly everything
+        private const val OIS_ADAPT_VEL_HIGH = 15.0 // °/s above which OIS struggles with sway
     }
 
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
@@ -501,12 +505,17 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         val alpha = 1.0 - exp(-(1.0 / sampleRate) / effectiveTc)
         smoothedQuat = slerp(smoothedQuat, rawQuat, alpha)
 
-        // Fast-tracking filter (TC=0.03s, ~33Hz cutoff): follows the device closely,
-        // only removing the highest-frequency vibration that OIS handles well.
-        // Used as the correction reference when OIS is active — the difference
-        // smoothHeavy⁻¹ × smoothFast is the low-frequency sway OIS misses.
-        val fastTc = OIS_FAST_TC
-        val fastAlpha = 1.0 - exp(-(1.0 / sampleRate) / fastTc)
+        // Fast-tracking filter: follows the device closely, filtering out
+        // high-frequency vibration that OIS handles optically. The correction
+        // smoothHeavy⁻¹ × smoothFast contains only sway OIS misses.
+        // Adaptive: during calm holding OIS handles more → raise TC to filter more.
+        // During walking sway OIS struggles → lower TC to let more correction through.
+        val vel = smoothedAngularVelocityDeg
+        val adaptFastTc = if (oisCompensation < 1.0) {
+            val t = ((vel - OIS_ADAPT_VEL_LOW) / (OIS_ADAPT_VEL_HIGH - OIS_ADAPT_VEL_LOW)).coerceIn(0.0, 1.0)
+            OIS_FAST_TC_CALM + t * (OIS_FAST_TC_SWAY - OIS_FAST_TC_CALM)
+        } else OIS_FAST_TC
+        val fastAlpha = 1.0 - exp(-(1.0 / sampleRate) / adaptFastTc)
         smoothFastQuat = slerp(smoothFastQuat, rawQuat, fastAlpha)
 
         // Leash: limit how far smoothed can deviate from raw.
