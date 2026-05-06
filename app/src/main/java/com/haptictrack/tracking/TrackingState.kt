@@ -68,7 +68,7 @@ data class TrackingUiState(
     /** Loading status messages shown during model init. */
     val loadingStatus: String = "Initializing...",
     /** ISP-level preview stabilization toggle. */
-    val ispStabilization: Boolean = true,
+    val ispStabilization: Boolean = false,
     /** Software gyro-based EIS toggle. */
     val gyroEis: Boolean = true,
     /** Gyro EIS strength 0.0–1.0 (0 = light, 1 = aggressive). */
@@ -80,5 +80,5 @@ data class TrackingUiState(
     /** OIS compensation active (scale correction to avoid overcorrecting). */
     val oisCompensation: Boolean = true,
     /** Optical-flow translation correction on top of gyro rotation EIS. */
-    val translationEis: Boolean = false
+    val translationEis: Boolean = true
 )

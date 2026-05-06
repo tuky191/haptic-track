@@ -62,7 +62,7 @@ class SurfaceTextureFrameReader(
     }
 
     /** When false, skips the raw displacement FBO render even if [onRawFrame] is set. */
-    @Volatile var rawFrameEnabled = false
+    @Volatile var rawFrameEnabled = true
 
     private var glThread: Thread? = null
     private var processingThread: Thread? = null

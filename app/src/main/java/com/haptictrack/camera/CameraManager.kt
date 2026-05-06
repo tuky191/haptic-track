@@ -48,7 +48,7 @@ class CameraManager(private val context: Context) {
     val gyroStabilizer = GyroStabilizer(context)
 
     /** Whether to request ISP-level preview stabilization on next bind. */
-    var ispStabilizationEnabled: Boolean = true
+    var ispStabilizationEnabled: Boolean = false
 
     /** Current lens facing — back by default. */
     var isFrontCamera: Boolean = false
@@ -249,7 +249,9 @@ class CameraManager(private val context: Context) {
     }
 
     fun setZoomRatio(ratio: Float) {
-        cameraControl?.setZoomRatio(ratio.coerceIn(getMinZoom(), getMaxZoom()))
+        val clamped = ratio.coerceIn(getMinZoom(), getMaxZoom())
+        cameraControl?.setZoomRatio(clamped)
+        gyroStabilizer.zoomRatio = clamped
     }
 
     fun getMinZoom(): Float = cameraInfo?.zoomState?.value?.minZoomRatio ?: 1f

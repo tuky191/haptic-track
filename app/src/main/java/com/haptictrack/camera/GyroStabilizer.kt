@@ -81,6 +81,9 @@ class GyroStabilizer(context: Context) : SensorEventListener {
      *  OIS handles ~20% of shake; without compensation the gyro overcorrects. */
     var oisCompensation: Double = 1.0
 
+    /** Current camera zoom ratio — used to scale TC (more smoothing at zoom). */
+    @Volatile var zoomRatio: Float = 1f
+
     /** Gaussian kernel smoothing for video frames (400ms output latency, ~95MB FBO buffer). */
     var rtsLookahead: Boolean = true
 
@@ -146,7 +149,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     // Translation correction: optical flow → position-domain smoothing with leash.
     // Measures post-gyro residual displacement from stabilized analysis frames,
     // smooths the cumulative path, applies the difference as a crop offset.
-    var translationCorrectionEnabled: Boolean = false
+    var translationCorrectionEnabled: Boolean = true
         set(value) {
             if (field != value) {
                 field = value
@@ -492,12 +495,14 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         }
 
         val isPanning = highVelocityDurationSec >= PAN_ONSET_SEC
+        val zoomTcScale = zoomRatio.toDouble().coerceAtLeast(1.0)
         if (adaptiveSmoothing) {
-            val targetTc = if (isPanning) timeConstant * PAN_TC_FACTOR else timeConstant
+            val baseTc = timeConstant * zoomTcScale
+            val targetTc = if (isPanning) baseTc * PAN_TC_FACTOR else baseTc
             val tcAlpha = 1.0 - exp(-dtSec * TC_RAMP_SPEED)
             effectiveTc += tcAlpha * (targetTc - effectiveTc)
         } else {
-            effectiveTc = timeConstant
+            effectiveTc = timeConstant * zoomTcScale
         }
         prevRawQuat = rawQuat
 
@@ -585,7 +590,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
                 "tc=${"%.3f".format(timeConstant)}→${"%.3f".format(telSumEffTc / telFrames)} " +
                 "vel=${"%.1f".format(telSumVel / telFrames)}/${"%.1f".format(telPeakVel)}°/s " +
                 "pan=${"%.0f".format(100.0 * telPanFrames / telFrames)}% " +
-                "crop=${"%.2f".format(cropZoom)}"
+                "crop=${"%.2f".format(cropZoom)} zoom=${"%.1f".format(zoomRatio)}"
             Log.d(TAG, line)
             try { sessionWriter?.println("${System.currentTimeMillis()} $line") } catch (_: Exception) {}
             resetTelemetry()
@@ -704,7 +709,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
 
         // Leash (same as causal path) — prevent corrections exceeding crop margin
         val cropMargin = 0.5 * (1.0 - 1.0 / cropZoom)
-        val maxCorrAngle = cropMargin / maxOf(fxUv, fyUv) / oisCompensation
+        val maxCorrAngle = cropMargin / maxOf(fxUv, fyUv)
         val devQuat = smoothed.conjugate() * rawAtTarget
         val devAngle = 2.0 * acos(devQuat.w.coerceIn(-1.0, 1.0))
         if (leashEnabled && devAngle > maxCorrAngle && devAngle > 1e-6) {
@@ -712,11 +717,9 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             smoothed = slerp(smoothed, rawAtTarget, catchUp)
         }
 
-        // Correction pipeline (same as causal path)
-        var correctionDevice = smoothed.conjugate() * rawAtTarget
-        if (oisCompensation < 1.0) {
-            correctionDevice = slerp(IDENTITY_QUAT, correctionDevice, oisCompensation)
-        }
+        // Correction pipeline (same as causal path) — band-split when OIS active
+        val corrRef = if (oisCompensation < 1.0) smoothFastQuat else rawAtTarget
+        val correctionDevice = smoothed.conjugate() * corrRef
         val correction = deviceToSensorQuat * correctionDevice * deviceToSensorQuat.conjugate()
         val r = correction.toRotationMatrix()
         val h = computeHomographyUV(r, fxUv, fyUv, cropZoom.toDouble())
