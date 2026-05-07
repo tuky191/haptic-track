@@ -87,8 +87,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     else -> TrackingStatus.SEARCHING
                 }
 
-                val edgeProximity = lockedObject?.let {
-                    zoomController.calculateEdgeProximity(it.boundingBox)
+                val driftX = lockedObject?.let {
+                    (it.boundingBox.centerX() - 0.5f) * 2f
+                } ?: 0f
+                val driftY = lockedObject?.let {
+                    (it.boundingBox.centerY() - 0.5f) * 2f
                 } ?: 0f
 
                 val targetZoom = if (lockedObject != null) {
@@ -113,7 +116,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     ).also { cameraManager.setZoomTarget(it) }
                 } else null
 
-                hapticManager.updateTrackingStatus(status, edgeProximity)
+                hapticManager.updateTrackingStatus(status, driftX, driftY)
 
                 val displayObjects = if (status == TrackingStatus.IDLE) {
                     smoothIdleDetections(allObjects)
