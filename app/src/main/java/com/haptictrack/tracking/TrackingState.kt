@@ -15,6 +15,13 @@ enum class CaptureMode {
     PHOTO
 }
 
+enum class TrackingFilter {
+    ALL,
+    PERSON_ONLY,
+    PETS,
+    NON_PERSON_ONLY
+}
+
 data class TrackedObject(
     val id: Int,
     val boundingBox: RectF,
@@ -80,5 +87,7 @@ data class TrackingUiState(
     /** OIS compensation active (scale correction to avoid overcorrecting). */
     val oisCompensation: Boolean = true,
     /** Optical-flow translation correction on top of gyro rotation EIS. */
-    val translationEis: Boolean = true
+    val translationEis: Boolean = true,
+    /** Which object categories to show and allow tracking. */
+    val trackingFilter: TrackingFilter = TrackingFilter.ALL
 )

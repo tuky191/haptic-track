@@ -17,6 +17,7 @@ import com.haptictrack.tracking.TrackedObject
 import com.haptictrack.tracking.TrackingStatus
 import com.haptictrack.tracking.TrackingUiState
 import com.haptictrack.tracking.CaptureMode
+import com.haptictrack.tracking.TrackingFilter
 import com.haptictrack.zoom.ZoomController
 import java.io.File
 import java.text.SimpleDateFormat
@@ -113,12 +114,14 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
                 hapticManager.updateTrackingStatus(status, edgeProximity)
 
-                val displayObjects = if (status == TrackingStatus.IDLE) {
+                val rawDisplayObjects = if (status == TrackingStatus.IDLE) {
                     smoothIdleDetections(allObjects)
                 } else {
                     recentDetections.clear()
                     allObjects
                 }
+
+                val displayObjects = rawDisplayObjects
 
                 _uiState.update { current ->
                     current.copy(
@@ -174,8 +177,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
         // Expand each box by TAP_PADDING in normalized coords to make small objects easier to hit.
         // When multiple boxes overlap at the tap point, pick the smallest (most specific).
+        val filter = _uiState.value.trackingFilter
         val tapped = objects
-            .filter { it.id >= 0 && it.boundingBox.containsWithPadding(normalizedX, normalizedY, TAP_PADDING) }
+            .filter { it.id >= 0 && matchesFilter(it.label, filter) && it.boundingBox.containsWithPadding(normalizedX, normalizedY, TAP_PADDING) }
             .minByOrNull { it.boundingBox.width() * it.boundingBox.height() }
 
         if (tapped != null) {
@@ -253,7 +257,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         }
 
         // Idle → lock on center + start recording
-        val objects = state.detectedObjects.filter { it.id >= 0 }
+        val objects = state.detectedObjects.filter { it.id >= 0 && matchesFilter(it.label, state.trackingFilter) }
         if (objects.isEmpty()) return
 
         val closest = objects.minByOrNull { obj ->
@@ -265,6 +269,16 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         objectTracker.lockOnObject(closest.id, closest.boundingBox, closest.label)
         _uiState.update { it.copy(status = TrackingStatus.LOCKED, trackedObject = closest) }
         toggleRecording()
+    }
+
+    fun cycleTrackingFilter() {
+        val next = when (_uiState.value.trackingFilter) {
+            TrackingFilter.ALL -> TrackingFilter.PERSON_ONLY
+            TrackingFilter.PERSON_ONLY -> TrackingFilter.PETS
+            TrackingFilter.PETS -> TrackingFilter.NON_PERSON_ONLY
+            TrackingFilter.NON_PERSON_ONLY -> TrackingFilter.ALL
+        }
+        _uiState.update { it.copy(trackingFilter = next) }
     }
 
     fun toggleCaptureMode() {
@@ -352,7 +366,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         zoomController.reset()
         hapticManager.updateTrackingStatus(TrackingStatus.IDLE)
         _uiState.update {
-            TrackingUiState(status = TrackingStatus.IDLE, isRecording = false, captureMode = it.captureMode, stealthMode = it.stealthMode, isReady = it.isReady, ispStabilization = it.ispStabilization, gyroEis = it.gyroEis, gyroStrength = it.gyroStrength, adaptiveEis = it.adaptiveEis, leashEnabled = it.leashEnabled, oisCompensation = it.oisCompensation, translationEis = it.translationEis)
+            TrackingUiState(status = TrackingStatus.IDLE, isRecording = false, captureMode = it.captureMode, stealthMode = it.stealthMode, isReady = it.isReady, ispStabilization = it.ispStabilization, gyroEis = it.gyroEis, gyroStrength = it.gyroStrength, adaptiveEis = it.adaptiveEis, leashEnabled = it.leashEnabled, oisCompensation = it.oisCompensation, translationEis = it.translationEis, trackingFilter = it.trackingFilter)
         }
     }
 
@@ -394,6 +408,18 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         cameraManager.shutdown()
         if (recordingManager.isRecording) recordingManager.stopRecording()
     }
+}
+
+private val ANIMAL_LABELS = setOf(
+    "cat", "dog", "bird", "horse", "sheep", "cow",
+    "elephant", "bear", "zebra", "giraffe"
+)
+
+private fun matchesFilter(label: String?, filter: TrackingFilter): Boolean = when (filter) {
+    TrackingFilter.ALL -> true
+    TrackingFilter.PERSON_ONLY -> label == "person"
+    TrackingFilter.PETS -> label in ANIMAL_LABELS
+    TrackingFilter.NON_PERSON_ONLY -> label != "person"
 }
 
 /** Check if a point falls inside the rect with padding on all sides. */
