@@ -404,6 +404,7 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                         onToggleTranslation = { viewModel.toggleTranslationEis() },
                         onToggleLeash = { viewModel.toggleLeash() },
                         onToggleOis = { viewModel.toggleOisCompensation() },
+                        onHapticStrengthChange = { viewModel.setHapticStrength(it) },
                         onDismiss = { showDebugSheet = false }
                     )
                 }
@@ -919,6 +920,7 @@ private fun DebugBottomSheet(
     onToggleTranslation: () -> Unit,
     onToggleLeash: () -> Unit,
     onToggleOis: () -> Unit,
+    onHapticStrengthChange: (Float) -> Unit,
     onDismiss: () -> Unit
 ) {
     ModalBottomSheet(
@@ -980,6 +982,48 @@ private fun DebugBottomSheet(
                 SettingRow("Translation Correction", uiState.translationEis, onToggleTranslation)
                 SettingRow("Leash", uiState.leashEnabled, onToggleLeash)
                 SettingRow("OIS Compensation", uiState.oisCompensation, onToggleOis)
+            }
+
+            Spacer(Modifier.height(8.dp))
+
+            Text(
+                text = "HAPTICS",
+                color = Color.White.copy(alpha = 0.4f),
+                fontSize = 11.sp,
+                fontWeight = FontWeight.SemiBold,
+                letterSpacing = 1.5.sp,
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp)
+            )
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 24.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    "Strength",
+                    color = Color.White,
+                    fontSize = 14.sp,
+                    modifier = Modifier.weight(0.35f)
+                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.weight(0.65f)
+                ) {
+                    Text("Off", color = Color.White.copy(alpha = 0.35f), fontSize = 11.sp)
+                    Slider(
+                        value = uiState.hapticStrength,
+                        onValueChange = onHapticStrengthChange,
+                        modifier = Modifier.weight(1f).height(32.dp),
+                        colors = SliderDefaults.colors(
+                            thumbColor = Color.White,
+                            activeTrackColor = Color.White.copy(alpha = 0.5f),
+                            inactiveTrackColor = Color.White.copy(alpha = 0.12f)
+                        )
+                    )
+                    Text("Max", color = Color.White.copy(alpha = 0.35f), fontSize = 11.sp)
+                }
             }
         }
     }

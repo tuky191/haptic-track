@@ -273,6 +273,12 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         toggleRecording()
     }
 
+    fun setHapticStrength(strength: Float) {
+        val clamped = strength.coerceIn(0f, 1f)
+        hapticManager.strength = clamped
+        _uiState.update { it.copy(hapticStrength = clamped) }
+    }
+
     fun cycleTrackingFilter() {
         val next = when (_uiState.value.trackingFilter) {
             TrackingFilter.ALL -> TrackingFilter.PERSON_ONLY
@@ -368,7 +374,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         zoomController.reset()
         hapticManager.updateTrackingStatus(TrackingStatus.IDLE)
         _uiState.update {
-            TrackingUiState(status = TrackingStatus.IDLE, isRecording = false, captureMode = it.captureMode, stealthMode = it.stealthMode, isReady = it.isReady, ispStabilization = it.ispStabilization, gyroEis = it.gyroEis, gyroStrength = it.gyroStrength, adaptiveEis = it.adaptiveEis, leashEnabled = it.leashEnabled, oisCompensation = it.oisCompensation, translationEis = it.translationEis, trackingFilter = it.trackingFilter)
+            TrackingUiState(status = TrackingStatus.IDLE, isRecording = false, captureMode = it.captureMode, stealthMode = it.stealthMode, isReady = it.isReady, ispStabilization = it.ispStabilization, gyroEis = it.gyroEis, gyroStrength = it.gyroStrength, adaptiveEis = it.adaptiveEis, leashEnabled = it.leashEnabled, oisCompensation = it.oisCompensation, translationEis = it.translationEis, trackingFilter = it.trackingFilter, hapticStrength = it.hapticStrength)
         }
     }
 

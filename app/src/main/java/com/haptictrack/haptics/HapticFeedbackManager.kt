@@ -20,13 +20,13 @@ class HapticFeedbackManager(context: Context) {
     companion object {
         private const val DEAD_ZONE = 0.05f
         private const val URGENCY_RANGE = 0.45f
-        private const val INTERVAL_MIN_MS = 180f
-        private const val INTERVAL_MAX_MS = 900f
-        private const val AMP_MIN = 20f
-        private const val AMP_MAX = 180f
-        private const val PULSE_MIN_MS = 35f
-        private const val PULSE_MAX_MS = 70f
-        private const val DOUBLE_PULSE_GAP_MS = 50L
+
+        // Geiger: fastest at center, slowest at edge
+        private const val INTERVAL_CENTER_MS = 120f
+        private const val INTERVAL_EDGE_MS = 800f
+        private const val PULSE_MS = 25L
+
+        private const val DOUBLE_PULSE_GAP_MS = 45L
     }
 
     private val vibrator: Vibrator = run {
@@ -41,6 +41,9 @@ class HapticFeedbackManager(context: Context) {
     @Volatile private var driftX: Float = 0f
     @Volatile private var driftY: Float = 0f
 
+    /** Vibration amplitude 0.0–1.0. Controls how strong each click feels, not frequency. */
+    @Volatile var strength: Float = 0.5f
+
     @Synchronized
     fun updateTrackingStatus(status: TrackingStatus, driftX: Float = 0f, driftY: Float = 0f) {
         this.driftX = driftX
@@ -53,46 +56,38 @@ class HapticFeedbackManager(context: Context) {
         vibrator.cancel()
 
         when (status) {
-            TrackingStatus.LOCKED -> heartbeatJob = scope.launch { lockedHeartbeat() }
-            TrackingStatus.LOST -> heartbeatJob = scope.launch { lostHeartbeat() }
-            TrackingStatus.SEARCHING -> heartbeatJob = scope.launch { lostHeartbeat() }
+            TrackingStatus.LOCKED -> heartbeatJob = scope.launch { geigerLoop() }
+            TrackingStatus.LOST -> {}
+            TrackingStatus.SEARCHING -> {}
             TrackingStatus.IDLE -> {}
         }
     }
 
-    private suspend fun CoroutineScope.lockedHeartbeat() {
+    private suspend fun CoroutineScope.geigerLoop() {
         while (isActive) {
             val dx = abs(driftX)
             val dy = abs(driftY)
             val edgeProximity = maxOf(dx, dy).coerceIn(0f, 1f)
             val horizontalDominant = dx >= dy
 
-            val urgency = ((edgeProximity - DEAD_ZONE) / URGENCY_RANGE).coerceIn(0f, 1f)
+            // 1.0 at center, 0.0 at edge
+            val centering = 1f - ((edgeProximity - DEAD_ZONE) / URGENCY_RANGE).coerceIn(0f, 1f)
 
-            val intervalMs = lerp(INTERVAL_MAX_MS, INTERVAL_MIN_MS, urgency).toLong()
-            val amplitude = lerp(AMP_MIN, AMP_MAX, urgency).toInt().coerceIn(1, 255)
-            val pulseDuration = lerp(PULSE_MIN_MS, PULSE_MAX_MS, urgency).toLong()
+            // Geiger: fast clicks when centered, slow when drifting
+            val intervalMs = lerp(INTERVAL_EDGE_MS, INTERVAL_CENTER_MS, centering).toLong()
+            val amp = (strength * 255f).toInt().coerceIn(1, 255)
 
-            if (!horizontalDominant && urgency > 0.05f) {
-                val tapAmp = (amplitude * 0.7f).toInt().coerceIn(1, 255)
-                vibrator.vibrate(VibrationEffect.createOneShot(pulseDuration, tapAmp))
-                delay(pulseDuration + DOUBLE_PULSE_GAP_MS)
-                vibrator.vibrate(VibrationEffect.createOneShot(pulseDuration, amplitude))
-                // Subtract double-pulse overhead so total cycle matches single-pulse
-                delay(maxOf(intervalMs - pulseDuration - DOUBLE_PULSE_GAP_MS, 30L))
+            if (!horizontalDominant && centering < 0.95f) {
+                // Double click — vertical drift dominates
+                vibrator.vibrate(VibrationEffect.createOneShot(PULSE_MS, (amp * 0.7f).toInt().coerceIn(1, 255)))
+                delay(PULSE_MS + DOUBLE_PULSE_GAP_MS)
+                vibrator.vibrate(VibrationEffect.createOneShot(PULSE_MS, amp))
+                delay(maxOf(intervalMs - PULSE_MS - DOUBLE_PULSE_GAP_MS, 30L))
             } else {
-                vibrator.vibrate(VibrationEffect.createOneShot(pulseDuration, amplitude))
+                // Single click — centered or horizontal drift
+                vibrator.vibrate(VibrationEffect.createOneShot(PULSE_MS, amp))
                 delay(intervalMs)
             }
-        }
-    }
-
-    private suspend fun CoroutineScope.lostHeartbeat() {
-        while (isActive) {
-            vibrator.vibrate(VibrationEffect.createOneShot(30, 50))
-            delay(100)
-            vibrator.vibrate(VibrationEffect.createOneShot(30, 50))
-            delay(1400)
         }
     }
 
