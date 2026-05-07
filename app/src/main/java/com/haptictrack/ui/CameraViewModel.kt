@@ -18,6 +18,7 @@ import com.haptictrack.tracking.TrackingStatus
 import com.haptictrack.tracking.TrackingUiState
 import com.haptictrack.tracking.CaptureMode
 import com.haptictrack.tracking.TrackingFilter
+import com.haptictrack.tracking.labelMatchesFilter
 import com.haptictrack.zoom.ZoomController
 import java.io.File
 import java.text.SimpleDateFormat
@@ -114,14 +115,12 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
                 hapticManager.updateTrackingStatus(status, edgeProximity)
 
-                val rawDisplayObjects = if (status == TrackingStatus.IDLE) {
+                val displayObjects = if (status == TrackingStatus.IDLE) {
                     smoothIdleDetections(allObjects)
                 } else {
                     recentDetections.clear()
                     allObjects
                 }
-
-                val displayObjects = rawDisplayObjects
 
                 _uiState.update { current ->
                     current.copy(
@@ -179,7 +178,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         // When multiple boxes overlap at the tap point, pick the smallest (most specific).
         val filter = _uiState.value.trackingFilter
         val tapped = objects
-            .filter { it.id >= 0 && matchesFilter(it.label, filter) && it.boundingBox.containsWithPadding(normalizedX, normalizedY, TAP_PADDING) }
+            .filter { it.id >= 0 && labelMatchesFilter(it.label, filter) && it.boundingBox.containsWithPadding(normalizedX, normalizedY, TAP_PADDING) }
             .minByOrNull { it.boundingBox.width() * it.boundingBox.height() }
 
         if (tapped != null) {
@@ -257,7 +256,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         }
 
         // Idle → lock on center + start recording
-        val objects = state.detectedObjects.filter { it.id >= 0 && matchesFilter(it.label, state.trackingFilter) }
+        val objects = state.detectedObjects.filter { it.id >= 0 && labelMatchesFilter(it.label, state.trackingFilter) }
         if (objects.isEmpty()) return
 
         val closest = objects.minByOrNull { obj ->
@@ -408,18 +407,6 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         cameraManager.shutdown()
         if (recordingManager.isRecording) recordingManager.stopRecording()
     }
-}
-
-private val ANIMAL_LABELS = setOf(
-    "cat", "dog", "bird", "horse", "sheep", "cow",
-    "elephant", "bear", "zebra", "giraffe"
-)
-
-private fun matchesFilter(label: String?, filter: TrackingFilter): Boolean = when (filter) {
-    TrackingFilter.ALL -> true
-    TrackingFilter.PERSON_ONLY -> label == "person"
-    TrackingFilter.PETS -> label in ANIMAL_LABELS
-    TrackingFilter.NON_PERSON_ONLY -> label != "person"
 }
 
 /** Check if a point falls inside the rect with padding on all sides. */

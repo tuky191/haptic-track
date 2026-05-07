@@ -84,6 +84,7 @@ import com.google.accompanist.permissions.rememberMultiplePermissionsState
 import com.haptictrack.tracking.CaptureMode
 import com.haptictrack.tracking.TrackingFilter
 import com.haptictrack.tracking.TrackingStatus
+import com.haptictrack.tracking.labelMatchesFilter
 import com.haptictrack.tracking.TrackingUiState
 import com.haptictrack.ui.theme.HapticAmber
 import com.haptictrack.ui.theme.HapticCyan
@@ -444,9 +445,7 @@ private fun TopBar(
         }
 
         // Center: zoom pill
-        if (zoomAlpha > 0.01f) {
-            ZoomPill(zoomRatio, zoomAlpha)
-        }
+        ZoomPill(zoomRatio, zoomAlpha)
 
         // Right: settings gear
         Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.CenterEnd) {
@@ -787,18 +786,6 @@ private fun CircleIconButton(
 // ---------------------------------------------------------------------------
 // Tracking Overlay
 // ---------------------------------------------------------------------------
-
-private val ANIMAL_LABELS_UI = setOf(
-    "cat", "dog", "bird", "horse", "sheep", "cow",
-    "elephant", "bear", "zebra", "giraffe"
-)
-
-private fun labelMatchesFilter(label: String?, filter: TrackingFilter): Boolean = when (filter) {
-    TrackingFilter.ALL -> true
-    TrackingFilter.PERSON_ONLY -> label == "person"
-    TrackingFilter.PETS -> label in ANIMAL_LABELS_UI
-    TrackingFilter.NON_PERSON_ONLY -> label != "person"
-}
 
 @Composable
 private fun TrackingOverlay(
