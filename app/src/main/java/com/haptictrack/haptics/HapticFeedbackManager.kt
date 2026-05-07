@@ -65,26 +65,28 @@ class HapticFeedbackManager(context: Context) {
 
     private suspend fun CoroutineScope.geigerLoop() {
         while (isActive) {
+            val currentStrength = strength
+            if (currentStrength <= 0f) {
+                delay(100L)
+                continue
+            }
+
             val dx = abs(driftX)
             val dy = abs(driftY)
             val edgeProximity = maxOf(dx, dy).coerceIn(0f, 1f)
             val horizontalDominant = dx >= dy
 
-            // 1.0 at center, 0.0 at edge
             val centering = 1f - ((edgeProximity - DEAD_ZONE) / URGENCY_RANGE).coerceIn(0f, 1f)
 
-            // Geiger: fast clicks when centered, slow when drifting
             val intervalMs = lerp(INTERVAL_EDGE_MS, INTERVAL_CENTER_MS, centering).toLong()
-            val amp = (strength * 255f).toInt().coerceIn(1, 255)
+            val amp = (currentStrength * 255f).toInt().coerceIn(1, 255)
 
             if (!horizontalDominant && centering < 0.95f) {
-                // Double click — vertical drift dominates
                 vibrator.vibrate(VibrationEffect.createOneShot(PULSE_MS, (amp * 0.7f).toInt().coerceIn(1, 255)))
                 delay(PULSE_MS + DOUBLE_PULSE_GAP_MS)
                 vibrator.vibrate(VibrationEffect.createOneShot(PULSE_MS, amp))
-                delay(maxOf(intervalMs - PULSE_MS - DOUBLE_PULSE_GAP_MS, 30L))
+                delay(maxOf(intervalMs - PULSE_MS * 2 - DOUBLE_PULSE_GAP_MS, 30L))
             } else {
-                // Single click — centered or horizontal drift
                 vibrator.vibrate(VibrationEffect.createOneShot(PULSE_MS, amp))
                 delay(intervalMs)
             }
