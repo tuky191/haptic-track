@@ -15,6 +15,25 @@ enum class CaptureMode {
     PHOTO
 }
 
+enum class TrackingFilter {
+    ALL,
+    PERSON_ONLY,
+    PETS,
+    NON_PERSON_ONLY
+}
+
+private val ANIMAL_LABELS = setOf(
+    "cat", "dog", "bird", "horse", "sheep", "cow",
+    "elephant", "bear", "zebra", "giraffe"
+)
+
+fun labelMatchesFilter(label: String?, filter: TrackingFilter): Boolean = when (filter) {
+    TrackingFilter.ALL -> true
+    TrackingFilter.PERSON_ONLY -> label == "person"
+    TrackingFilter.PETS -> label in ANIMAL_LABELS
+    TrackingFilter.NON_PERSON_ONLY -> label != "person"
+}
+
 data class TrackedObject(
     val id: Int,
     val boundingBox: RectF,
@@ -80,5 +99,7 @@ data class TrackingUiState(
     /** OIS compensation active (scale correction to avoid overcorrecting). */
     val oisCompensation: Boolean = true,
     /** Optical-flow translation correction on top of gyro rotation EIS. */
-    val translationEis: Boolean = true
+    val translationEis: Boolean = true,
+    /** Which object categories to show and allow tracking. */
+    val trackingFilter: TrackingFilter = TrackingFilter.ALL
 )

@@ -4,86 +4,99 @@ import android.graphics.RectF
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import androidx.camera.view.PreviewView
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.PathEffect
-import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.StrokeJoin
-import androidx.compose.ui.graphics.asAndroidPath
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.DrawScope
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.foundation.Image
-import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.pointerInteropFilter
-import kotlin.math.abs
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
-import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
-import com.haptictrack.tracking.CaptureMode
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.rememberMultiplePermissionsState
-import com.haptictrack.tracking.TrackedObject
+import com.haptictrack.tracking.CaptureMode
+import com.haptictrack.tracking.TrackingFilter
 import com.haptictrack.tracking.TrackingStatus
+import com.haptictrack.tracking.labelMatchesFilter
 import com.haptictrack.tracking.TrackingUiState
 import com.haptictrack.ui.theme.HapticAmber
 import com.haptictrack.ui.theme.HapticCyan
 import com.haptictrack.ui.theme.HapticGreen
 import com.haptictrack.ui.theme.HapticRed
+import kotlin.math.abs
 import kotlinx.coroutines.delay
 
-/**
- * Computes the FILL_CENTER transform: scale + offset to map normalized image
- * coordinates (0..1) to screen pixel coordinates.
- */
+// ---------------------------------------------------------------------------
+// Coordinate Transform (FILL_CENTER)
+// ---------------------------------------------------------------------------
+
 private data class FillCenterTransform(
     val scale: Float,
     val offsetX: Float,
@@ -131,6 +144,10 @@ private fun FillCenterTransform.toNormalizedX(screenX: Float): Float =
 private fun FillCenterTransform.toNormalizedY(screenY: Float): Float =
     (screenY - offsetY) / mappedHeight
 
+// ---------------------------------------------------------------------------
+// Main Screen
+// ---------------------------------------------------------------------------
+
 @OptIn(ExperimentalPermissionsApi::class, ExperimentalComposeUiApi::class)
 @Composable
 fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
@@ -158,12 +175,10 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
 
         // --- Animations ---
 
-        // Lock pulse: scale 0.92 → 1.0 on lock/re-acquire
         val lockPulse = remember { Animatable(1f) }
         var previousStatus by remember { mutableStateOf(TrackingStatus.IDLE) }
         var previousLockedId by remember { mutableStateOf<Int?>(null) }
 
-        // Re-acquire flash color blend (0 = green, 1 = cyan)
         var reacquireBrightness by remember { mutableStateOf(0f) }
         val reacquireColorBlend by animateFloatAsState(
             targetValue = reacquireBrightness,
@@ -171,7 +186,6 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
             label = "reacquireColor"
         )
 
-        // Lost fade-out: opacity decays from 1.0 → 0.0 over 2s
         val lostOpacity by animateFloatAsState(
             targetValue = if (uiState.status == TrackingStatus.LOST) 0f else 1f,
             animationSpec = tween(
@@ -181,7 +195,6 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
             label = "lostFade"
         )
 
-        // Bracket opacity: smooth transition between states
         val bracketOpacity by animateFloatAsState(
             targetValue = when (uiState.status) {
                 TrackingStatus.LOCKED -> 1f
@@ -201,13 +214,11 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
             val idChanged = currentId != null && currentId != previousLockedId && uiState.status == TrackingStatus.LOCKED
 
             if (justLocked || justReacquired || idChanged) {
-                // Lock pulse: scale down then back
                 lockPulse.snapTo(0.92f)
                 lockPulse.animateTo(1f, tween(200, easing = FastOutSlowInEasing))
             }
 
             if (justReacquired) {
-                // Cyan flash → green
                 reacquireBrightness = 1f
                 delay(300)
                 reacquireBrightness = 0f
@@ -223,12 +234,25 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
             if (uiState.showZoomIndicator) {
                 zoomIndicatorOpacity.snapTo(1f)
             } else {
-                // Fade out over 500ms
                 zoomIndicatorOpacity.animateTo(0f, tween(500, easing = FastOutSlowInEasing))
             }
         }
 
-        // Pinch-to-zoom detector — lives outside recomposition
+        // --- Recording timer ---
+        var elapsedSeconds by remember { mutableIntStateOf(0) }
+        LaunchedEffect(uiState.isRecording) {
+            if (uiState.isRecording) {
+                elapsedSeconds = 0
+                while (true) {
+                    delay(1000L)
+                    elapsedSeconds++
+                }
+            } else {
+                elapsedSeconds = 0
+            }
+        }
+
+        // --- Pinch-to-zoom ---
         val scaleDetector = remember {
             ScaleGestureDetector(context, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
                 override fun onScale(detector: ScaleGestureDetector): Boolean {
@@ -236,24 +260,22 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                     return true
                 }
                 override fun onScaleEnd(detector: ScaleGestureDetector) {
-                    // Start the fade-out after a short hold
                     viewModel.hideZoomIndicator()
                 }
             })
         }
-        // Track whether a scale gesture is in progress to suppress tap-on-release
         var isScaling by remember { mutableStateOf(false) }
 
+        // --- Debug sheet ---
+        var showDebugSheet by remember { mutableStateOf(false) }
+
         Box(modifier = Modifier.fillMaxSize()) {
-            // Camera preview (always full size — getBitmap needs rendered pixels)
+            // Camera preview (hidden — surface routed to SurfaceTextureFrameReader)
             AndroidView(
                 factory = { previewView },
                 modifier = Modifier
                     .fillMaxSize()
                     .pointerInteropFilter { event ->
-                        // In stealth mode, swallow all touches — the volume-up key is
-                        // the only way in/out. Prevents accidental taps from locking or
-                        // exiting stealth.
                         if (uiState.stealthMode) return@pointerInteropFilter true
 
                         scaleDetector.onTouchEvent(event)
@@ -288,9 +310,7 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                     }
             )
 
-            // Viewfinder from SurfaceTexture GL thread — always active.
-            // Preview surface goes to SurfaceTextureFrameReader, so PreviewView
-            // shows nothing. We render the GL viewfinder bitmap instead.
+            // Viewfinder from SurfaceTexture GL thread
             if (!uiState.stealthMode) {
                 val viewfinderBmp by viewModel.viewfinderBitmap.collectAsStateWithLifecycle()
                 viewfinderBmp?.let { bmp ->
@@ -303,124 +323,80 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                 }
             }
 
-            // Stealth mode: black overlay (analysis runs via SurfaceTexture, no viewfinder)
+            // Stealth overlay
             if (uiState.stealthMode) {
                 Box(modifier = Modifier.fillMaxSize().background(Color.Black))
             }
 
-            // Loading overlay while ML models initialize on GPU
+            // Loading overlay
             if (!uiState.isReady) {
                 Box(
                     modifier = Modifier.fillMaxSize().background(Color.Black),
                     contentAlignment = Alignment.Center
                 ) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        CircularProgressIndicator(color = Color.White)
+                        CircularProgressIndicator(color = Color.White, strokeWidth = 2.dp)
                         Spacer(modifier = Modifier.height(16.dp))
-                        Text(uiState.loadingStatus, color = Color.White, fontSize = 14.sp)
+                        Text(uiState.loadingStatus, color = Color.White.copy(alpha = 0.7f), fontSize = 13.sp)
                     }
                 }
             }
 
-            // In stealth mode, show nothing — completely black screen.
-            // Volume-up toggles stealth. Volume-down runs the lock → record →
-            // stop+clear cycle. Touches are swallowed by the preview handler.
             if (!uiState.stealthMode) {
-                // Bounding box / contour overlay
+                // Tracking overlay (bounding boxes)
                 TrackingOverlay(
                     state = uiState,
                     bracketOpacity = bracketOpacity,
                     lockScale = lockPulse.value,
                     reacquireColorBlend = reacquireColorBlend,
-                    lostOpacity = lostOpacity
+                    lostOpacity = lostOpacity,
+                    trackingFilter = uiState.trackingFilter
                 )
 
-                // Label overlay (locked object only — kept for testing, remove later)
-                LockedLabelOverlay(uiState)
-
-                // Status indicator
-                StatusBadge(
-                    state = uiState,
-                    modifier = Modifier
-                        .align(Alignment.TopCenter)
-                        .padding(top = 64.dp)
-                )
-
-                // Zoom level indicator — always visible when tracking, fades after pinch otherwise
+                // Top HUD
                 val showZoomAlways = uiState.status == TrackingStatus.LOCKED || uiState.status == TrackingStatus.LOST
                 val zoomAlpha = if (showZoomAlways) 1f else zoomIndicatorOpacity.value
-                if (zoomAlpha > 0.01f) {
-                    Text(
-                        text = "×${"%.1f".format(uiState.currentZoomRatio)}",
-                        color = Color.White.copy(alpha = zoomAlpha),
-                        fontSize = 16.sp,
-                        fontWeight = FontWeight.Medium,
-                        modifier = Modifier
-                            .align(Alignment.TopCenter)
-                            .padding(top = 100.dp)
-                            .background(
-                                Color.Black.copy(alpha = 0.5f * zoomAlpha),
-                                RoundedCornerShape(16.dp)
-                            )
-                            .padding(horizontal = 12.dp, vertical = 4.dp)
+
+                Column(
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .fillMaxWidth()
+                        .statusBarsPadding(),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    TopBar(
+                        isRecording = uiState.isRecording,
+                        elapsedSeconds = elapsedSeconds,
+                        zoomRatio = uiState.currentZoomRatio,
+                        zoomAlpha = zoomAlpha,
+                        onSettingsClick = { showDebugSheet = true }
+                    )
+                    StatusIndicator(
+                        status = uiState.status,
+                        label = uiState.trackedObject?.label
                     )
                 }
 
-                // Capture mode selector (swipeable)
-                CaptureModePill(
-                    captureMode = uiState.captureMode,
-                    onToggle = { viewModel.toggleCaptureMode() },
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(bottom = 132.dp)
-                )
-
-                // Record button
-                RecordButton(
+                // Bottom controls
+                BottomControls(
                     isRecording = uiState.isRecording,
                     captureMode = uiState.captureMode,
-                    onClick = { viewModel.toggleRecording() },
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(bottom = 48.dp)
+                    trackingFilter = uiState.trackingFilter,
+                    showFlip = uiState.status == TrackingStatus.IDLE,
+                    showClear = uiState.status != TrackingStatus.IDLE,
+                    isIdle = uiState.status == TrackingStatus.IDLE,
+                    onShutterClick = { viewModel.toggleRecording() },
+                    onFlipClick = { viewModel.switchCamera() },
+                    onClearClick = { viewModel.clearTracking() },
+                    onModeToggle = { viewModel.toggleCaptureMode() },
+                    onFilterCycle = { viewModel.cycleTrackingFilter() },
+                    modifier = Modifier.align(Alignment.BottomCenter)
                 )
 
-                // Clear tracking button
-                if (uiState.status != TrackingStatus.IDLE) {
-                    Button(
-                        onClick = { viewModel.clearTracking() },
-                        modifier = Modifier
-                            .align(Alignment.TopEnd)
-                            .padding(top = 64.dp, end = 16.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color.Black.copy(alpha = 0.5f))
-                    ) {
-                        Text("Clear", color = Color.White)
-                    }
-                }
-
-                // Switch camera button
-                if (uiState.status == TrackingStatus.IDLE) {
-                    Button(
-                        onClick = { viewModel.switchCamera() },
-                        modifier = Modifier
-                            .align(Alignment.TopStart)
-                            .padding(top = 64.dp, start = 16.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color.Black.copy(alpha = 0.5f))
-                    ) {
-                        Text("\u21BB", color = Color.White, fontSize = 18.sp)
-                    }
-                }
-
-                // Stabilization toggles (idle only)
-                if (uiState.status == TrackingStatus.IDLE) {
-                    StabilizationToggles(
-                        ispEnabled = uiState.ispStabilization,
-                        gyroEnabled = uiState.gyroEis,
-                        gyroStrength = uiState.gyroStrength,
-                        adaptiveEnabled = uiState.adaptiveEis,
-                        translationEnabled = uiState.translationEis,
-                        leashEnabled = uiState.leashEnabled,
-                        oisEnabled = uiState.oisCompensation,
+                // Debug bottom sheet
+                if (showDebugSheet) {
+                    DebugBottomSheet(
+                        uiState = uiState,
                         onToggleIsp = { viewModel.toggleIspStabilization() },
                         onToggleGyro = { viewModel.toggleGyroEis() },
                         onGyroStrengthChange = { viewModel.setGyroStrength(it) },
@@ -428,312 +404,273 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                         onToggleTranslation = { viewModel.toggleTranslationEis() },
                         onToggleLeash = { viewModel.toggleLeash() },
                         onToggleOis = { viewModel.toggleOisCompensation() },
-                        modifier = Modifier
-                            .align(Alignment.TopStart)
-                            .padding(top = 110.dp, start = 16.dp)
+                        onDismiss = { showDebugSheet = false }
                     )
                 }
-
-                // Stealth mode is toggled by volume-up (see MainActivity) — no button.
             }
         }
     } else {
         LaunchedEffect(Unit) {
             permissions.launchMultiplePermissionRequest()
         }
-        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Text("Camera and microphone permissions required", color = Color.White)
+        Box(modifier = Modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) {
+            Text("Camera and microphone permissions required", color = Color.White.copy(alpha = 0.7f), fontSize = 14.sp)
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Bounding Box Overlay
+// Top Bar
 // ---------------------------------------------------------------------------
 
 @Composable
-private fun TrackingOverlay(
-    state: TrackingUiState,
-    bracketOpacity: Float,
-    lockScale: Float,
-    reacquireColorBlend: Float,
-    lostOpacity: Float
-) {
-    val isLocked = state.status == TrackingStatus.LOCKED
-    val isLost = state.status == TrackingStatus.LOST
-    val isIdle = state.status == TrackingStatus.IDLE
-    val hasContour = state.lockedContour.size >= 3
-
-    Canvas(modifier = Modifier.fillMaxSize()) {
-        val transform = computeFillCenterTransform(
-            size.width, size.height,
-            state.sourceImageWidth, state.sourceImageHeight
-        )
-
-        if (isIdle) {
-            state.detectedObjects.forEach { obj ->
-                drawIdleBrackets(obj.boundingBox, transform, bracketOpacity)
-            }
-        } else if (isLocked && state.trackedObject != null) {
-            val color = lerp(HapticGreen, HapticCyan, reacquireColorBlend)
-                .copy(alpha = bracketOpacity)
-
-            val box = state.trackedObject.boundingBox
-            val (left, top, right, bottom) = mapBox(box, transform)
-            val cx = (left + right) / 2f
-            val cy = (top + bottom) / 2f
-
-            scale(lockScale, pivot = Offset(cx, cy)) {
-                drawRoundedGlow(left, top, right, bottom, color)
-            }
-        } else if (isLost && state.trackedObject != null && lostOpacity > 0.01f) {
-            val color = HapticRed.copy(alpha = lostOpacity * 0.7f)
-            val (ll, lt, lr, lb) = mapBox(state.trackedObject.boundingBox, transform)
-            drawRoundedGlow(ll, lt, lr, lb, color)
-        }
-    }
-}
-
-// Cached Paint objects for glow rendering — avoids allocation on every frame.
-// Color/alpha updated per-frame; BlurMaskFilter is reused.
-private val outerGlowPaint = android.graphics.Paint().apply {
-    style = android.graphics.Paint.Style.STROKE
-    isAntiAlias = true
-    strokeWidth = 30f
-    maskFilter = android.graphics.BlurMaskFilter(40f, android.graphics.BlurMaskFilter.Blur.NORMAL)
-}
-
-private val innerGlowPaint = android.graphics.Paint().apply {
-    style = android.graphics.Paint.Style.STROKE
-    isAntiAlias = true
-    strokeWidth = 15f
-    maskFilter = android.graphics.BlurMaskFilter(20f, android.graphics.BlurMaskFilter.Blur.NORMAL)
-}
-
-/**
- * Draw a soft glowing rounded rectangle — backlight effect around the object.
- * Thick blurred strokes dissolve into diffused light. No fill = interior stays clear.
- */
-private fun DrawScope.drawRoundedGlow(
-    left: Float, top: Float, right: Float, bottom: Float,
-    color: Color
-) {
-    val nativeCanvas = drawContext.canvas.nativeCanvas
-    val w = right - left
-    val h = bottom - top
-    val cornerRadius = minOf(w, h) * 0.25f
-    val rect = android.graphics.RectF(left, top, right, bottom)
-
-    outerGlowPaint.color = color.copy(alpha = color.alpha * 0.20f).toArgb()
-    nativeCanvas.drawRoundRect(rect, cornerRadius, cornerRadius, outerGlowPaint)
-
-    innerGlowPaint.color = color.copy(alpha = color.alpha * 0.30f).toArgb()
-    nativeCanvas.drawRoundRect(rect, cornerRadius, cornerRadius, innerGlowPaint)
-}
-
-/** Compute stroke width that scales with box size, clamped to [2, 6] px. */
-private fun scaledStroke(boxWidthPx: Float, boxHeightPx: Float): Float {
-    return (minOf(boxWidthPx, boxHeightPx) * 0.008f).coerceIn(2f, 6f)
-}
-
-/** Map a normalized box to screen pixel coordinates, clamped to canvas bounds. */
-private fun DrawScope.mapBox(
-    box: RectF,
-    transform: FillCenterTransform
-): FloatArray {
-    return floatArrayOf(
-        transform.toScreenX(box.left).coerceIn(0f, size.width),
-        transform.toScreenY(box.top).coerceIn(0f, size.height),
-        transform.toScreenX(box.right).coerceIn(0f, size.width),
-        transform.toScreenY(box.bottom).coerceIn(0f, size.height)
-    )
-}
-
-/**
- * Draw brackets from pre-computed screen coordinates with shadow.
- */
-private fun DrawScope.drawBracketsRaw(
-    left: Float, top: Float, right: Float, bottom: Float,
-    color: Color
-) {
-    val w = right - left
-    val h = bottom - top
-    val cornerLen = minOf(w, h) * 0.2f
-    val stroke = scaledStroke(w, h)
-
-    // Shadow pass
-    val shadow = Color.Black.copy(alpha = color.alpha * 0.4f)
-    val so = 1.5f
-    drawBracketLines(left + so, top + so, right + so, bottom + so, cornerLen, shadow, stroke)
-
-    // Color pass
-    drawBracketLines(left, top, right, bottom, cornerLen, color, stroke)
-}
-
-/**
- * Draw camera-viewfinder-style corner brackets with shadow.
- */
-private fun DrawScope.drawBrackets(
-    box: RectF,
-    transform: FillCenterTransform,
-    color: Color
-) {
-    val (left, top, right, bottom) = mapBox(box, transform)
-    drawBracketsRaw(left, top, right, bottom, color)
-}
-
-/**
- * Draw dashed corner brackets (for lost state — fading out).
- */
-private fun DrawScope.drawDashedBrackets(
-    box: RectF,
-    transform: FillCenterTransform,
-    color: Color
-) {
-    val (left, top, right, bottom) = mapBox(box, transform)
-    val w = right - left
-    val h = bottom - top
-    val cornerLen = minOf(w, h) * 0.2f
-    val stroke = scaledStroke(w, h)
-    val dashEffect = PathEffect.dashPathEffect(floatArrayOf(8f, 6f), 0f)
-
-    drawBracketLines(left, top, right, bottom, cornerLen, color, stroke, dashEffect)
-}
-
-/**
- * Draw the eight bracket line segments (two per corner).
- */
-private fun DrawScope.drawBracketLines(
-    left: Float, top: Float, right: Float, bottom: Float,
-    cornerLen: Float, color: Color, strokeWidth: Float,
-    pathEffect: PathEffect? = null
-) {
-    drawLine(color, Offset(left, top), Offset(left + cornerLen, top), strokeWidth, pathEffect = pathEffect)
-    drawLine(color, Offset(left, top), Offset(left, top + cornerLen), strokeWidth, pathEffect = pathEffect)
-    drawLine(color, Offset(right, top), Offset(right - cornerLen, top), strokeWidth, pathEffect = pathEffect)
-    drawLine(color, Offset(right, top), Offset(right, top + cornerLen), strokeWidth, pathEffect = pathEffect)
-    drawLine(color, Offset(left, bottom), Offset(left + cornerLen, bottom), strokeWidth, pathEffect = pathEffect)
-    drawLine(color, Offset(left, bottom), Offset(left, bottom - cornerLen), strokeWidth, pathEffect = pathEffect)
-    drawLine(color, Offset(right, bottom), Offset(right - cornerLen, bottom), strokeWidth, pathEffect = pathEffect)
-    drawLine(color, Offset(right, bottom), Offset(right, bottom - cornerLen), strokeWidth, pathEffect = pathEffect)
-}
-
-/**
- * Draw thin corner brackets for idle detections — shows what's tappable.
- */
-private fun DrawScope.drawIdleBrackets(box: RectF, transform: FillCenterTransform, opacity: Float) {
-    val (left, top, right, bottom) = mapBox(box, transform)
-    val w = right - left
-    val h = bottom - top
-    val cornerLen = minOf(w, h) * 0.15f
-    val stroke = scaledStroke(w, h) * 0.6f
-    val color = Color.White.copy(alpha = 0.5f * opacity)
-
-    drawBracketLines(left, top, right, bottom, cornerLen, color, stroke)
-}
-
-// ---------------------------------------------------------------------------
-// Label Overlay — locked object only (kept for testing, remove later)
-// ---------------------------------------------------------------------------
-
-@Composable
-private fun LockedLabelOverlay(state: TrackingUiState) {
-    if (state.status != TrackingStatus.LOCKED || state.trackedObject == null) return
-    val obj = state.trackedObject
-
-    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-        val parentWidth = constraints.maxWidth.toFloat()
-        val parentHeight = constraints.maxHeight.toFloat()
-        val density = LocalDensity.current
-        val transform = computeFillCenterTransform(
-            parentWidth, parentHeight,
-            state.sourceImageWidth, state.sourceImageHeight
-        )
-
-        val label = obj.label ?: return@BoxWithConstraints
-
-        val left = transform.toScreenX(obj.boundingBox.left)
-        val bottom = transform.toScreenY(obj.boundingBox.bottom)
-        val boxHeightPx = bottom - transform.toScreenY(obj.boundingBox.top)
-
-        val fontSize = (boxHeightPx * 0.06f).coerceIn(
-            with(density) { 10.sp.toPx() },
-            with(density) { 16.sp.toPx() }
-        )
-        val fontSizeSp = with(density) { fontSize.toSp() }
-
-        val inset = with(density) { 4.dp.toPx() }
-        val xPx = left + inset
-        val yPx = bottom - fontSize - inset * 2
-
-        Text(
-            text = label,
-            color = Color.White,
-            fontSize = fontSizeSp,
-            modifier = Modifier
-                .offset(
-                    x = with(density) { xPx.toDp() },
-                    y = with(density) { yPx.coerceAtLeast(0f).toDp() }
-                )
-                .background(Color.Black.copy(alpha = 0.5f), RoundedCornerShape(4.dp))
-                .padding(horizontal = 6.dp, vertical = 2.dp)
-        )
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Status Badge & Record Button
-// ---------------------------------------------------------------------------
-
-@Composable
-private fun StatusBadge(state: TrackingUiState, modifier: Modifier = Modifier) {
-    val lockedLabel = state.trackedObject?.label
-
-    val (text, color) = when (state.status) {
-        TrackingStatus.IDLE -> "Tap an object to track" to Color.White
-        TrackingStatus.SEARCHING -> "Searching..." to HapticAmber
-        TrackingStatus.LOCKED -> "Tracking: ${lockedLabel ?: "Object"}" to HapticGreen
-        TrackingStatus.LOST -> "Lost: ${lockedLabel ?: "Object"} — searching..." to HapticRed
-    }
-
-    Text(
-        text = text,
-        color = color,
-        style = MaterialTheme.typography.titleMedium,
-        modifier = modifier
-            .background(Color.Black.copy(alpha = 0.5f), RoundedCornerShape(8.dp))
-            .padding(horizontal = 12.dp, vertical = 6.dp)
-    )
-}
-
-@Composable
-private fun RecordButton(
+private fun TopBar(
     isRecording: Boolean,
-    captureMode: CaptureMode = CaptureMode.VIDEO,
+    elapsedSeconds: Int,
+    zoomRatio: Float,
+    zoomAlpha: Float,
+    onSettingsClick: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        // Left: recording indicator or empty space
+        Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
+            if (isRecording) {
+                RecordingIndicator(elapsedSeconds)
+            }
+        }
+
+        // Center: zoom pill
+        ZoomPill(zoomRatio, zoomAlpha)
+
+        // Right: settings gear
+        Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.CenterEnd) {
+            CircleIconButton(
+                icon = Icons.Filled.Settings,
+                contentDescription = "Settings",
+                onClick = onSettingsClick,
+                size = 40.dp
+            )
+        }
+    }
+}
+
+@Composable
+private fun RecordingIndicator(elapsedSeconds: Int) {
+    val dotAlpha = remember { Animatable(1f) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            dotAlpha.animateTo(0.3f, tween(500))
+            dotAlpha.animateTo(1f, tween(500))
+        }
+    }
+
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .background(Color.Black.copy(alpha = 0.4f), RoundedCornerShape(16.dp))
+            .padding(horizontal = 10.dp, vertical = 6.dp)
+    ) {
+        Canvas(Modifier.size(8.dp)) {
+            drawCircle(HapticRed.copy(alpha = dotAlpha.value))
+        }
+        Spacer(Modifier.width(6.dp))
+        Text(
+            text = "%02d:%02d".format(elapsedSeconds / 60, elapsedSeconds % 60),
+            color = Color.White,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.Medium,
+            fontFamily = FontFamily.Monospace
+        )
+    }
+}
+
+@Composable
+private fun ZoomPill(zoomRatio: Float, alpha: Float) {
+    Text(
+        text = "%.1f×".format(zoomRatio),
+        color = Color.White.copy(alpha = alpha),
+        fontSize = 14.sp,
+        fontWeight = FontWeight.SemiBold,
+        modifier = Modifier
+            .background(
+                Color.Black.copy(alpha = 0.4f * alpha),
+                RoundedCornerShape(16.dp)
+            )
+            .padding(horizontal = 14.dp, vertical = 6.dp)
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Status Indicator
+// ---------------------------------------------------------------------------
+
+@Composable
+private fun StatusIndicator(
+    status: TrackingStatus,
+    label: String?,
+    modifier: Modifier = Modifier
+) {
+    val (text, color) = when (status) {
+        TrackingStatus.IDLE -> "Tap to track" to Color.White.copy(alpha = 0.5f)
+        TrackingStatus.SEARCHING -> "Searching" to HapticAmber
+        TrackingStatus.LOCKED -> (if (label != null) "Tracking · $label" else "Tracking") to HapticGreen
+        TrackingStatus.LOST -> "Lost" to HapticRed
+    }
+
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = modifier
+            .padding(top = 2.dp)
+            .background(Color.Black.copy(alpha = 0.25f), RoundedCornerShape(12.dp))
+            .padding(horizontal = 10.dp, vertical = 4.dp)
+    ) {
+        if (status != TrackingStatus.IDLE) {
+            Canvas(Modifier.size(6.dp)) {
+                drawCircle(color)
+            }
+            Spacer(Modifier.width(6.dp))
+        }
+        Text(
+            text = text,
+            color = color,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Medium
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bottom Controls
+// ---------------------------------------------------------------------------
+
+@Composable
+private fun BottomControls(
+    isRecording: Boolean,
+    captureMode: CaptureMode,
+    trackingFilter: TrackingFilter,
+    showFlip: Boolean,
+    showClear: Boolean,
+    isIdle: Boolean,
+    onShutterClick: () -> Unit,
+    onFlipClick: () -> Unit,
+    onClearClick: () -> Unit,
+    onModeToggle: () -> Unit,
+    onFilterCycle: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = modifier
+            .fillMaxWidth()
+            .navigationBarsPadding()
+            .padding(bottom = 24.dp)
+    ) {
+        // Tracking filter (IDLE only)
+        if (isIdle && !isRecording) {
+            TrackingFilterPill(trackingFilter, onFilterCycle)
+            Spacer(Modifier.height(8.dp))
+        }
+
+        // Mode selector
+        if (!isRecording) {
+            CaptureModePill(captureMode, onModeToggle)
+            Spacer(Modifier.height(20.dp))
+        } else {
+            Spacer(Modifier.height(52.dp))
+        }
+
+        // Controls row: [flip] [shutter] [clear]
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 48.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (showFlip) {
+                CircleIconButton(
+                    icon = Icons.Filled.Refresh,
+                    contentDescription = "Switch camera",
+                    onClick = onFlipClick
+                )
+            } else {
+                Spacer(Modifier.size(48.dp))
+            }
+
+            ShutterButton(
+                isRecording = isRecording,
+                onClick = onShutterClick
+            )
+
+            if (showClear) {
+                CircleIconButton(
+                    icon = Icons.Filled.Close,
+                    contentDescription = "Clear tracking",
+                    onClick = onClearClick
+                )
+            } else {
+                Spacer(Modifier.size(48.dp))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shutter Button
+// ---------------------------------------------------------------------------
+
+@Composable
+private fun ShutterButton(
+    isRecording: Boolean,
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    Button(
-        onClick = onClick,
-        modifier = modifier.size(72.dp),
-        shape = CircleShape,
-        colors = ButtonDefaults.buttonColors(
-            containerColor = if (isRecording) HapticRed else Color.White
-        )
+    val innerSize by animateDpAsState(
+        targetValue = if (isRecording) 24.dp else 56.dp,
+        animationSpec = tween(200, easing = FastOutSlowInEasing),
+        label = "shutterInner"
+    )
+    val innerCorner by animateDpAsState(
+        targetValue = if (isRecording) 6.dp else 28.dp,
+        animationSpec = tween(200, easing = FastOutSlowInEasing),
+        label = "shutterCorner"
+    )
+    val innerColor by animateColorAsState(
+        targetValue = if (isRecording) HapticRed else Color.White,
+        animationSpec = tween(200),
+        label = "shutterColor"
+    )
+
+    Box(
+        modifier = modifier
+            .size(72.dp)
+            .clip(CircleShape)
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
     ) {
-        if (isRecording) {
-            Canvas(modifier = Modifier.size(24.dp)) {
-                drawRect(color = Color.White)
-            }
-        } else if (captureMode == CaptureMode.PHOTO) {
-            // Inner circle for photo mode (camera shutter style)
-            Canvas(modifier = Modifier.size(28.dp)) {
-                drawCircle(color = Color.White)
-                drawCircle(color = Color.Black.copy(alpha = 0.15f), radius = size.minDimension / 2f * 0.85f)
-            }
-        }
+        // Outer ring
+        Box(
+            Modifier
+                .fillMaxSize()
+                .border(4.dp, Color.White.copy(alpha = 0.9f), CircleShape)
+        )
+        // Inner shape (circle when idle, rounded square when recording)
+        Box(
+            Modifier
+                .size(innerSize)
+                .background(innerColor, RoundedCornerShape(innerCorner))
+        )
     }
 }
+
+// ---------------------------------------------------------------------------
+// Capture Mode Pill
+// ---------------------------------------------------------------------------
 
 @Composable
 private fun CaptureModePill(
@@ -745,7 +682,7 @@ private fun CaptureModePill(
 
     Row(
         modifier = modifier
-            .background(Color.Black.copy(alpha = 0.4f), RoundedCornerShape(16.dp))
+            .background(Color.Black.copy(alpha = 0.3f), RoundedCornerShape(16.dp))
             .padding(horizontal = 4.dp, vertical = 2.dp)
             .pointerInput(Unit) {
                 detectHorizontalDragGestures(
@@ -771,27 +708,210 @@ private fun CaptureModePill(
 private fun ModeLabel(text: String, selected: Boolean) {
     Text(
         text = text,
-        color = if (selected) Color.White else Color.White.copy(alpha = 0.5f),
+        color = if (selected) Color.White else Color.White.copy(alpha = 0.4f),
         fontSize = 12.sp,
         fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
         modifier = Modifier
             .background(
-                if (selected) Color.White.copy(alpha = 0.15f) else Color.Transparent,
+                if (selected) Color.White.copy(alpha = 0.12f) else Color.Transparent,
                 RoundedCornerShape(12.dp)
             )
-            .padding(horizontal = 12.dp, vertical = 4.dp)
+            .padding(horizontal = 14.dp, vertical = 4.dp)
     )
 }
 
+// ---------------------------------------------------------------------------
+// Tracking Filter Pill
+// ---------------------------------------------------------------------------
+
 @Composable
-private fun StabilizationToggles(
-    ispEnabled: Boolean,
-    gyroEnabled: Boolean,
-    gyroStrength: Float,
-    adaptiveEnabled: Boolean,
-    translationEnabled: Boolean,
-    leashEnabled: Boolean,
-    oisEnabled: Boolean,
+private fun TrackingFilterPill(
+    filter: TrackingFilter,
+    onCycle: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val label = when (filter) {
+        TrackingFilter.ALL -> "All"
+        TrackingFilter.PERSON_ONLY -> "People"
+        TrackingFilter.PETS -> "Pets"
+        TrackingFilter.NON_PERSON_ONLY -> "Things"
+    }
+
+    Text(
+        text = label,
+        color = when (filter) {
+            TrackingFilter.ALL -> Color.White.copy(alpha = 0.6f)
+            TrackingFilter.PERSON_ONLY -> HapticGreen
+            TrackingFilter.PETS -> HapticCyan
+            TrackingFilter.NON_PERSON_ONLY -> HapticAmber
+        },
+        fontSize = 12.sp,
+        fontWeight = FontWeight.Medium,
+        modifier = modifier
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onCycle)
+            .background(Color.Black.copy(alpha = 0.3f), RoundedCornerShape(12.dp))
+            .padding(horizontal = 14.dp, vertical = 4.dp)
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+@Composable
+private fun CircleIconButton(
+    icon: ImageVector,
+    contentDescription: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    size: Dp = 48.dp,
+    tint: Color = Color.White
+) {
+    IconButton(
+        onClick = onClick,
+        modifier = modifier
+            .size(size)
+            .background(Color.Black.copy(alpha = 0.4f), CircleShape)
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = contentDescription,
+            tint = tint,
+            modifier = Modifier.size(size * 0.5f)
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tracking Overlay
+// ---------------------------------------------------------------------------
+
+@Composable
+private fun TrackingOverlay(
+    state: TrackingUiState,
+    bracketOpacity: Float,
+    lockScale: Float,
+    reacquireColorBlend: Float,
+    lostOpacity: Float,
+    trackingFilter: TrackingFilter = TrackingFilter.ALL
+) {
+    val isLocked = state.status == TrackingStatus.LOCKED
+    val isLost = state.status == TrackingStatus.LOST
+    val isIdle = state.status == TrackingStatus.IDLE
+
+    Canvas(modifier = Modifier.fillMaxSize()) {
+        val transform = computeFillCenterTransform(
+            size.width, size.height,
+            state.sourceImageWidth, state.sourceImageHeight
+        )
+
+        if (isIdle) {
+            state.detectedObjects
+                .filter { labelMatchesFilter(it.label, trackingFilter) }
+                .forEach { obj ->
+                    drawIdleBrackets(obj.boundingBox, transform, bracketOpacity)
+                }
+        } else if (isLocked && state.trackedObject != null) {
+            val color = lerp(HapticGreen, HapticCyan, reacquireColorBlend)
+                .copy(alpha = bracketOpacity)
+
+            val box = state.trackedObject.boundingBox
+            val (left, top, right, bottom) = mapBox(box, transform)
+            val cx = (left + right) / 2f
+            val cy = (top + bottom) / 2f
+
+            scale(lockScale, pivot = Offset(cx, cy)) {
+                drawRoundedGlow(left, top, right, bottom, color)
+            }
+        } else if (isLost && state.trackedObject != null && lostOpacity > 0.01f) {
+            val color = HapticRed.copy(alpha = lostOpacity * 0.7f)
+            val (ll, lt, lr, lb) = mapBox(state.trackedObject.boundingBox, transform)
+            drawRoundedGlow(ll, lt, lr, lb, color)
+        }
+    }
+}
+
+private val outerGlowPaint = android.graphics.Paint().apply {
+    style = android.graphics.Paint.Style.STROKE
+    isAntiAlias = true
+    strokeWidth = 30f
+    maskFilter = android.graphics.BlurMaskFilter(40f, android.graphics.BlurMaskFilter.Blur.NORMAL)
+}
+
+private val innerGlowPaint = android.graphics.Paint().apply {
+    style = android.graphics.Paint.Style.STROKE
+    isAntiAlias = true
+    strokeWidth = 15f
+    maskFilter = android.graphics.BlurMaskFilter(20f, android.graphics.BlurMaskFilter.Blur.NORMAL)
+}
+
+private fun DrawScope.drawRoundedGlow(
+    left: Float, top: Float, right: Float, bottom: Float,
+    color: Color
+) {
+    val nativeCanvas = drawContext.canvas.nativeCanvas
+    val w = right - left
+    val h = bottom - top
+    val cornerRadius = minOf(w, h) * 0.25f
+    val rect = android.graphics.RectF(left, top, right, bottom)
+
+    outerGlowPaint.color = color.copy(alpha = color.alpha * 0.20f).toArgb()
+    nativeCanvas.drawRoundRect(rect, cornerRadius, cornerRadius, outerGlowPaint)
+
+    innerGlowPaint.color = color.copy(alpha = color.alpha * 0.30f).toArgb()
+    nativeCanvas.drawRoundRect(rect, cornerRadius, cornerRadius, innerGlowPaint)
+}
+
+private fun scaledStroke(boxWidthPx: Float, boxHeightPx: Float): Float {
+    return (minOf(boxWidthPx, boxHeightPx) * 0.008f).coerceIn(2f, 6f)
+}
+
+private fun DrawScope.mapBox(
+    box: RectF,
+    transform: FillCenterTransform
+): FloatArray {
+    return floatArrayOf(
+        transform.toScreenX(box.left).coerceIn(0f, size.width),
+        transform.toScreenY(box.top).coerceIn(0f, size.height),
+        transform.toScreenX(box.right).coerceIn(0f, size.width),
+        transform.toScreenY(box.bottom).coerceIn(0f, size.height)
+    )
+}
+
+private fun DrawScope.drawBracketLines(
+    left: Float, top: Float, right: Float, bottom: Float,
+    cornerLen: Float, color: Color, strokeWidth: Float
+) {
+    drawLine(color, Offset(left, top), Offset(left + cornerLen, top), strokeWidth)
+    drawLine(color, Offset(left, top), Offset(left, top + cornerLen), strokeWidth)
+    drawLine(color, Offset(right, top), Offset(right - cornerLen, top), strokeWidth)
+    drawLine(color, Offset(right, top), Offset(right, top + cornerLen), strokeWidth)
+    drawLine(color, Offset(left, bottom), Offset(left + cornerLen, bottom), strokeWidth)
+    drawLine(color, Offset(left, bottom), Offset(left, bottom - cornerLen), strokeWidth)
+    drawLine(color, Offset(right, bottom), Offset(right - cornerLen, bottom), strokeWidth)
+    drawLine(color, Offset(right, bottom), Offset(right, bottom - cornerLen), strokeWidth)
+}
+
+private fun DrawScope.drawIdleBrackets(box: RectF, transform: FillCenterTransform, opacity: Float) {
+    val (left, top, right, bottom) = mapBox(box, transform)
+    val w = right - left
+    val h = bottom - top
+    val cornerLen = minOf(w, h) * 0.15f
+    val stroke = scaledStroke(w, h) * 0.6f
+    val color = Color.White.copy(alpha = 0.5f * opacity)
+
+    drawBracketLines(left, top, right, bottom, cornerLen, color, stroke)
+}
+
+// ---------------------------------------------------------------------------
+// Debug Bottom Sheet
+// ---------------------------------------------------------------------------
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun DebugBottomSheet(
+    uiState: TrackingUiState,
     onToggleIsp: () -> Unit,
     onToggleGyro: () -> Unit,
     onGyroStrengthChange: (Float) -> Unit,
@@ -799,58 +919,93 @@ private fun StabilizationToggles(
     onToggleTranslation: () -> Unit,
     onToggleLeash: () -> Unit,
     onToggleOis: () -> Unit,
-    modifier: Modifier = Modifier
+    onDismiss: () -> Unit
 ) {
-    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        StabToggle("ISP", ispEnabled, onToggleIsp)
-        StabToggle("Gyro", gyroEnabled, onToggleGyro)
-        if (gyroEnabled) {
-            StabToggle("Adapt", adaptiveEnabled, onToggleAdaptive)
-            StabToggle("Trans", translationEnabled, onToggleTranslation)
-            StabToggle("Leash", leashEnabled, onToggleLeash)
-            StabToggle("OIS", oisEnabled, onToggleOis)
-        }
-        if (gyroEnabled) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier
-                    .background(Color.Black.copy(alpha = 0.5f), RoundedCornerShape(16.dp))
-                    .padding(horizontal = 8.dp)
-            ) {
-                Text("Lo", color = Color.White.copy(alpha = 0.6f), fontSize = 10.sp)
-                androidx.compose.material3.Slider(
-                    value = gyroStrength,
-                    onValueChange = onGyroStrengthChange,
-                    modifier = Modifier.weight(1f).height(32.dp),
-                    colors = androidx.compose.material3.SliderDefaults.colors(
-                        thumbColor = Color.White,
-                        activeTrackColor = Color.White.copy(alpha = 0.6f),
-                        inactiveTrackColor = Color.White.copy(alpha = 0.2f)
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        containerColor = Color(0xFF1A1A1A),
+        contentColor = Color.White
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 32.dp)
+        ) {
+            Text(
+                text = "STABILIZATION",
+                color = Color.White.copy(alpha = 0.4f),
+                fontSize = 11.sp,
+                fontWeight = FontWeight.SemiBold,
+                letterSpacing = 1.5.sp,
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp)
+            )
+
+            SettingRow("ISP Stabilization", uiState.ispStabilization, onToggleIsp)
+            SettingRow("Gyro EIS", uiState.gyroEis, onToggleGyro)
+
+            if (uiState.gyroEis) {
+                // Strength slider
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 24.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        "Strength",
+                        color = Color.White,
+                        fontSize = 14.sp,
+                        modifier = Modifier.weight(0.35f)
                     )
-                )
-                Text("Hi", color = Color.White.copy(alpha = 0.6f), fontSize = 10.sp)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.weight(0.65f)
+                    ) {
+                        Text("Lo", color = Color.White.copy(alpha = 0.35f), fontSize = 11.sp)
+                        Slider(
+                            value = uiState.gyroStrength,
+                            onValueChange = onGyroStrengthChange,
+                            modifier = Modifier.weight(1f).height(32.dp),
+                            colors = SliderDefaults.colors(
+                                thumbColor = Color.White,
+                                activeTrackColor = Color.White.copy(alpha = 0.5f),
+                                inactiveTrackColor = Color.White.copy(alpha = 0.12f)
+                            )
+                        )
+                        Text("Hi", color = Color.White.copy(alpha = 0.35f), fontSize = 11.sp)
+                    }
+                }
+
+                SettingRow("Adaptive Smoothing", uiState.adaptiveEis, onToggleAdaptive)
+                SettingRow("Translation Correction", uiState.translationEis, onToggleTranslation)
+                SettingRow("Leash", uiState.leashEnabled, onToggleLeash)
+                SettingRow("OIS Compensation", uiState.oisCompensation, onToggleOis)
             }
         }
     }
 }
 
 @Composable
-private fun StabToggle(label: String, enabled: Boolean, onToggle: () -> Unit) {
-    Button(
-        onClick = onToggle,
-        modifier = Modifier.height(32.dp),
-        shape = RoundedCornerShape(16.dp),
-        colors = ButtonDefaults.buttonColors(
-            containerColor = if (enabled) Color.White.copy(alpha = 0.25f)
-                             else Color.Black.copy(alpha = 0.5f)
-        ),
-        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 0.dp)
+private fun SettingRow(label: String, enabled: Boolean, onToggle: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onToggle)
+            .padding(horizontal = 24.dp, vertical = 10.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
     ) {
-        Text(
-            text = "$label ${if (enabled) "ON" else "OFF"}",
-            color = if (enabled) Color.White else Color.White.copy(alpha = 0.5f),
-            fontSize = 11.sp,
-            fontWeight = FontWeight.Medium
+        Text(label, color = Color.White, fontSize = 14.sp)
+        Switch(
+            checked = enabled,
+            onCheckedChange = { onToggle() },
+            colors = SwitchDefaults.colors(
+                checkedThumbColor = HapticGreen,
+                checkedTrackColor = HapticGreen.copy(alpha = 0.3f),
+                uncheckedThumbColor = Color.White.copy(alpha = 0.5f),
+                uncheckedTrackColor = Color.White.copy(alpha = 0.12f),
+                uncheckedBorderColor = Color.Transparent
+            )
         )
     }
 }
