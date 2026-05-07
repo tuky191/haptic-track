@@ -8,24 +8,40 @@ import com.haptictrack.tracking.TrackingStatus
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlin.math.abs
 
 class HapticFeedbackManager(context: Context) {
+
+    companion object {
+        private const val DEAD_ZONE = 0.05f
+        private const val URGENCY_RANGE = 0.45f
+        private const val INTERVAL_MIN_MS = 180f
+        private const val INTERVAL_MAX_MS = 900f
+        private const val AMP_MIN = 20f
+        private const val AMP_MAX = 180f
+        private const val PULSE_MIN_MS = 35f
+        private const val PULSE_MAX_MS = 70f
+        private const val DOUBLE_PULSE_GAP_MS = 50L
+    }
 
     private val vibrator: Vibrator = run {
         val manager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
         manager.defaultVibrator
     }
 
-    private val scope = CoroutineScope(Dispatchers.Default)
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var heartbeatJob: Job? = null
 
     @Volatile private var currentStatus: TrackingStatus = TrackingStatus.IDLE
     @Volatile private var driftX: Float = 0f
     @Volatile private var driftY: Float = 0f
 
+    @Synchronized
     fun updateTrackingStatus(status: TrackingStatus, driftX: Float = 0f, driftY: Float = 0f) {
         this.driftX = driftX
         this.driftY = driftY
@@ -44,38 +60,35 @@ class HapticFeedbackManager(context: Context) {
         }
     }
 
-    private suspend fun lockedHeartbeat() {
-        while (true) {
+    private suspend fun CoroutineScope.lockedHeartbeat() {
+        while (isActive) {
             val dx = abs(driftX)
             val dy = abs(driftY)
             val edgeProximity = maxOf(dx, dy).coerceIn(0f, 1f)
             val horizontalDominant = dx >= dy
 
-            // Remap: 0.05 dead zone, full urgency by 0.5 (zoomed subjects fill frame)
-            val urgency = ((edgeProximity - 0.05f) / 0.45f).coerceIn(0f, 1f)
+            val urgency = ((edgeProximity - DEAD_ZONE) / URGENCY_RANGE).coerceIn(0f, 1f)
 
-            val intervalMs = lerp(900f, 180f, urgency).toLong()
-            val amplitude = lerp(20f, 180f, urgency).toInt().coerceIn(1, 255)
-            val pulseDuration = lerp(35f, 70f, urgency).toLong()
+            val intervalMs = lerp(INTERVAL_MAX_MS, INTERVAL_MIN_MS, urgency).toLong()
+            val amplitude = lerp(AMP_MIN, AMP_MAX, urgency).toInt().coerceIn(1, 255)
+            val pulseDuration = lerp(PULSE_MIN_MS, PULSE_MAX_MS, urgency).toLong()
 
             if (!horizontalDominant && urgency > 0.05f) {
-                // Double pulse — vertical drift dominates
                 val tapAmp = (amplitude * 0.7f).toInt().coerceIn(1, 255)
                 vibrator.vibrate(VibrationEffect.createOneShot(pulseDuration, tapAmp))
-                delay(pulseDuration + 60)
+                delay(pulseDuration + DOUBLE_PULSE_GAP_MS)
                 vibrator.vibrate(VibrationEffect.createOneShot(pulseDuration, amplitude))
-                delay(intervalMs)
+                // Subtract double-pulse overhead so total cycle matches single-pulse
+                delay(maxOf(intervalMs - pulseDuration - DOUBLE_PULSE_GAP_MS, 30L))
             } else {
-                // Single pulse — centered or horizontal drift
                 vibrator.vibrate(VibrationEffect.createOneShot(pulseDuration, amplitude))
                 delay(intervalMs)
             }
         }
     }
 
-    private suspend fun lostHeartbeat() {
-        while (true) {
-            // Distinct double-tap at slow rate
+    private suspend fun CoroutineScope.lostHeartbeat() {
+        while (isActive) {
             vibrator.vibrate(VibrationEffect.createOneShot(30, 50))
             delay(100)
             vibrator.vibrate(VibrationEffect.createOneShot(30, 50))
@@ -86,7 +99,7 @@ class HapticFeedbackManager(context: Context) {
     private fun lerp(a: Float, b: Float, t: Float): Float = a + (b - a) * t
 
     fun shutdown() {
-        heartbeatJob?.cancel()
+        scope.cancel()
         vibrator.cancel()
     }
 }
