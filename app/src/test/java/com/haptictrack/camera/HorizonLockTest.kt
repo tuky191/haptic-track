@@ -83,13 +83,13 @@ class HorizonLockTest {
 
     /**
      * Rotation the matrix applies to the IMAGE (deg), aspect-corrected back to
-     * pixel space. The matrix transforms texture coordinates, which rotates the
-     * visible image by the inverse — hence the negation.
+     * pixel space. Sign convention settled empirically on the causal video path
+     * (session 20260610_220747): the matrix angle IS the image rotation.
      */
     private fun matrixRollDeg(m: FloatArray): Double {
         val a = m[0].toDouble()
         val d = m[1].toDouble() * GyroStabilizer.LOCK_STREAM_ASPECT
-        return -Math.toDegrees(atan2(d, a))
+        return Math.toDegrees(atan2(d, a))
     }
 
     @Test

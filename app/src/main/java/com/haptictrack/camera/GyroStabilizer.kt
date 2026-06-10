@@ -191,13 +191,15 @@ class GyroStabilizer(context: Context) : SensorEventListener {
      * (portrait h/w = LOCK_STREAM_ASPECT), so the off-diagonal terms carry the
      * aspect, else rotation shears the image.
      *
-     * [corrDeg] is the rotation the IMAGE needs. The matrix transforms texture
-     * coordinates, which rotates the visible image by the inverse — hence the
-     * negation (verified on device: session 20260610_210744 doubled the roll
-     * before it).
+     * [corrDeg] is the rotation the IMAGE needs, applied directly to texcoords.
+     * Sign settled empirically on the causal video path (session
+     * 20260610_220747: regression of video roll on gyro+applied warp fit
+     * "v≈dg−da" best with the negated matrix → un-negated is correct). The
+     * earlier "doubling" read (210744) was meter noise — the lookahead path
+     * was dropping uStabMatrix entirely, so no sign was observable through it.
      */
     private fun lockMatrix(corrDeg: Double, crop: Double): FloatArray {
-        val th = Math.toRadians(-corrDeg)
+        val th = Math.toRadians(corrDeg)
         val iz = 1.0 / crop
         val c = iz * cos(th)
         val s = iz * sin(th)
@@ -253,7 +255,15 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     }
 
     /** Gaussian kernel smoothing for video frames (400ms output latency, ~95MB FBO buffer). */
-    var rtsLookahead: Boolean = true
+    /**
+     * Lookahead (Gaussian, zero-phase) video path. DISABLED: renderFromFBO
+     * produces an identity warp on S26 — recordings through it never contained
+     * uStabMatrix (verified: EIS crop absent comparing braced EIS-on/off
+     * sessions 1907xx; lock warp absent in walks 210744/211537 while the
+     * causal session 220747 demonstrably renders it). Root cause TBD — until
+     * then the causal single-pass path is the one that actually stabilizes.
+     */
+    var rtsLookahead: Boolean = false
 
     /** Current stabilization matrix in column-major order for GL (mat3). Identity when disabled. */
     private val currentMatrix = AtomicReference(IDENTITY_MATRIX.clone())
