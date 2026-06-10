@@ -55,6 +55,9 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         // with matching -3dB cutoff: f_c = 1/(2πTC) for one pole, ≈0.187/σ for Gaussian.
         private const val FAST_SIGMA_TC_SCALE = 1.175
         private const val LOCAL_VEL_WINDOW_NS = 60_000_000L  // ±60ms for frame-local velocity
+        // Budget-aware TC: fraction of the leash budget the smoother may demand
+        // (deviation ≈ rate × TC must fit cropMargin/fEff at the current zoom).
+        private const val TC_BUDGET_SAFETY = 0.8
 
         /**
          * Per-device correction for intrinsics that don't match the HAL's actual
@@ -456,7 +459,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
                 it.println("frame_idx,timestamp_ns")
             }
             benchCorrWriter = PrintWriter(FileWriter(File(dir, "corrections.csv")), false).also {
-                it.println("frame_idx,timestamp_ns,raw_w,raw_x,raw_y,raw_z,smooth_w,smooth_x,smooth_y,smooth_z,eff_tc,corr_deg,leash,m0,m1,m2,m3,m4,m5,m6,m7,m8,zoom")
+                it.println("frame_idx,timestamp_ns,raw_w,raw_x,raw_y,raw_z,smooth_w,smooth_x,smooth_y,smooth_z,eff_tc,corr_deg,leash,m0,m1,m2,m3,m4,m5,m6,m7,m8,zoom,trans_cum_x,trans_cum_y,trans_vid_x,trans_vid_y")
             }
             PrintWriter(FileWriter(File(dir, "bench_params.csv"))).use { pw ->
                 pw.println("timeConstant,cropZoom,fxUv,fyUv,clampMarginFraction,oisCompensation")
@@ -487,11 +490,13 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         val sq = smoothedQuat
         val mat = currentMatrix.get()
         val leash = if (lastLeashActive) 1 else 0
+        val videoTrans = videoTranslationCorrection(timestampNs)
         cw.println("$frameIdx,$timestampNs," +
             "${rq.w},${rq.x},${rq.y},${rq.z}," +
             "${sq.w},${sq.x},${sq.y},${sq.z}," +
             "$effectiveTc,$lastCorrAngleDeg,$leash," +
-            "${mat[0]},${mat[1]},${mat[2]},${mat[3]},${mat[4]},${mat[5]},${mat[6]},${mat[7]},${mat[8]},$zoomRatio")
+            "${mat[0]},${mat[1]},${mat[2]},${mat[3]},${mat[4]},${mat[5]},${mat[6]},${mat[7]},${mat[8]},$zoomRatio," +
+            "$transCumX,$transCumY,${videoTrans.first},${videoTrans.second}")
     }
 
     /** Get the current stabilization matrix (column-major mat3, 9 floats). Thread-safe. */
@@ -644,14 +649,31 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         }
 
         val isPanning = highVelocityDurationSec >= PAN_ONSET_SEC
-        val zoomTcScale = sqrt(zoomRatio.toDouble().coerceAtLeast(1.0))
+
+        // Camera zoom magnifies on-screen motion: the SurfaceTexture stream is
+        // already zoom-cropped by the ISP, so its UV [0,1]² spans 1/zoom of the
+        // FOV and the same rotation displaces pixels zoom× farther. Scale the
+        // focal lengths so corrections (and the leash budget) match the stream.
+        val zoomFocal = zoomRatio.toDouble().coerceAtLeast(0.1)
+        val fxEff = fxUv * zoomFocal
+        val fyEff = fyUv * zoomFocal
+        val cropMargin = 0.5 * (1.0 - 1.0 / cropZoom)
+
+        // Budget-aware TC: the crop margin grants maxCorrAngle of correction range,
+        // and a causal smoother deviates by ~rate×TC under sustained rotation. Cap
+        // TC so the demanded deviation fits the budget — otherwise the leash chops
+        // corrections nonlinearly every sample and stabilization degrades to the
+        // margin width (measured: 26% leash duty at zoom 2.7 with the old
+        // tc×sqrt(zoom) boost, mean correction pinned at the ceiling).
+        val budgetDeg = Math.toDegrees(cropMargin / maxOf(fxEff, fyEff))
+        val tcBudget = TC_BUDGET_SAFETY * budgetDeg / smoothedAngularVelocityDeg.coerceAtLeast(1.0)
+        val cappedTc = min(timeConstant, tcBudget)
         if (adaptiveSmoothing) {
-            val baseTc = timeConstant * zoomTcScale
-            val targetTc = if (isPanning) baseTc * PAN_TC_FACTOR else baseTc
+            val targetTc = if (isPanning) cappedTc * PAN_TC_FACTOR else cappedTc
             val tcAlpha = 1.0 - exp(-dtSec * TC_RAMP_SPEED)
             effectiveTc += tcAlpha * (targetTc - effectiveTc)
         } else {
-            effectiveTc = timeConstant * zoomTcScale
+            effectiveTc = cappedTc
         }
         prevRawQuat = rawQuat
 
@@ -672,16 +694,8 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         val fastAlpha = 1.0 - exp(-(1.0 / sampleRate) / adaptFastTc)
         smoothFastQuat = slerp(smoothFastQuat, rawQuat, fastAlpha)
 
-        // Camera zoom magnifies on-screen motion: the SurfaceTexture stream is
-        // already zoom-cropped by the ISP, so its UV [0,1]² spans 1/zoom of the
-        // FOV and the same rotation displaces pixels zoom× farther. Scale the
-        // focal lengths so corrections (and the leash budget) match the stream.
-        val zoomFocal = zoomRatio.toDouble().coerceAtLeast(0.1)
-        val fxEff = fxUv * zoomFocal
-        val fyEff = fyUv * zoomFocal
-
-        // Leash: limit how far smoothed can deviate from raw.
-        val cropMargin = 0.5 * (1.0 - 1.0 / cropZoom)
+        // Leash: limit how far smoothed can deviate from raw (safety net — the
+        // budget-aware TC above should keep deviations inside the margin).
         val maxCorrAngle = cropMargin / maxOf(fxEff, fyEff)
         val devQuat = smoothedQuat.conjugate() * rawQuat
         val devAngle = 2.0 * acos(abs(devQuat.w).coerceIn(0.0, 1.0))

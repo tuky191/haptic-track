@@ -96,6 +96,14 @@ def telemetry(session: Path):
     if "zoom" in rows[0]:
         zooms = [float(r["zoom"]) for r in rows]
         out["zoom_med"] = float(np.median(zooms))
+    if "trans_vid_x" in rows[0]:
+        tvx = np.array([float(r["trans_vid_x"]) for r in rows])
+        tvy = np.array([float(r["trans_vid_y"]) for r in rows])
+        out["trans_vid_rms_uv"] = float(np.sqrt(np.mean(tvx**2 + tvy**2)))
+        cx = np.array([float(r["trans_cum_x"]) for r in rows])
+        cy = np.array([float(r["trans_cum_y"]) for r in rows])
+        dc = np.hypot(np.diff(cx), np.diff(cy))
+        out["trans_flow_rms_uv"] = float(np.sqrt(np.mean(dc**2)))
     return out
 
 
@@ -133,6 +141,9 @@ def main():
     if tel:
         print(f"  telemetry: zoom_med={zoom:.2f} leash={tel.get('leash_pct', 0):.0f}% "
               f"corr_mean={tel.get('corr_deg_mean', 0):.2f}deg  phase-corr good {good}/{total}")
+        if "trans_vid_rms_uv" in tel:
+            print(f"  translation: optical-flow step RMS={tel['trans_flow_rms_uv']:.5f} UV/frame, "
+                  f"video correction RMS={tel['trans_vid_rms_uv']:.5f} UV")
 
     ledger = args.ledger or session.parent / "eis_progress.csv"
     new = not ledger.exists()
