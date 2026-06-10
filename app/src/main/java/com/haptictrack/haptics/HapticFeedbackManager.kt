@@ -21,12 +21,13 @@ class HapticFeedbackManager(context: Context) {
         private const val DEAD_ZONE = 0.05f
         private const val URGENCY_RANGE = 0.45f
 
-        // Geiger: fastest at center, slowest at edge
         private const val INTERVAL_CENTER_MS = 120f
         private const val INTERVAL_EDGE_MS = 800f
         private const val PULSE_MS = 25L
 
         private const val DOUBLE_PULSE_GAP_MS = 45L
+
+        private const val LOST_GRACE_MS = 800L
     }
 
     private val vibrator: Vibrator = run {
@@ -36,6 +37,7 @@ class HapticFeedbackManager(context: Context) {
 
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var heartbeatJob: Job? = null
+    private var graceJob: Job? = null
 
     @Volatile private var currentStatus: TrackingStatus = TrackingStatus.IDLE
     @Volatile private var driftX: Float = 0f
@@ -52,14 +54,25 @@ class HapticFeedbackManager(context: Context) {
         if (status == currentStatus) return
         currentStatus = status
 
-        heartbeatJob?.cancel()
-        vibrator.cancel()
+        graceJob?.cancel()
 
         when (status) {
-            TrackingStatus.LOCKED -> heartbeatJob = scope.launch { geigerLoop() }
-            TrackingStatus.LOST -> {}
-            TrackingStatus.SEARCHING -> {}
-            TrackingStatus.IDLE -> {}
+            TrackingStatus.LOCKED -> {
+                if (heartbeatJob?.isActive != true) {
+                    heartbeatJob = scope.launch { geigerLoop() }
+                }
+            }
+            TrackingStatus.LOST, TrackingStatus.SEARCHING -> {
+                graceJob = scope.launch {
+                    delay(LOST_GRACE_MS)
+                    heartbeatJob?.cancel()
+                    vibrator.cancel()
+                }
+            }
+            TrackingStatus.IDLE -> {
+                heartbeatJob?.cancel()
+                vibrator.cancel()
+            }
         }
     }
 
