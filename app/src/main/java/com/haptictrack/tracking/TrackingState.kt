@@ -100,6 +100,7 @@ data class TrackingUiState(
     val oisCompensation: Boolean = true,
     /** Optical-flow translation correction on top of gyro rotation EIS. */
     val translationEis: Boolean = false,
+    val horizonLock: Boolean = false,
     /** Which object categories to show and allow tracking. */
     val trackingFilter: TrackingFilter = TrackingFilter.ALL,
     /** Haptic vibration strength 0.0–1.0. */

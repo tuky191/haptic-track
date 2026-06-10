@@ -352,6 +352,12 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         _uiState.update { it.copy(translationEis = newValue) }
     }
 
+    fun toggleHorizonLock() {
+        val newValue = !_uiState.value.horizonLock
+        cameraManager.gyroStabilizer.horizonLockEnabled = newValue
+        _uiState.update { it.copy(horizonLock = newValue) }
+    }
+
     fun setGyroStrength(strength: Float) {
         val clamped = strength.coerceIn(0f, 1f)
         val tc = GYRO_TC_MAX - GYRO_TC_RANGE * clamped

@@ -80,6 +80,31 @@ class GyroStabilizer(context: Context) : SensorEventListener {
          */
         fun defaultEnabled(manufacturer: String): Boolean =
             manufacturer.equals("Xiaomi", ignoreCase = true)
+
+        // Horizon lock: roll-only stabilization toward gravity — the one axis
+        // lens-shift OIS physically cannot correct. Walking capture
+        // 20260610_195144 measured ±5° roll drift reaching the screen at ~100%.
+        const val LOCK_RANGE_DEG = 10.0          // max counter-rotation
+        const val LOCK_RELEASE_START_DEG = 15.0  // fade begins (intentional tilt)
+        const val LOCK_RELEASE_END_DEG = 25.0    // fully released
+        const val LOCK_STREAM_ASPECT = 16.0 / 9.0  // portrait stream h/w in quad UV
+        const val LOCK_CROP = 1.15               // margin for ±10° (measured walk needs ≥1.042)
+        private const val LOCK_SLEW_DEG_PER_S = 60.0  // p95 roll rate measured 16.5°/s
+
+        /** Roll of the device about the optical axis vs gravity, degrees (0 = portrait level). */
+        fun gravityRollDeg(q: Quat): Double {
+            val gx = 2.0 * (q.x * q.z - q.w * q.y)
+            val gy = 2.0 * (q.y * q.z + q.w * q.x)
+            return Math.toDegrees(atan2(gx, gy))
+        }
+
+        /** Lock correction for a given roll: clamped to range, faded to zero toward release end. */
+        fun lockTargetDeg(rollDeg: Double): Double {
+            val a = abs(rollDeg)
+            val fade = ((LOCK_RELEASE_END_DEG - a) /
+                (LOCK_RELEASE_END_DEG - LOCK_RELEASE_START_DEG)).coerceIn(0.0, 1.0)
+            return -rollDeg.coerceIn(-LOCK_RANGE_DEG, LOCK_RANGE_DEG) * fade
+        }
     }
 
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
@@ -114,6 +139,11 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     /** Current camera zoom ratio — used to scale TC (more smoothing at zoom). */
     @Volatile var zoomRatio: Float = 1f
 
+    /** Horizon lock: counter-rotate roll toward gravity. Works with EIS on or off. */
+    @Volatile var horizonLockEnabled: Boolean = false
+    @Volatile private var lockAppliedDeg = 0.0
+    private var lastLockNs = 0L
+
     /** Zoom interpolation: target set at 10-12fps by tracker, interpolated at 200Hz. */
     @Volatile private var zoomTarget: Float = 1f   // desired zoom from auto-zoom controller
     @Volatile private var zoomApplied: Float = 1f  // interpolated zoom dispatched to CameraX
@@ -134,6 +164,62 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         zoomTarget = ratio
         zoomApplied = ratio
         zoomRatio = ratio
+    }
+
+    /** Slew-limit the applied lock correction toward the gravity target. */
+    private fun updateLock(nowNs: Long) {
+        if (!horizonLockEnabled) {
+            lockAppliedDeg = 0.0
+            lastLockNs = nowNs
+            return
+        }
+        val target = lockTargetDeg(gravityRollDeg(rawQuat))
+        val last = lastLockNs
+        lastLockNs = nowNs
+        val dtNs = nowNs - last
+        if (last == 0L || dtNs <= 0 || dtNs > SENSOR_GAP_THRESHOLD_NS) {
+            lockAppliedDeg = target
+            return
+        }
+        val maxStep = LOCK_SLEW_DEG_PER_S * dtNs / 1e9
+        lockAppliedDeg += (target - lockAppliedDeg).coerceIn(-maxStep, maxStep)
+    }
+
+    /**
+     * Counter-rotation affine about the view center in portrait UV, with crop.
+     * Rotation happens in PIXEL space — UV axes have different physical lengths
+     * (portrait h/w = LOCK_STREAM_ASPECT), so the off-diagonal terms carry the
+     * aspect, else rotation shears the image.
+     */
+    private fun lockMatrix(corrDeg: Double, crop: Double): FloatArray {
+        val th = Math.toRadians(corrDeg)
+        val iz = 1.0 / crop
+        val c = iz * cos(th)
+        val s = iz * sin(th)
+        val a = c
+        val b = -s * LOCK_STREAM_ASPECT
+        val d = s / LOCK_STREAM_ASPECT
+        val e = c
+        val tx = 0.5 - 0.5 * a - 0.5 * b
+        val ty = 0.5 - 0.5 * d - 0.5 * e
+        // column-major mat3
+        return floatArrayOf(
+            a.toFloat(), d.toFloat(), 0f,
+            b.toFloat(), e.toFloat(), 0f,
+            tx.toFloat(), ty.toFloat(), 1f
+        )
+    }
+
+    /** Column-major mat3 multiply: out = a × b. */
+    private fun mat3Mul(a: FloatArray, b: FloatArray): FloatArray {
+        val o = FloatArray(9)
+        for (col in 0..2) {
+            for (row in 0..2) {
+                o[col * 3 + row] =
+                    a[row] * b[col * 3] + a[3 + row] * b[col * 3 + 1] + a[6 + row] * b[col * 3 + 2]
+            }
+        }
+        return o
     }
 
     /**
@@ -608,6 +694,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         // Zoom dispatch must run before the enabled gate — auto-zoom works with EIS off (#174).
         // Before the history write so the recorded per-sample zoom is fresh.
         interpolateZoom(nowNs)
+        updateLock(nowNs)
 
         synchronized(historyLock) {
             historyW[historyHead] = rawQuat.w
@@ -621,7 +708,10 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         }
 
         if (!enabled) {
-            currentMatrix.set(IDENTITY_MATRIX.clone())
+            currentMatrix.set(
+                if (horizonLockEnabled) lockMatrix(lockAppliedDeg, LOCK_CROP)
+                else IDENTITY_MATRIX.clone()
+            )
             return
         }
 
@@ -754,7 +844,12 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         // Subject centering not applied — bbox center at 10-12fps is too noisy.
         // onTrackingUpdate() still computes offsets for future use (VT-based center).
         val rawExcursion = maxCornerExcursion(hPortrait)
-        currentMatrix.set(hPortrait)
+        // Horizon lock composes on top — the EIS crop (1.3) already covers ±10°
+        // of rotation margin, so no extra crop when both are active.
+        currentMatrix.set(
+            if (horizonLockEnabled) mat3Mul(lockMatrix(lockAppliedDeg, 1.0), hPortrait)
+            else hPortrait
+        )
 
         // --- Telemetry ---
         val corrAngleDeg = 2.0 * acos(abs(correction.w).coerceIn(0.0, 1.0)) * (180.0 / PI)
@@ -847,7 +942,15 @@ class GyroStabilizer(context: Context) : SensorEventListener {
      * the frame is rendered, we have LOOKAHEAD_FRAMES worth of future gyro data.
      */
     fun getVideoMatrix(frameTimestampNs: Long): FloatArray {
-        if (!_enabled) return IDENTITY_MATRIX.clone()
+        if (!_enabled) {
+            if (!horizonLockEnabled) return IDENTITY_MATRIX.clone()
+            // Lock-only path: roll evaluated at the frame timestamp from history.
+            val window = snapshotWindow(frameTimestampNs) ?: return getMatrix()
+            if (window.count < 10) return getMatrix()
+            val ti = findClosestIndex(window.timestamps, window.count, frameTimestampNs)
+            val q = Quat(window.w[ti], window.x[ti], window.y[ti], window.z[ti])
+            return lockMatrix(lockTargetDeg(gravityRollDeg(q)), LOCK_CROP)
+        }
 
         val window = snapshotWindow(frameTimestampNs) ?: return getMatrix()
         if (window.count < 10) return getMatrix()
@@ -900,7 +1003,10 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             hPortrait[6] += tx
             hPortrait[7] -= ty
         }
-        return hPortrait
+        // Horizon lock composes on top (no extra crop — EIS margin covers ±10°)
+        return if (horizonLockEnabled) {
+            mat3Mul(lockMatrix(lockTargetDeg(gravityRollDeg(rawAtTarget)), 1.0), hPortrait)
+        } else hPortrait
     }
 
     /** Record one optical-flow translation sample (cumulative track) for the video path. */
