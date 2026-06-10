@@ -7,6 +7,7 @@ import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager as Camera2Manager
+import android.os.Build
 import android.util.Log
 import java.io.File
 import java.io.FileWriter
@@ -50,6 +51,17 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         private const val OIS_FAST_TC_SWAY = 0.02 // fast TC during sway — OIS handles less, let more through
         private const val OIS_ADAPT_VEL_LOW = 3.0  // °/s below which OIS handles nearly everything
         private const val OIS_ADAPT_VEL_HIGH = 15.0 // °/s above which OIS struggles with sway
+
+        /**
+         * Per-device correction for intrinsics that don't match the HAL's actual
+         * output crop. Xiaomi 13 Pro reports focal lengths 1.27× too short
+         * (bench regression eis_bench_ois_off_2 measured the uniform scale error
+         * on both axes). S26 Ultra intrinsics are genuinely calibrated (fx≠fy,
+         * FOV sanity-checks at ~72°) — applying 1.27× there over-corrects every
+         * frame by 27%. #158 tracks replacing this table with runtime auto-calibration.
+         */
+        fun empiricalFocalScale(manufacturer: String): Double =
+            if (manufacturer.equals("Xiaomi", ignoreCase = true)) 1.27 else 1.0
     }
 
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
@@ -466,10 +478,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
                     val fyPx = intrinsicCal[1]  // focal length in pixels (y)
                     val arrayW = activeArray.width().toDouble()
                     val arrayH = activeArray.height().toDouble()
-                    // Bench regression (eis_bench_ois_off_2) measured 1.27x uniform
-                    // scale error on both axes — HAL applies additional crop beyond
-                    // what active array dimensions describe.
-                    val empiricalScale = 1.27
+                    val empiricalScale = empiricalFocalScale(Build.MANUFACTURER)
                     fxUv = fxPx / arrayW * empiricalScale
                     fyUv = fyPx / arrayH * empiricalScale
                     Log.i(TAG, "Intrinsics (calibrated): fxPx=${"%.1f".format(fxPx)} fyPx=${"%.1f".format(fyPx)} " +
@@ -483,7 +492,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
                         val focalMm = focalLengths[0].toDouble()
                         val sensorW = sensorSize.width.toDouble()
                         val sensorH = sensorSize.height.toDouble()
-                        val empiricalScale = 1.27
+                        val empiricalScale = empiricalFocalScale(Build.MANUFACTURER)
                         fxUv = focalMm / sensorW * empiricalScale
                         fyUv = focalMm / sensorH * empiricalScale
                         Log.i(TAG, "Intrinsics (physical): focal=${"%.2f".format(focalMm)}mm " +

@@ -84,4 +84,13 @@ class GyroStabilizerTest {
         assertEquals(0.0, m[1], 1e-6)
         assertEquals(1.0, m[4], 1e-6)
     }
+
+    @Test
+    fun `empirical focal scale applies 1_27 on Xiaomi only`() {
+        assertEquals(1.27, GyroStabilizer.empiricalFocalScale("Xiaomi"), 1e-9)
+        assertEquals(1.27, GyroStabilizer.empiricalFocalScale("xiaomi"), 1e-9)
+        assertEquals(1.0, GyroStabilizer.empiricalFocalScale("samsung"), 1e-9)
+        assertEquals(1.0, GyroStabilizer.empiricalFocalScale("Google"), 1e-9)
+        assertEquals(1.0, GyroStabilizer.empiricalFocalScale(""), 1e-9)
+    }
 }
