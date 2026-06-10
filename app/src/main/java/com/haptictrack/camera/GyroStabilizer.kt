@@ -51,6 +51,10 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         private const val OIS_FAST_TC_SWAY = 0.02 // fast TC during sway — OIS handles less, let more through
         private const val OIS_ADAPT_VEL_LOW = 3.0  // °/s below which OIS handles nearly everything
         private const val OIS_ADAPT_VEL_HIGH = 15.0 // °/s above which OIS struggles with sway
+        // Video path: zero-phase fast reference. Maps the causal fast TC to a Gaussian σ
+        // with matching -3dB cutoff: f_c = 1/(2πTC) for one pole, ≈0.187/σ for Gaussian.
+        private const val FAST_SIGMA_TC_SCALE = 1.175
+        private const val LOCAL_VEL_WINDOW_NS = 60_000_000L  // ±60ms for frame-local velocity
 
         /**
          * Per-device correction for intrinsics that don't match the HAL's actual
@@ -191,6 +195,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     private val historyY = DoubleArray(QUAT_HISTORY_SIZE)
     private val historyZ = DoubleArray(QUAT_HISTORY_SIZE)
     private val historyTs = LongArray(QUAT_HISTORY_SIZE)
+    private val historyZoom = FloatArray(QUAT_HISTORY_SIZE)  // zoom at sample time (video fxEff)
     private var historyHead = 0
     private var historyCount = 0
     private val historyLock = Any()
@@ -557,18 +562,20 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         val nowNs = event.timestamp
         try { benchGyroWriter?.println("$nowNs,${rawQuat.w},${rawQuat.x},${rawQuat.y},${rawQuat.z}") } catch (_: Exception) {}
 
+        // Zoom dispatch must run before the enabled gate — auto-zoom works with EIS off (#174).
+        // Before the history write so the recorded per-sample zoom is fresh.
+        interpolateZoom(nowNs)
+
         synchronized(historyLock) {
             historyW[historyHead] = rawQuat.w
             historyX[historyHead] = rawQuat.x
             historyY[historyHead] = rawQuat.y
             historyZ[historyHead] = rawQuat.z
             historyTs[historyHead] = nowNs
+            historyZoom[historyHead] = zoomRatio
             historyHead = (historyHead + 1) % QUAT_HISTORY_SIZE
             if (historyCount < QUAT_HISTORY_SIZE) historyCount++
         }
-
-        // Zoom dispatch must run before the enabled gate — auto-zoom works with EIS off (#174)
-        interpolateZoom(nowNs)
 
         if (!enabled) {
             currentMatrix.set(IDENTITY_MATRIX.clone())
@@ -794,22 +801,60 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         if (window.count < 10) return getMatrix()
 
         val targetIdx = findClosestIndex(window.timestamps, window.count, frameTimestampNs)
-        val sigmaNs = GAUSSIAN_SIGMA_MS * 1_000_000.0
+        var smoothed = gaussianMeanQuat(window, frameTimestampNs, GAUSSIAN_SIGMA_MS * 1_000_000.0, targetIdx)
+        val rawAtTarget = Quat(window.w[targetIdx], window.x[targetIdx], window.y[targetIdx], window.z[targetIdx])
 
-        // Compute Gaussian weights
+        // Camera zoom at FRAME time (not "now" — zoom may have ramped during the
+        // lookahead buffer). Same geometry as the causal path: the zoom-cropped
+        // stream magnifies on-screen motion, so focal lengths scale with zoom.
+        val zoomFocal = window.zoom[targetIdx].toDouble().coerceAtLeast(0.1)
+        val fxEff = fxUv * zoomFocal
+        val fyEff = fyUv * zoomFocal
+
+        // Leash (same as causal path) — prevent corrections exceeding crop margin
+        val cropMargin = 0.5 * (1.0 - 1.0 / cropZoom)
+        val maxCorrAngle = cropMargin / maxOf(fxEff, fyEff)
+        val devQuat = smoothed.conjugate() * rawAtTarget
+        val devAngle = 2.0 * acos(devQuat.w.coerceIn(-1.0, 1.0))
+        if (leashEnabled && devAngle > maxCorrAngle && devAngle > 1e-6) {
+            val catchUp = 1.0 - maxCorrAngle / devAngle
+            smoothed = slerp(smoothed, rawAtTarget, catchUp)
+        }
+
+        // Band-split when OIS active: the fast reference must be evaluated AT the
+        // frame timestamp. The causal smoothFastQuat is ~400ms newer than the frame
+        // (lookahead buffering) — using it mixed the rotation since capture into the
+        // correction, injecting high-frequency garbage. With history on both sides of
+        // the frame we can do better than causal: a narrow symmetric Gaussian gives a
+        // ZERO-PHASE fast reference (the causal single-pole lags ~45°+ near cutoff,
+        // which made 3-8Hz corrections arrive anti-phase and amplify shake).
+        val corrRef = if (oisCompensation < 1.0) {
+            val vel = localAngVelDeg(window, targetIdx)
+            val t = ((vel - OIS_ADAPT_VEL_LOW) / (OIS_ADAPT_VEL_HIGH - OIS_ADAPT_VEL_LOW)).coerceIn(0.0, 1.0)
+            val fastTc = OIS_FAST_TC_CALM + t * (OIS_FAST_TC_SWAY - OIS_FAST_TC_CALM)
+            gaussianMeanQuat(window, frameTimestampNs, FAST_SIGMA_TC_SCALE * fastTc * 1e9, targetIdx)
+        } else rawAtTarget
+        val correctionDevice = smoothed.conjugate() * corrRef
+        val correction = deviceToSensorQuat * correctionDevice * deviceToSensorQuat.conjugate()
+        val r = correction.toRotationMatrix()
+        val h = computeHomographyUV(r, fxEff, fyEff, cropZoom.toDouble())
+        return sensorToPortraitGL(h, sensorOrientation)
+    }
+
+    /** Weighted quaternion average via iterative tangent-space refinement. */
+    private fun gaussianMeanQuat(window: QuatWindow, centerNs: Long, sigmaNs: Double, initIdx: Int): Quat {
         var weightSum = 0.0
         val weights = DoubleArray(window.count)
         for (i in 0 until window.count) {
-            val dt = (window.timestamps[i] - frameTimestampNs).toDouble()
+            val dt = (window.timestamps[i] - centerNs).toDouble()
             val w = exp(-0.5 * (dt / sigmaNs) * (dt / sigmaNs))
             weights[i] = w
             weightSum += w
         }
+        if (weightSum < 1e-12) return Quat(window.w[initIdx], window.x[initIdx], window.y[initIdx], window.z[initIdx])
         for (i in 0 until window.count) weights[i] /= weightSum
 
-        // Weighted quaternion average via iterative tangent-space refinement
-        var meanQ = Quat(window.w[targetIdx], window.x[targetIdx], window.y[targetIdx], window.z[targetIdx])
-
+        var meanQ = Quat(window.w[initIdx], window.x[initIdx], window.y[initIdx], window.z[initIdx])
         for (iter in 0..2) {
             var tx = 0.0; var ty = 0.0; var tz = 0.0
             val meanConj = meanQ.conjugate()
@@ -836,32 +881,28 @@ class GyroStabilizer(context: Context) : SensorEventListener {
                 meanQ = (meanQ * stepQ).normalized()
             }
         }
+        return meanQ
+    }
 
-        var smoothed = meanQ
-        val rawAtTarget = Quat(window.w[targetIdx], window.x[targetIdx], window.y[targetIdx], window.z[targetIdx])
-
-        // Leash (same as causal path) — prevent corrections exceeding crop margin
-        val cropMargin = 0.5 * (1.0 - 1.0 / cropZoom)
-        val maxCorrAngle = cropMargin / maxOf(fxUv, fyUv)
-        val devQuat = smoothed.conjugate() * rawAtTarget
-        val devAngle = 2.0 * acos(devQuat.w.coerceIn(-1.0, 1.0))
-        if (leashEnabled && devAngle > maxCorrAngle && devAngle > 1e-6) {
-            val catchUp = 1.0 - maxCorrAngle / devAngle
-            smoothed = slerp(smoothed, rawAtTarget, catchUp)
-        }
-
-        // Correction pipeline (same as causal path) — band-split when OIS active
-        val corrRef = if (oisCompensation < 1.0) smoothFastQuat else rawAtTarget
-        val correctionDevice = smoothed.conjugate() * corrRef
-        val correction = deviceToSensorQuat * correctionDevice * deviceToSensorQuat.conjugate()
-        val r = correction.toRotationMatrix()
-        val h = computeHomographyUV(r, fxUv, fyUv, cropZoom.toDouble())
-        return sensorToPortraitGL(h, sensorOrientation)
+    /** Angular velocity (deg/s) around a window sample, from neighbors within ±LOCAL_VEL_WINDOW_NS. */
+    private fun localAngVelDeg(window: QuatWindow, targetIdx: Int): Double {
+        val t0 = window.timestamps[targetIdx]
+        var lo = targetIdx
+        var hi = targetIdx
+        while (lo > 0 && t0 - window.timestamps[lo - 1] <= LOCAL_VEL_WINDOW_NS) lo--
+        while (hi < window.count - 1 && window.timestamps[hi + 1] - t0 <= LOCAL_VEL_WINDOW_NS) hi++
+        if (hi <= lo) return 0.0
+        val qa = Quat(window.w[lo], window.x[lo], window.y[lo], window.z[lo])
+        val qb = Quat(window.w[hi], window.x[hi], window.y[hi], window.z[hi])
+        val d = qa.conjugate() * qb
+        val angle = 2.0 * acos(abs(d.w).coerceIn(0.0, 1.0))
+        val dtSec = (window.timestamps[hi] - window.timestamps[lo]) / 1e9
+        return Math.toDegrees(angle) / dtSec
     }
 
     private data class QuatWindow(
         val w: DoubleArray, val x: DoubleArray, val y: DoubleArray, val z: DoubleArray,
-        val timestamps: LongArray, val count: Int
+        val timestamps: LongArray, val zoom: FloatArray, val count: Int
     )
 
     private fun snapshotWindow(targetNs: Long): QuatWindow? {
@@ -888,6 +929,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
                 y = DoubleArray(n) { historyY[indices[it]] },
                 z = DoubleArray(n) { historyZ[indices[it]] },
                 timestamps = LongArray(n) { historyTs[indices[it]] },
+                zoom = FloatArray(n) { historyZoom[indices[it]] },
                 count = n
             )
         }
