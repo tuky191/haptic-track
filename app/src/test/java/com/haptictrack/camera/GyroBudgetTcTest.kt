@@ -42,7 +42,7 @@ class GyroBudgetTcTest {
     fun `correction stays within crop margin at zoom without the leash`() {
         // 20 deg/s sustained rotation at 3x zoom for 1s, leash OFF: only the
         // budget-aware TC can keep the correction inside the crop margin.
-        val stab = GyroStabilizer(RuntimeEnvironment.getApplication())
+        val stab = GyroStabilizer(RuntimeEnvironment.getApplication()).apply { enabled = true }
         stab.adaptiveSmoothing = false
         stab.leashEnabled = false
         stab.setZoomImmediate(3f)
@@ -57,7 +57,7 @@ class GyroBudgetTcTest {
         }
         val m = stab.getMatrix()
 
-        val base = GyroStabilizer(RuntimeEnvironment.getApplication())
+        val base = GyroStabilizer(RuntimeEnvironment.getApplication()).apply { enabled = true }
         base.adaptiveSmoothing = false
         base.leashEnabled = false
         base.setZoomImmediate(3f)

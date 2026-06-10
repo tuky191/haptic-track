@@ -56,7 +56,7 @@ class GyroVideoMatrixTest {
 
     /** History: identity then sustained tilt; frame at the end. Returns video matrix. */
     private fun videoMatrix(zoom: Float, halfAngle: Float): FloatArray {
-        val stab = GyroStabilizer(RuntimeEnvironment.getApplication())
+        val stab = GyroStabilizer(RuntimeEnvironment.getApplication()).apply { enabled = true }
         stab.adaptiveSmoothing = false
         stab.setZoomImmediate(zoom)
         val step = 5_000_000L
@@ -83,7 +83,7 @@ class GyroVideoMatrixTest {
         // OIS split active. The device is still through the frame epoch, then a
         // quick rotation happens 550ms AFTER the frame (i.e. between capture and
         // lookahead render). The correction for the frame must not contain it.
-        val stab = GyroStabilizer(RuntimeEnvironment.getApplication())
+        val stab = GyroStabilizer(RuntimeEnvironment.getApplication()).apply { enabled = true }
         stab.adaptiveSmoothing = false
         stab.oisCompensation = 0.4
         val step = 5_000_000L
@@ -94,7 +94,7 @@ class GyroVideoMatrixTest {
         val m = stab.getVideoMatrix(frameTs)
 
         // Baseline: identical timeline with no rotation at all → pure static crop.
-        val stabBase = GyroStabilizer(RuntimeEnvironment.getApplication())
+        val stabBase = GyroStabilizer(RuntimeEnvironment.getApplication()).apply { enabled = true }
         stabBase.adaptiveSmoothing = false
         stabBase.oisCompensation = 0.4
         feedIdentity(stabBase, 1_000_000_000L, 1_800_000_000L, step)
@@ -108,7 +108,7 @@ class GyroVideoMatrixTest {
 
     /** Translation samples: cumX oscillates at 5Hz, cumY constant. Quats stay identity. */
     private fun translationOffsets(cumXAt: (Double) -> Double): Pair<Float, Float> {
-        val stab = GyroStabilizer(RuntimeEnvironment.getApplication())
+        val stab = GyroStabilizer(RuntimeEnvironment.getApplication()).apply { enabled = true }
         stab.adaptiveSmoothing = false
         stab.translationCorrectionEnabled = true  // apply is off by default (unvalidated sensor)
         feedIdentity(stab, 1_000_000_000L, 1_800_000_000L, 5_000_000L)
@@ -119,7 +119,7 @@ class GyroVideoMatrixTest {
             t += 25_000_000L  // 40fps so a sample lands exactly on the frame timestamp
         }
         val m = stab.getVideoMatrix(1_450_000_000L)
-        val base = GyroStabilizer(RuntimeEnvironment.getApplication())
+        val base = GyroStabilizer(RuntimeEnvironment.getApplication()).apply { enabled = true }
         base.adaptiveSmoothing = false
         feedIdentity(base, 1_000_000_000L, 1_800_000_000L, 5_000_000L)
         val b = base.getVideoMatrix(1_450_000_000L)

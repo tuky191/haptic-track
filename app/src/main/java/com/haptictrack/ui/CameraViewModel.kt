@@ -64,6 +64,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     init {
         orientationListener.start()
         setGyroStrength(_uiState.value.gyroStrength)
+        // Gyro EIS default is device-gated (off on S26 — hardware OIS wins);
+        // sync the UI toggle to the stabilizer's actual state.
+        _uiState.update { it.copy(gyroEis = cameraManager.gyroStabilizer.enabled) }
 
         // Load ML models on background thread — takes ~20s with GPU delegate init
         viewModelScope.launch(Dispatchers.Default) {

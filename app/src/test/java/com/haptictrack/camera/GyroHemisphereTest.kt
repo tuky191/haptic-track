@@ -40,7 +40,7 @@ class GyroHemisphereTest {
     /** Identity then sustained tilt, with every quat multiplied by [sign]. */
     private fun correctionTranslation(sign: Float): Double {
         fun run(halfAngle: Float): FloatArray {
-            val stab = GyroStabilizer(RuntimeEnvironment.getApplication())
+            val stab = GyroStabilizer(RuntimeEnvironment.getApplication()).apply { enabled = true }
             stab.adaptiveSmoothing = false
             var t = 1_000_000_000L
             while (t <= 1_100_000_000L) {
@@ -68,7 +68,7 @@ class GyroHemisphereTest {
     @Test
     fun `mid-stream hemisphere flip does not latch the leash`() {
         // Same orientation stream, but the sensor flips quat sign halfway through.
-        val stab = GyroStabilizer(RuntimeEnvironment.getApplication())
+        val stab = GyroStabilizer(RuntimeEnvironment.getApplication()).apply { enabled = true }
         stab.adaptiveSmoothing = false
         var t = 1_000_000_000L
         while (t <= 1_100_000_000L) {
@@ -79,7 +79,7 @@ class GyroHemisphereTest {
         }
         val m = stab.getMatrix()
 
-        val ref = GyroStabilizer(RuntimeEnvironment.getApplication())
+        val ref = GyroStabilizer(RuntimeEnvironment.getApplication()).apply { enabled = true }
         ref.adaptiveSmoothing = false
         t = 1_000_000_000L
         while (t <= 1_100_000_000L) {

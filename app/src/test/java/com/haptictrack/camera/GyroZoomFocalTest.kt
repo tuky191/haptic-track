@@ -38,7 +38,7 @@ class GyroZoomFocalTest {
     }
 
     private fun matrixAfter(zoom: Float, halfAngle: Float): FloatArray {
-        val stab = GyroStabilizer(RuntimeEnvironment.getApplication())
+        val stab = GyroStabilizer(RuntimeEnvironment.getApplication()).apply { enabled = true }
         stab.adaptiveSmoothing = false
         stab.setZoomImmediate(zoom)
         stab.onSensorChanged(event(0f, 0f, 0f, 1f, 1_000_000_000L))

@@ -69,6 +69,17 @@ class GyroStabilizer(context: Context) : SensorEventListener {
          */
         fun empiricalFocalScale(manufacturer: String): Double =
             if (manufacturer.equals("Xiaomi", ignoreCase = true)) 1.27 else 1.0
+
+        /**
+         * Gyro EIS earns its keep only where hardware stabilization is weak
+         * (Xiaomi 13 Pro: measured 2.14× improvement). On the S26 Ultra the
+         * OIS+HAL already removes 90–96% of rotational shake in every band and
+         * software EIS measured 2–2.9× WORSE than off (controlled matrix,
+         * sessions 20260610_1907xx). Default off except on known-weak devices;
+         * the UI toggle still allows manual override.
+         */
+        fun defaultEnabled(manufacturer: String): Boolean =
+            manufacturer.equals("Xiaomi", ignoreCase = true)
     }
 
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
@@ -156,9 +167,9 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     /** Current stabilization matrix in column-major order for GL (mat3). Identity when disabled. */
     private val currentMatrix = AtomicReference(IDENTITY_MATRIX.clone())
 
-    /** Whether stabilization is active. */
+    /** Whether stabilization is active. Device-gated default — see [defaultEnabled]. */
     @Volatile
-    private var _enabled: Boolean = true
+    private var _enabled: Boolean = defaultEnabled(Build.MANUFACTURER)
     var enabled: Boolean
         get() = _enabled
         set(value) {

@@ -93,4 +93,13 @@ class GyroStabilizerTest {
         assertEquals(1.0, GyroStabilizer.empiricalFocalScale("Google"), 1e-9)
         assertEquals(1.0, GyroStabilizer.empiricalFocalScale(""), 1e-9)
     }
+
+    @Test
+    fun `gyro EIS default is on for Xiaomi only`() {
+        assertTrue(GyroStabilizer.defaultEnabled("Xiaomi"))
+        assertTrue(GyroStabilizer.defaultEnabled("xiaomi"))
+        assertFalse(GyroStabilizer.defaultEnabled("samsung"))
+        assertFalse(GyroStabilizer.defaultEnabled("Google"))
+        assertFalse(GyroStabilizer.defaultEnabled(""))
+    }
 }
