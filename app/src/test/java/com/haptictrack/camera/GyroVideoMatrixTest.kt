@@ -110,6 +110,7 @@ class GyroVideoMatrixTest {
     private fun translationOffsets(cumXAt: (Double) -> Double): Pair<Float, Float> {
         val stab = GyroStabilizer(RuntimeEnvironment.getApplication())
         stab.adaptiveSmoothing = false
+        stab.translationCorrectionEnabled = true  // apply is off by default (unvalidated sensor)
         feedIdentity(stab, 1_000_000_000L, 1_800_000_000L, 5_000_000L)
         var t = 1_000_000_000L
         while (t <= 1_800_000_000L) {

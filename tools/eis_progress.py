@@ -25,6 +25,7 @@ ANALYSIS_H, ANALYSIS_W = 480, 270  # portrait 4K downscale
 def band_rms(sig, fs):
     sig = np.asarray(sig, dtype=np.float64)
     sig = sig - sig.mean()
+    sig = sig * np.hanning(len(sig))  # window the series — raw FFT leaks across bands
     f = np.fft.rfftfreq(len(sig), 1 / fs)
     p = np.abs(np.fft.rfft(sig)) ** 2 / len(sig)
     return {b: float(np.sqrt(p[(f >= b[0]) & (f < b[1])].sum())) for b in BANDS}

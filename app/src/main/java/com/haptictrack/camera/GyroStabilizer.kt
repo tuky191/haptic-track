@@ -218,7 +218,14 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     // Translation correction: optical flow → position-domain smoothing with leash.
     // Measures post-gyro residual displacement from stabilized analysis frames,
     // smooths the cumulative path, applies the difference as a crop offset.
-    var translationCorrectionEnabled: Boolean = true
+    /**
+     * Whether the measured translation track is APPLIED as a correction. Off by
+     * default: the raw-FBO optical flow measured 7× the physically possible
+     * displacement on S26 (session 20260610_182744) and the injected correction
+     * anti-correlated with stability. Measurement + telemetry always run so
+     * EIS-off captures double as sensor-validation data.
+     */
+    var translationCorrectionEnabled: Boolean = false
         set(value) {
             if (field != value) {
                 field = value
@@ -274,7 +281,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
      * displacement to isolate the translation component.
      */
     fun onRawFrame(bitmap: android.graphics.Bitmap, frameTimestampNs: Long) {
-        if (!translationCorrectionEnabled || !_enabled) return
+        if (!_enabled) return  // measurement runs regardless of the apply flag
 
         val mat = org.opencv.core.Mat()
         val gray = org.opencv.core.Mat()
