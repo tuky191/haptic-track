@@ -100,6 +100,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     @Volatile private var zoomTarget: Float = 1f   // desired zoom from auto-zoom controller
     @Volatile private var zoomApplied: Float = 1f  // interpolated zoom dispatched to CameraX
     private var lastZoomDispatchNs: Long = 0L
+    private var lastZoomInterpNs: Long = 0L        // independent of EIS state (#174)
     private val ZOOM_INTERP_RATE = 25.0   // interpolation speed (~40ms TC)
     private val ZOOM_DISPATCH_NS = 16_000_000L  // CameraX dispatch throttle (~60Hz)
 
@@ -115,6 +116,31 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         zoomTarget = ratio
         zoomApplied = ratio
         zoomRatio = ratio
+    }
+
+    /**
+     * Zoom interpolation: ramp toward target at sensor rate, dispatch to CameraX at ~60Hz.
+     * Runs on every sensor sample regardless of EIS state — auto-zoom must work with
+     * stabilization off (#174). Owns its timestamp so EIS smoothing resets don't touch it.
+     */
+    internal fun interpolateZoom(nowNs: Long) {
+        val last = lastZoomInterpNs
+        lastZoomInterpNs = nowNs
+        val dtNs = nowNs - last
+        if (last == 0L || dtNs <= 0) return
+        if (dtNs > SENSOR_GAP_THRESHOLD_NS) {
+            zoomApplied = zoomTarget
+            zoomRatio = zoomApplied
+            return
+        }
+        val dtSec = dtNs / 1_000_000_000.0
+        val zoomAlpha = (1.0 - exp(-dtSec * ZOOM_INTERP_RATE)).toFloat()
+        zoomApplied += zoomAlpha * (zoomTarget - zoomApplied)
+        zoomRatio = zoomApplied
+        if (nowNs - lastZoomDispatchNs >= ZOOM_DISPATCH_NS) {
+            lastZoomDispatchNs = nowNs
+            onZoomApply?.invoke(zoomApplied)
+        }
     }
 
     /** Gaussian kernel smoothing for video frames (400ms output latency, ~95MB FBO buffer). */
@@ -541,6 +567,9 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             if (historyCount < QUAT_HISTORY_SIZE) historyCount++
         }
 
+        // Zoom dispatch must run before the enabled gate — auto-zoom works with EIS off (#174)
+        interpolateZoom(nowNs)
+
         if (!enabled) {
             currentMatrix.set(IDENTITY_MATRIX.clone())
             return
@@ -567,7 +596,6 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             smoothFastQuat = rawQuat
             prevRawQuat = rawQuat
             resetAdaptiveState()
-            zoomApplied = zoomTarget
             return
         }
 
@@ -660,15 +688,6 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         // onTrackingUpdate() still computes offsets for future use (VT-based center).
         val rawExcursion = maxCornerExcursion(hPortrait)
         currentMatrix.set(hPortrait)
-
-        // Zoom interpolation: ramp toward target at 200Hz, dispatch to CameraX at ~60Hz
-        val zoomAlpha = (1.0 - exp(-dtSec * ZOOM_INTERP_RATE)).toFloat()
-        zoomApplied += zoomAlpha * (zoomTarget - zoomApplied)
-        zoomRatio = zoomApplied
-        if (nowNs - lastZoomDispatchNs >= ZOOM_DISPATCH_NS) {
-            lastZoomDispatchNs = nowNs
-            onZoomApply?.invoke(zoomApplied)
-        }
 
         // --- Telemetry ---
         val corrAngleDeg = 2.0 * acos(correction.w.coerceIn(-1.0, 1.0)) * (180.0 / PI)
