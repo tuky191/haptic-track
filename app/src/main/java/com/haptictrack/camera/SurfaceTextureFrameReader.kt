@@ -48,7 +48,7 @@ class SurfaceTextureFrameReader(
     private val stabMatrixProvider: (() -> FloatArray)? = null,
     /** Called on GL thread at camera rate with a small raw (pre-stabilization) bitmap
      *  for translation displacement measurement. Bitmap is reused — do not retain. */
-    private val onRawFrame: ((Bitmap) -> Unit)? = null
+    private val onRawFrame: ((Bitmap, Long) -> Unit)? = null
 ) {
 
     companion object {
@@ -200,7 +200,7 @@ class SurfaceTextureFrameReader(
                             GLES20.glReadPixels(0, 0, rawW, rawH, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, rawBuf)
                             rawBuf.rewind()
                             rawBitmap!!.copyPixelsFromBuffer(rawBuf)
-                            onRawFrame.invoke(rawBitmap!!)
+                            onRawFrame.invoke(rawBitmap!!, st.timestamp)
                         }
 
                         // Render external texture to FBO at output resolution

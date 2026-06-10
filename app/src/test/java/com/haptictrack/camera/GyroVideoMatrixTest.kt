@@ -105,4 +105,40 @@ class GyroVideoMatrixTest {
         // New behavior: zero-phase reference at the frame time ≈ identity → corr ≈ 0.
         assertTrue("correction for a still frame must not include future rotation (got $corr UV)", corr < 0.03)
     }
+
+    /** Translation samples: cumX oscillates at 5Hz, cumY constant. Quats stay identity. */
+    private fun translationOffsets(cumXAt: (Double) -> Double): Pair<Float, Float> {
+        val stab = GyroStabilizer(RuntimeEnvironment.getApplication())
+        stab.adaptiveSmoothing = false
+        feedIdentity(stab, 1_000_000_000L, 1_800_000_000L, 5_000_000L)
+        var t = 1_000_000_000L
+        while (t <= 1_800_000_000L) {
+            val sec = (t - 1_000_000_000L) / 1e9
+            stab.recordTranslationSample(t, cumXAt(sec), 0.0)
+            t += 25_000_000L  // 40fps so a sample lands exactly on the frame timestamp
+        }
+        val m = stab.getVideoMatrix(1_450_000_000L)
+        val base = GyroStabilizer(RuntimeEnvironment.getApplication())
+        base.adaptiveSmoothing = false
+        feedIdentity(base, 1_000_000_000L, 1_800_000_000L, 5_000_000L)
+        val b = base.getVideoMatrix(1_450_000_000L)
+        return (m[6] - b[6]) to (m[7] - b[7])
+    }
+
+    @Test
+    fun `video translation correction cancels oscillation at the frame time`() {
+        // 5Hz hand-shake translation, frame at a positive peak (t=0.45s → sin=1).
+        val amp = 0.02
+        val (dx, _) = translationOffsets { sec -> amp * kotlin.math.sin(2 * Math.PI * 5.0 * sec) }
+        // Zero-phase mean over the symmetric window ≈ 0 → correction ≈ +amp on m6.
+        assertEquals("translation correction must offset the frame by ~the shake amplitude",
+            amp, dx.toDouble(), 0.005)
+    }
+
+    @Test
+    fun `video translation correction rejects constant offset`() {
+        val (dx, dy) = translationOffsets { 0.015 }
+        assertEquals(0.0, dx.toDouble(), 1e-4)
+        assertEquals(0.0, dy.toDouble(), 1e-4)
+    }
 }

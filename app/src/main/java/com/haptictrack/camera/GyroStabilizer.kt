@@ -239,6 +239,16 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     @Volatile private var rotOnlyUvX = 0.0   // latest rotation-only center offset (no translation)
     @Volatile private var rotOnlyUvY = 0.0
 
+    // Translation path history for the video (lookahead) path — zero-phase smoothing
+    // of the cumulative translation track, mirroring the rotation history ring.
+    private val TRANS_HISTORY_SIZE = 256  // ~8.5s at 30fps
+    private val transHistTs = LongArray(TRANS_HISTORY_SIZE)
+    private val transHistX = DoubleArray(TRANS_HISTORY_SIZE)
+    private val transHistY = DoubleArray(TRANS_HISTORY_SIZE)
+    private var transHistHead = 0
+    private var transHistCount = 0
+    private val transHistLock = Any()
+
     // Subject centering: nudge the crop toward the locked subject's bbox center.
     // Smooths the bbox center heavily to avoid detector jitter, then drifts the
     // crop offset so the subject moves toward frame center.
@@ -260,7 +270,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
      * Displacement = rotation + translation. We subtract the gyro-predicted rotation
      * displacement to isolate the translation component.
      */
-    fun onRawFrame(bitmap: android.graphics.Bitmap) {
+    fun onRawFrame(bitmap: android.graphics.Bitmap, frameTimestampNs: Long) {
         if (!translationCorrectionEnabled || !_enabled) return
 
         val mat = org.opencv.core.Mat()
@@ -331,6 +341,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
 
             transTargetUvX = (transCumX - transSmoothX).toFloat()
             transTargetUvY = (transCumY - transSmoothY).toFloat()
+            recordTranslationSample(frameTimestampNs, transCumX, transCumY)
 
             prev.release()
         } else {
@@ -838,7 +849,65 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         val correction = deviceToSensorQuat * correctionDevice * deviceToSensorQuat.conjugate()
         val r = correction.toRotationMatrix()
         val h = computeHomographyUV(r, fxEff, fyEff, cropZoom.toDouble())
-        return sensorToPortraitGL(h, sensorOrientation)
+        val hPortrait = sensorToPortraitGL(h, sensorOrientation)
+
+        // Translation correction, zero-phase: the causal path applies a lagged
+        // high-pass of the optical-flow translation track; with lookahead we
+        // subtract a symmetric Gaussian mean instead (same signs as causal path).
+        if (translationCorrectionEnabled) {
+            val (tx, ty) = videoTranslationCorrection(frameTimestampNs)
+            hPortrait[6] += tx
+            hPortrait[7] -= ty
+        }
+        return hPortrait
+    }
+
+    /** Record one optical-flow translation sample (cumulative track) for the video path. */
+    internal fun recordTranslationSample(timestampNs: Long, cumX: Double, cumY: Double) {
+        synchronized(transHistLock) {
+            transHistTs[transHistHead] = timestampNs
+            transHistX[transHistHead] = cumX
+            transHistY[transHistHead] = cumY
+            transHistHead = (transHistHead + 1) % TRANS_HISTORY_SIZE
+            if (transHistCount < TRANS_HISTORY_SIZE) transHistCount++
+        }
+    }
+
+    /**
+     * Zero-phase translation correction at the frame timestamp: cumulative track
+     * at the frame minus a Gaussian-weighted mean of the track around it.
+     * Leashed to the same margin fraction as the causal path.
+     */
+    private fun videoTranslationCorrection(frameTimestampNs: Long): Pair<Float, Float> {
+        val sigmaNs = FAST_SIGMA_TC_SCALE * TRANS_TC * 1e9
+        val windowNs = (3.0 * sigmaNs).toLong()
+        var nearIdx = -1; var nearDist = Long.MAX_VALUE
+        var sumW = 0.0; var meanX = 0.0; var meanY = 0.0
+        var cumAtFrameX = 0.0; var cumAtFrameY = 0.0
+        synchronized(transHistLock) {
+            if (transHistCount < 5) return 0f to 0f
+            for (i in 0 until transHistCount) {
+                val idx = (transHistHead - transHistCount + i + TRANS_HISTORY_SIZE) % TRANS_HISTORY_SIZE
+                val dt = transHistTs[idx] - frameTimestampNs
+                if (abs(dt) > windowNs) continue
+                val w = exp(-0.5 * (dt / sigmaNs) * (dt / sigmaNs))
+                sumW += w
+                meanX += w * transHistX[idx]
+                meanY += w * transHistY[idx]
+                if (abs(dt) < nearDist) {
+                    nearDist = abs(dt); nearIdx = idx
+                    cumAtFrameX = transHistX[idx]; cumAtFrameY = transHistY[idx]
+                }
+            }
+        }
+        // No sample close to the frame (stale history) → no correction
+        if (nearIdx < 0 || nearDist > 100_000_000L || sumW < 1e-12) return 0f to 0f
+        var tx = cumAtFrameX - meanX / sumW
+        var ty = cumAtFrameY - meanY / sumW
+        val maxCorrUv = 0.5 * (1.0 - 1.0 / cropZoom) * TRANS_MARGIN_FRAC
+        tx = tx.coerceIn(-maxCorrUv, maxCorrUv)
+        ty = ty.coerceIn(-maxCorrUv, maxCorrUv)
+        return tx.toFloat() to ty.toFloat()
     }
 
     /** Weighted quaternion average via iterative tangent-space refinement. */
@@ -1029,6 +1098,9 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         transAppliedUvX = 0f; transAppliedUvY = 0f
         prevGyroUvX = 0.0; prevGyroUvY = 0.0
         rotOnlyUvX = 0.0; rotOnlyUvY = 0.0
+        synchronized(transHistLock) {
+            transHistHead = 0; transHistCount = 0
+        }
     }
 
     private fun hfovToFocalUv(hfovDegrees: Double): Double {
