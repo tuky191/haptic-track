@@ -190,9 +190,14 @@ class GyroStabilizer(context: Context) : SensorEventListener {
      * Rotation happens in PIXEL space — UV axes have different physical lengths
      * (portrait h/w = LOCK_STREAM_ASPECT), so the off-diagonal terms carry the
      * aspect, else rotation shears the image.
+     *
+     * [corrDeg] is the rotation the IMAGE needs. The matrix transforms texture
+     * coordinates, which rotates the visible image by the inverse — hence the
+     * negation (verified on device: session 20260610_210744 doubled the roll
+     * before it).
      */
     private fun lockMatrix(corrDeg: Double, crop: Double): FloatArray {
-        val th = Math.toRadians(corrDeg)
+        val th = Math.toRadians(-corrDeg)
         val iz = 1.0 / crop
         val c = iz * cos(th)
         val s = iz * sin(th)
