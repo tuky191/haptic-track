@@ -570,6 +570,15 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         rawQuat = Quat(quaternion[0].toDouble(), quaternion[1].toDouble(),
                        quaternion[2].toDouble(), quaternion[3].toDouble()).normalized()
 
+        // Quaternions double-cover rotations (q ≡ −q) and the sensor may flip sign
+        // mid-stream. Keep raw in the smoothing state's hemisphere — otherwise the
+        // leash deviation reads ~360°, fires every sample, and snaps smoothed onto
+        // raw, silently disabling stabilization (session_20260610_173942: 100% of
+        // frames latched).
+        if (initialized && rawQuat.dot(smoothedQuat) < 0.0) {
+            rawQuat = Quat(-rawQuat.w, -rawQuat.x, -rawQuat.y, -rawQuat.z)
+        }
+
         val nowNs = event.timestamp
         try { benchGyroWriter?.println("$nowNs,${rawQuat.w},${rawQuat.x},${rawQuat.y},${rawQuat.z}") } catch (_: Exception) {}
 
@@ -675,7 +684,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         val cropMargin = 0.5 * (1.0 - 1.0 / cropZoom)
         val maxCorrAngle = cropMargin / maxOf(fxEff, fyEff)
         val devQuat = smoothedQuat.conjugate() * rawQuat
-        val devAngle = 2.0 * acos(devQuat.w.coerceIn(-1.0, 1.0))
+        val devAngle = 2.0 * acos(abs(devQuat.w).coerceIn(0.0, 1.0))
         lastLeashActive = leashEnabled && devAngle > maxCorrAngle && devAngle > 1e-6
         if (lastLeashActive) {
             val catchUp = 1.0 - maxCorrAngle / devAngle
@@ -716,7 +725,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         currentMatrix.set(hPortrait)
 
         // --- Telemetry ---
-        val corrAngleDeg = 2.0 * acos(correction.w.coerceIn(-1.0, 1.0)) * (180.0 / PI)
+        val corrAngleDeg = 2.0 * acos(abs(correction.w).coerceIn(0.0, 1.0)) * (180.0 / PI)
         lastCorrAngleDeg = corrAngleDeg
 
         telFrames++
@@ -826,7 +835,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         val cropMargin = 0.5 * (1.0 - 1.0 / cropZoom)
         val maxCorrAngle = cropMargin / maxOf(fxEff, fyEff)
         val devQuat = smoothed.conjugate() * rawAtTarget
-        val devAngle = 2.0 * acos(devQuat.w.coerceIn(-1.0, 1.0))
+        val devAngle = 2.0 * acos(abs(devQuat.w).coerceIn(0.0, 1.0))
         if (leashEnabled && devAngle > maxCorrAngle && devAngle > 1e-6) {
             val catchUp = 1.0 - maxCorrAngle / devAngle
             smoothed = slerp(smoothed, rawAtTarget, catchUp)
