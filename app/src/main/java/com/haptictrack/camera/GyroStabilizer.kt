@@ -440,7 +440,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
                 it.println("frame_idx,timestamp_ns")
             }
             benchCorrWriter = PrintWriter(FileWriter(File(dir, "corrections.csv")), false).also {
-                it.println("frame_idx,timestamp_ns,raw_w,raw_x,raw_y,raw_z,smooth_w,smooth_x,smooth_y,smooth_z,eff_tc,corr_deg,leash,m0,m1,m2,m3,m4,m5,m6,m7,m8")
+                it.println("frame_idx,timestamp_ns,raw_w,raw_x,raw_y,raw_z,smooth_w,smooth_x,smooth_y,smooth_z,eff_tc,corr_deg,leash,m0,m1,m2,m3,m4,m5,m6,m7,m8,zoom")
             }
             PrintWriter(FileWriter(File(dir, "bench_params.csv"))).use { pw ->
                 pw.println("timeConstant,cropZoom,fxUv,fyUv,clampMarginFraction,oisCompensation")
@@ -475,7 +475,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             "${rq.w},${rq.x},${rq.y},${rq.z}," +
             "${sq.w},${sq.x},${sq.y},${sq.z}," +
             "$effectiveTc,$lastCorrAngleDeg,$leash," +
-            "${mat[0]},${mat[1]},${mat[2]},${mat[3]},${mat[4]},${mat[5]},${mat[6]},${mat[7]},${mat[8]}")
+            "${mat[0]},${mat[1]},${mat[2]},${mat[3]},${mat[4]},${mat[5]},${mat[6]},${mat[7]},${mat[8]},$zoomRatio")
     }
 
     /** Get the current stabilization matrix (column-major mat3, 9 floats). Thread-safe. */
@@ -645,9 +645,17 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         val fastAlpha = 1.0 - exp(-(1.0 / sampleRate) / adaptFastTc)
         smoothFastQuat = slerp(smoothFastQuat, rawQuat, fastAlpha)
 
+        // Camera zoom magnifies on-screen motion: the SurfaceTexture stream is
+        // already zoom-cropped by the ISP, so its UV [0,1]² spans 1/zoom of the
+        // FOV and the same rotation displaces pixels zoom× farther. Scale the
+        // focal lengths so corrections (and the leash budget) match the stream.
+        val zoomFocal = zoomRatio.toDouble().coerceAtLeast(0.1)
+        val fxEff = fxUv * zoomFocal
+        val fyEff = fyUv * zoomFocal
+
         // Leash: limit how far smoothed can deviate from raw.
         val cropMargin = 0.5 * (1.0 - 1.0 / cropZoom)
-        val maxCorrAngle = cropMargin / maxOf(fxUv, fyUv)
+        val maxCorrAngle = cropMargin / maxOf(fxEff, fyEff)
         val devQuat = smoothedQuat.conjugate() * rawQuat
         val devAngle = 2.0 * acos(devQuat.w.coerceIn(-1.0, 1.0))
         lastLeashActive = leashEnabled && devAngle > maxCorrAngle && devAngle > 1e-6
@@ -668,7 +676,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
 
         // Build homography H = K × R × K⁻¹ in UV [0,1]² space
         val r = correction.toRotationMatrix()
-        val h = computeHomographyUV(r, fxUv, fyUv, cropZoom.toDouble())
+        val h = computeHomographyUV(r, fxEff, fyEff, cropZoom.toDouble())
 
         val hPortrait = sensorToPortraitGL(h, sensorOrientation)
         // Capture rotation-only center offset BEFORE adding translation correction.
