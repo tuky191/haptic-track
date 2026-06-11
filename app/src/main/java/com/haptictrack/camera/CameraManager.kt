@@ -50,6 +50,21 @@ class CameraManager(private val context: Context) {
     /** Whether to request ISP-level preview stabilization on next bind. */
     var ispStabilizationEnabled: Boolean = false
 
+    /** ISP tracker probe (#ISP-tracker experiment): result logging gate. */
+    @Volatile private var ispTrackerActive = false
+
+    /**
+     * ISP tracker probe — PERMANENTLY OFF on S26 Ultra. The vendor channel is
+     * open (config keys accepted, result keys returned) and the source-verified
+     * CamX T2T protocol was used (one-shot register, square active-array ROI),
+     * but Samsung's HAL SEGFAULTS natively in CamX::TrackerNode::TrackerThreadCb
+     * on any registration (2026-06-11, camera.qcom.core.so +2524) — their
+     * 3rd-party topology likely never wires the node's FD buffer port. Not
+     * fixable from an app. com.qti.stats.tracker.so ships on the device; keys
+     * and protocol kept for reference should another device wire the node.
+     */
+    var ispTrackerProbeEnabled: Boolean = false
+
     /** Current lens facing — back by default. */
     var isFrontCamera: Boolean = false
         private set
@@ -175,6 +190,64 @@ class CameraManager(private val context: Context) {
                     CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON
                 )
             }
+            // DIAGNOSTIC: ground-truth probe of what the HAL returns to THIS app —
+            // applied stabilization mode (VDIS verification) + vendor OIS hall data
+            // visibility (tag 0x81340006 exists in the registry but isn't advertised;
+            // vendor key visibility is per-client on Samsung, so dumpsys isn't proof).
+            setSessionCaptureCallback(object : android.hardware.camera2.CameraCaptureSession.CaptureCallback() {
+                private var logged = false
+                override fun onCaptureCompleted(
+                    session: android.hardware.camera2.CameraCaptureSession,
+                    request: CaptureRequest,
+                    result: android.hardware.camera2.TotalCaptureResult
+                ) {
+                    if (logged) return
+                    logged = true
+                    val applied = result.get(android.hardware.camera2.CaptureResult.CONTROL_VIDEO_STABILIZATION_MODE)
+                    val oisMode = result.get(android.hardware.camera2.CaptureResult.LENS_OPTICAL_STABILIZATION_MODE)
+                    Log.i(TAG, "PROBE applied videoStab=$applied oisMode=$oisMode (requested vdis=$useVdis)")
+                    val vendor = result.keys.filter { k ->
+                        val n = k.name
+                        n.startsWith("samsung.") || n.startsWith("com.samsung") || n.startsWith("org.quic")
+                    }
+                    Log.i(TAG, "PROBE vendor result keys (${vendor.size}): ${vendor.joinToString { it.name }}")
+                    try {
+                        @Suppress("UNCHECKED_CAST")
+                        val hallKey = android.hardware.camera2.CaptureResult.Key(
+                            "samsung.android.statistics.oisHallInfo", LongArray::class.java)
+                        val hall = result.get(hallKey)
+                        Log.i(TAG, "PROBE oisHallInfo explicit read: " +
+                            (hall?.let { "${it.size} values, first=${it.take(4)}" } ?: "null"))
+                    } catch (e: Throwable) {
+                        Log.i(TAG, "PROBE oisHallInfo explicit read threw: ${e.message}")
+                    }
+                }
+            })
+            // ISP tracker probe: log Qualcomm T2T results while registered (#ISP-tracker
+            // experiment). Separate callback so it logs continuously, not once.
+            setSessionCaptureCallback(object : android.hardware.camera2.CameraCaptureSession.CaptureCallback() {
+                private var frame = 0L
+                override fun onCaptureCompleted(
+                    session: android.hardware.camera2.CameraCaptureSession,
+                    request: CaptureRequest,
+                    result: android.hardware.camera2.TotalCaptureResult
+                ) {
+                    if (!ispTrackerActive) return
+                    if (frame++ % 5 != 0L) return
+                    try {
+                        val status = result.get(android.hardware.camera2.CaptureResult.Key(
+                            "org.quic.camera2.objectTrackingResults.TrackerStatus", Int::class.javaObjectType))
+                        val roi = result.get(android.hardware.camera2.CaptureResult.Key(
+                            "org.quic.camera2.objectTrackingResults.ResultROI", IntArray::class.java))
+                        val score = result.get(android.hardware.camera2.CaptureResult.Key(
+                            "org.quic.camera2.objectTrackingResults.TrackerScore", Int::class.javaObjectType))
+                        Log.i("IspTracker", "f=$frame status=$status score=$score roi=${roi?.joinToString()}")
+                    } catch (e: Throwable) {
+                        Log.i("IspTracker", "result read threw: ${e.message}")
+                        ispTrackerActive = false
+                    }
+                }
+            })
         }
         Log.i(TAG, if (useVdis) "VDIS ON (vendor video stabilization via interop)"
                else if (ispStabilizationEnabled) "VDIS OFF (gyro EIS takes over)"
@@ -263,6 +336,89 @@ class CameraManager(private val context: Context) {
         val clamped = ratio.coerceIn(getMinZoom(), getMaxZoom())
         cameraControl?.setZoomRatio(clamped)
         gyroStabilizer.setZoomImmediate(clamped)
+    }
+
+    /**
+     * Register a region with the Qualcomm ISP object tracker (Touch-to-Track) —
+     * probe experiment. [normBox] is in portrait-normalized view coords; converted
+     * to sensor active-array coords (orientation 90, zoom-visible region).
+     * ROI layout assumed [x, y, w, h]; status/score/ROI are logged per frame by the
+     * IspTracker capture callback for offline comparison against VisualTracker.
+     */
+    @Suppress("UnsafeOptInUsageError")
+    fun ispTrackerRegister(normBox: android.graphics.RectF, zoomRatio: Float) {
+        if (!ispTrackerProbeEnabled) return
+        val cc = cameraControl ?: return
+        try {
+            val aw = 4080f; val ah = 3060f  // S26 active array (probe-only; TODO read from characteristics)
+            val z = maxOf(zoomRatio, 1f)
+            val visW = aw / z; val visH = ah / z
+            val cx0 = (aw - visW) / 2f; val cy0 = (ah - visH) / 2f
+            // portrait norm -> sensor (SENSOR_ORIENTATION 90): sx = py, sy = 1 - px
+            fun sx(py: Float) = cx0 + py * visW
+            fun sy(px: Float) = cy0 + (1f - px) * visH
+            val x1 = sx(normBox.top); val x2 = sx(normBox.bottom)
+            val y1 = sy(normBox.right); val y2 = sy(normBox.left)
+            val l = minOf(x1, x2); val t = minOf(y1, y2)
+            val w = kotlin.math.abs(x2 - x1); val h = kotlin.math.abs(y2 - y1)
+            // The HAL forces the ROI square (width := height) — send it square,
+            // centered on the original box (camxtrackernode.cpp).
+            val side = minOf(w, h)
+            val roi = intArrayOf(
+                (l + w / 2f - side / 2f).toInt(), (t + h / 2f - side / 2f).toInt(),
+                side.toInt(), side.toInt()
+            )
+            val c2 = androidx.camera.camera2.interop.Camera2CameraControl.from(cc)
+            c2.addCaptureRequestOptions(
+                androidx.camera.camera2.interop.CaptureRequestOptions.Builder()
+                    .setCaptureRequestOption(CaptureRequest.Key(
+                        "org.quic.camera2.objectTrackingConfig.Enable", Byte::class.javaObjectType), 1.toByte())
+                    .setCaptureRequestOption(CaptureRequest.Key(
+                        "org.quic.camera2.objectTrackingConfig.RegisterROI", IntArray::class.java), roi)
+                    .setCaptureRequestOption(CaptureRequest.Key(
+                        "org.quic.camera2.objectTrackingConfig.CmdTrigger", Int::class.javaObjectType), 1)
+                    .build()
+            )
+            ispTrackerActive = true
+            Log.i("IspTracker", "REGISTER roi=${roi.joinToString()} (zoom=$z, normBox=$normBox)")
+            // One-shot emulation: demote the trigger to Track (0) after a few frames.
+            // A sticky Reg re-registers whenever zoom changes the crop-translated ROI
+            // (HAL dedup compares post-translation) — that storm froze round 1.
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                if (!ispTrackerActive) return@postDelayed
+                try {
+                    c2.addCaptureRequestOptions(
+                        androidx.camera.camera2.interop.CaptureRequestOptions.Builder()
+                            .setCaptureRequestOption(CaptureRequest.Key(
+                                "org.quic.camera2.objectTrackingConfig.CmdTrigger", Int::class.javaObjectType), 0)
+                            .build()
+                    )
+                    Log.i("IspTracker", "TRIGGER demoted to Track")
+                } catch (e: Throwable) {
+                    Log.w("IspTracker", "trigger demote failed: ${e.message}")
+                }
+            }, 150)
+        } catch (e: Throwable) {
+            Log.w("IspTracker", "register failed: ${e.message}")
+        }
+    }
+
+    @Suppress("UnsafeOptInUsageError")
+    fun ispTrackerCancel() {
+        val cc = cameraControl ?: return
+        ispTrackerActive = false
+        try {
+            val opts = androidx.camera.camera2.interop.CaptureRequestOptions.Builder()
+                .setCaptureRequestOption(CaptureRequest.Key(
+                    "org.quic.camera2.objectTrackingConfig.Enable", Byte::class.javaObjectType), 0.toByte())
+                .setCaptureRequestOption(CaptureRequest.Key(
+                    "org.quic.camera2.objectTrackingConfig.CmdTrigger", Int::class.javaObjectType), 2)
+                .build()
+            androidx.camera.camera2.interop.Camera2CameraControl.from(cc).addCaptureRequestOptions(opts)
+            Log.i("IspTracker", "CANCEL")
+        } catch (e: Throwable) {
+            Log.w("IspTracker", "cancel failed: ${e.message}")
+        }
     }
 
     fun getMinZoom(): Float = cameraInfo?.zoomState?.value?.minZoomRatio ?: 1f

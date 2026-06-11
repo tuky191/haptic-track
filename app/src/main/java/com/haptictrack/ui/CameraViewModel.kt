@@ -191,6 +191,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             objectTracker.lockOnObject(tapped.id, tapped.boundingBox, tapped.label)
             _uiState.update { it.copy(status = TrackingStatus.LOCKED, trackedObject = tapped) }
             if (!_uiState.value.isRecording) toggleRecording()
+            // ISP tracker probe: register the same box with the Qualcomm hardware
+            // tracker for side-by-side comparison (logcat tag IspTracker)
+            cameraManager.ispTrackerRegister(tapped.boundingBox, cameraManager.gyroStabilizer.zoomRatio)
         }
     }
 
@@ -381,6 +384,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         }
         objectTracker.clearLock()
         zoomController.reset()
+        cameraManager.ispTrackerCancel()
         hapticManager.updateTrackingStatus(TrackingStatus.IDLE)
         _uiState.update {
             TrackingUiState(status = TrackingStatus.IDLE, isRecording = false, captureMode = it.captureMode, stealthMode = it.stealthMode, isReady = it.isReady, ispStabilization = it.ispStabilization, gyroEis = it.gyroEis, gyroStrength = it.gyroStrength, adaptiveEis = it.adaptiveEis, leashEnabled = it.leashEnabled, oisCompensation = it.oisCompensation, translationEis = it.translationEis, trackingFilter = it.trackingFilter, hapticStrength = it.hapticStrength)
