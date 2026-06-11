@@ -97,11 +97,28 @@ class CameraManager(private val context: Context) {
     var videoCapture = createVideoCapture()
         private set
 
+    /**
+     * Recording preset. false = 4K30 (UHD — the hardware's 4K fps cap).
+     * true = FHD 1080p60 with vendor VDIS: 60fps is only available at
+     * 1080p-class sizes, and Samsung grants third-party VDIS real corrective
+     * margin below 4K (vdisPreviewMargin=0 at UHD → inert). Changing the
+     * preset requires recreating VideoCapture + rebind.
+     */
+    var fhd60VdisPreset: Boolean = false
+        set(value) {
+            if (field != value) {
+                field = value
+                videoCapture = createVideoCapture()
+            }
+        }
+
     private fun createVideoCapture(): VideoCapture<Recorder> {
+        val qualities = if (fhd60VdisPreset) listOf(Quality.FHD, Quality.HD)
+                        else listOf(Quality.UHD, Quality.FHD, Quality.HD)
         val recorder = Recorder.Builder()
             .setQualitySelector(
                 QualitySelector.fromOrderedList(
-                    listOf(Quality.UHD, Quality.FHD, Quality.HD),
+                    qualities,
                     FallbackStrategy.higherQualityOrLowerThan(Quality.FHD)
                 )
             )
@@ -170,7 +187,7 @@ class CameraManager(private val context: Context) {
                        else CameraSelector.DEFAULT_BACK_CAMERA
 
         val previewBuilder = Preview.Builder()
-        val useVdis = ispStabilizationEnabled && !gyroStabilizer.enabled
+        val useVdis = (ispStabilizationEnabled || fhd60VdisPreset) && !gyroStabilizer.enabled
         @Suppress("UnsafeOptInUsageError")
         Camera2Interop.Extender(previewBuilder).apply {
             setCaptureRequestOption(
@@ -188,6 +205,14 @@ class CameraManager(private val context: Context) {
                 setCaptureRequestOption(
                     CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
                     CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON
+                )
+            }
+            if (fhd60VdisPreset) {
+                // 60fps pin — legal at FHD (minFrameDuration 16.6ms); forces
+                // exposures <= 1/60s, so indoor footage gets a bit darker.
+                setCaptureRequestOption(
+                    CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                    android.util.Range(60, 60)
                 )
             }
             // DIAGNOSTIC: ground-truth probe of what the HAL returns to THIS app —

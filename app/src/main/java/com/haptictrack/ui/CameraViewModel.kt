@@ -361,6 +361,15 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         _uiState.update { it.copy(horizonLock = newValue) }
     }
 
+    /** Recording preset: 4K30 ↔ FHD 1080p60 + vendor VDIS. Needs a rebind; blocked while recording. */
+    fun toggleFhd60Vdis() {
+        if (_uiState.value.isRecording) return
+        val newValue = !_uiState.value.fhd60Vdis
+        cameraManager.fhd60VdisPreset = newValue
+        _uiState.update { it.copy(fhd60Vdis = newValue) }
+        cameraManager.rebind()
+    }
+
     fun setGyroStrength(strength: Float) {
         val clamped = strength.coerceIn(0f, 1f)
         val tc = GYRO_TC_MAX - GYRO_TC_RANGE * clamped
