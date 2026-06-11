@@ -155,29 +155,30 @@ class CameraManager(private val context: Context) {
                        else CameraSelector.DEFAULT_BACK_CAMERA
 
         val previewBuilder = Preview.Builder()
-        if (ispStabilizationEnabled && !gyroStabilizer.enabled) {
-            try {
-                val caps = Preview.getPreviewCapabilities(provider.getCameraInfo(selector))
-                if (caps.isStabilizationSupported) {
-                    previewBuilder.setPreviewStabilizationEnabled(true)
-                    Log.i(TAG, "ISP stabilization ON")
-                } else {
-                    Log.i(TAG, "ISP stabilization requested but not supported on this device")
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to query stabilization caps: ${e.message}")
-            }
-        } else if (ispStabilizationEnabled && gyroStabilizer.enabled) {
-            Log.i(TAG, "ISP stabilization OFF (gyro EIS takes over)")
-        } else {
-            Log.i(TAG, "ISP stabilization OFF (user toggle)")
-        }
+        val useVdis = ispStabilizationEnabled && !gyroStabilizer.enabled
         @Suppress("UnsafeOptInUsageError")
-        Camera2Interop.Extender(previewBuilder)
-            .setCaptureRequestOption(
+        Camera2Interop.Extender(previewBuilder).apply {
+            setCaptureRequestOption(
                 CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
                 CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON
             )
+            if (useVdis) {
+                // Vendor VDIS (CONTROL_VIDEO_STABILIZATION_MODE_ON): Samsung's own
+                // digital stabilization — zero-phase, RS-aware, translation-handling.
+                // Applies to the whole repeating request (both streams). The S26
+                // advertises modes [OFF, ON, PREVIEW_STABILIZATION]; whether the
+                // HAL honors ON at 4K is what this build tests. The old CameraX
+                // setPreviewStabilizationEnabled used mode 2, which Snapdragon
+                // ISPs cap at 1080p.
+                setCaptureRequestOption(
+                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON
+                )
+            }
+        }
+        Log.i(TAG, if (useVdis) "VDIS ON (vendor video stabilization via interop)"
+               else if (ispStabilizationEnabled) "VDIS OFF (gyro EIS takes over)"
+               else "VDIS OFF (user toggle)")
         if (gyroStabilizer.enabled) {
             gyroStabilizer.oisCompensation = 0.40
             Log.i(TAG, "OIS + gyro EIS: oisCompensation=${gyroStabilizer.oisCompensation}")

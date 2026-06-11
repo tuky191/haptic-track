@@ -97,7 +97,7 @@ class HorizonLockTest {
         val stab = GyroStabilizer(RuntimeEnvironment.getApplication())
         stab.enabled = false
         stab.horizonLockEnabled = true
-        feed(stab, rollDeg = 6.0, fromNs = 1_000_000_000L, toNs = 2_000_000_000L)
+        feed(stab, rollDeg = 6.0, fromNs = 1_000_000_000L, toNs = 4_000_000_000L)  // > 5x LOCK_TC
         val m = stab.getMatrix()
         assertEquals("counter-rotation must equal -roll", -6.0, matrixRollDeg(m), 0.3)
         // crop applied: uniform scale 1/1.15 in pixel space
@@ -137,17 +137,17 @@ class HorizonLockTest {
     }
 
     @Test
-    fun `applied correction slews instead of jumping`() {
+    fun `applied correction levels gradually instead of jumping`() {
         val stab = GyroStabilizer(RuntimeEnvironment.getApplication())
         stab.enabled = false
         stab.horizonLockEnabled = true
         feed(stab, rollDeg = 0.0, fromNs = 1_000_000_000L, toNs = 1_500_000_000L)
-        // roll steps to 8 deg; after only 30ms the applied correction must be
-        // mid-slew (rate-limited), not snapped to -8.
-        feed(stab, rollDeg = 8.0, fromNs = 1_505_000_000L, toNs = 1_530_000_000L)
+        // roll steps to 8 deg; after 100ms the low-pass (TC=0.4s) must be at
+        // ~22% of the step, not snapped to -8 — the lock is a slow leveler.
+        feed(stab, rollDeg = 8.0, fromNs = 1_505_000_000L, toNs = 1_600_000_000L)
         val mid = matrixRollDeg(stab.getMatrix())
-        assertTrue("expected partial slew, got $mid", mid < -0.5 && mid > -7.5)
-        feed(stab, rollDeg = 8.0, fromNs = 1_535_000_000L, toNs = 3_000_000_000L)
+        assertTrue("expected partial leveling, got $mid", mid < -1.0 && mid > -4.0)
+        feed(stab, rollDeg = 8.0, fromNs = 1_605_000_000L, toNs = 4_000_000_000L)
         assertEquals(-8.0, matrixRollDeg(stab.getMatrix()), 0.3)
     }
 }

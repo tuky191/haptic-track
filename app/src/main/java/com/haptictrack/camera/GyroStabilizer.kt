@@ -89,7 +89,12 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         const val LOCK_RELEASE_END_DEG = 25.0    // fully released
         const val LOCK_STREAM_ASPECT = 16.0 / 9.0  // portrait stream h/w in quad UV
         const val LOCK_CROP = 1.15               // margin for ±10° (measured walk needs ≥1.042)
-        private const val LOCK_SLEW_DEG_PER_S = 60.0  // p95 roll rate measured 16.5°/s
+        private const val LOCK_SLEW_DEG_PER_S = 60.0  // safety bound on correction rate
+        // The lock is a slow LEVELER, not a rigid clamp: the horizon drifts at <1Hz,
+        // everything faster is shake. Unsmoothed, the correction carried 9.2° RMS of
+        // 3-8Hz oscillation (A/B session 20260611_073437) — chasing fusion noise and
+        // aliasing through the 30fps render as visible wobble.
+        private const val LOCK_TC = 0.4          // causal low-pass; video path uses the σ=400ms Gaussian
 
         /** Roll of the device about the optical axis vs gravity, degrees (0 = portrait level). */
         fun gravityRollDeg(q: Quat): Double {
@@ -166,7 +171,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         zoomRatio = ratio
     }
 
-    /** Slew-limit the applied lock correction toward the gravity target. */
+    /** Low-pass the applied lock correction toward the gravity target (slew-bounded). */
     private fun updateLock(nowNs: Long) {
         if (!horizonLockEnabled) {
             lockAppliedDeg = 0.0
@@ -181,8 +186,10 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             lockAppliedDeg = target
             return
         }
-        val maxStep = LOCK_SLEW_DEG_PER_S * dtNs / 1e9
-        lockAppliedDeg += (target - lockAppliedDeg).coerceIn(-maxStep, maxStep)
+        val dtSec = dtNs / 1e9
+        val alpha = 1.0 - exp(-dtSec / LOCK_TC)
+        val maxStep = LOCK_SLEW_DEG_PER_S * dtSec
+        lockAppliedDeg += (alpha * (target - lockAppliedDeg)).coerceIn(-maxStep, maxStep)
     }
 
     /**
@@ -959,12 +966,14 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     fun getVideoMatrix(frameTimestampNs: Long): FloatArray {
         if (!_enabled) {
             if (!horizonLockEnabled) return IDENTITY_MATRIX.clone()
-            // Lock-only path: roll evaluated at the frame timestamp from history.
+            // Lock-only path: roll from the Gaussian-smoothed orientation around the
+            // frame timestamp (zero-phase). Instantaneous roll wobbles at 3-8Hz
+            // (fusion noise + real shake) — the lock levels slow drift only.
             val window = snapshotWindow(frameTimestampNs) ?: return getMatrix()
             if (window.count < 10) return getMatrix()
             val ti = findClosestIndex(window.timestamps, window.count, frameTimestampNs)
-            val q = Quat(window.w[ti], window.x[ti], window.y[ti], window.z[ti])
-            return lockMatrix(lockTargetDeg(gravityRollDeg(q)), LOCK_CROP)
+            val meanQ = gaussianMeanQuat(window, frameTimestampNs, GAUSSIAN_SIGMA_MS * 1_000_000.0, ti)
+            return lockMatrix(lockTargetDeg(gravityRollDeg(meanQ)), LOCK_CROP)
         }
 
         val window = snapshotWindow(frameTimestampNs) ?: return getMatrix()
@@ -1018,9 +1027,10 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             hPortrait[6] += tx
             hPortrait[7] -= ty
         }
-        // Horizon lock composes on top (no extra crop — EIS margin covers ±10°)
+        // Horizon lock composes on top (no extra crop — EIS margin covers ±10°).
+        // Roll from the heavy-smoothed orientation, not the instantaneous one.
         return if (horizonLockEnabled) {
-            mat3Mul(lockMatrix(lockTargetDeg(gravityRollDeg(rawAtTarget)), 1.0), hPortrait)
+            mat3Mul(lockMatrix(lockTargetDeg(gravityRollDeg(smoothed)), 1.0), hPortrait)
         } else hPortrait
     }
 
