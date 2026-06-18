@@ -88,7 +88,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
         const val LOCK_RELEASE_START_DEG = 15.0  // fade begins (intentional tilt)
         const val LOCK_RELEASE_END_DEG = 25.0    // fully released
         const val LOCK_STREAM_ASPECT = 16.0 / 9.0  // portrait stream h/w in quad UV
-        const val LOCK_CROP = 1.15               // margin for ±10° (measured walk needs ≥1.042)
+        const val LOCK_CROP = 1.15               // EIS-off crop; supports ~±5° (covers the measured ±5° walk). Larger roll is clamped by maxLockAngleDeg, not cropped to black.
         private const val LOCK_SLEW_DEG_PER_S = 60.0  // safety bound on correction rate
         // The lock is a slow LEVELER, not a rigid clamp: the horizon drifts at <1Hz,
         // everything faster is shake. Unsmoothed, the correction carried 9.2° RMS of
@@ -103,12 +103,30 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             return Math.toDegrees(atan2(gx, gy))
         }
 
-        /** Lock correction for a given roll: clamped to range, faded to zero toward release end. */
-        fun lockTargetDeg(rollDeg: Double): Double {
+        /**
+         * Max roll (deg) a given crop can counter-rotate without exposing black
+         * corners. A centered rotation θ of a portrait frame (h/w = aspect) needs
+         * zoom z ≥ cosθ + aspect·sinθ; inverting gives the largest θ for a crop.
+         * (Verified against maxCornerExcursion: crop 1.15 → 4.9°, 1.30 → 10.2°.)
+         */
+        fun maxLockAngleDeg(crop: Double): Double {
+            val a = LOCK_STREAM_ASPECT
+            val r = sqrt(1.0 + a * a)
+            if (crop >= r) return 90.0
+            return Math.toDegrees(atan(a) - acos((crop / r).coerceIn(-1.0, 1.0))).coerceAtLeast(0.0)
+        }
+
+        /**
+         * Lock correction for a given roll: faded to zero toward release end, then
+         * clamped to [maxAngleDeg] — the crop-supported limit, so the counter-rotation
+         * never demands more margin than exists (prevents black corners).
+         */
+        fun lockTargetDeg(rollDeg: Double, maxAngleDeg: Double = LOCK_RANGE_DEG): Double {
             val a = abs(rollDeg)
             val fade = ((LOCK_RELEASE_END_DEG - a) /
                 (LOCK_RELEASE_END_DEG - LOCK_RELEASE_START_DEG)).coerceIn(0.0, 1.0)
-            return -rollDeg.coerceIn(-LOCK_RANGE_DEG, LOCK_RANGE_DEG) * fade
+            val limit = minOf(LOCK_RANGE_DEG, maxAngleDeg)
+            return -rollDeg.coerceIn(-limit, limit) * fade
         }
     }
 
@@ -178,7 +196,10 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             lastLockNs = nowNs
             return
         }
-        val target = lockTargetDeg(gravityRollDeg(rawQuat))
+        // Clamp to the angle the crop this frame renders through can support:
+        // EIS-off path uses LOCK_CROP; EIS-on path composes on the slider cropZoom.
+        val renderCrop = if (_enabled) cropZoom.toDouble() else LOCK_CROP
+        val target = lockTargetDeg(gravityRollDeg(rawQuat), maxLockAngleDeg(renderCrop))
         val last = lastLockNs
         lastLockNs = nowNs
         val dtNs = nowNs - last
@@ -973,7 +994,7 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             if (window.count < 10) return getMatrix()
             val ti = findClosestIndex(window.timestamps, window.count, frameTimestampNs)
             val meanQ = gaussianMeanQuat(window, frameTimestampNs, GAUSSIAN_SIGMA_MS * 1_000_000.0, ti)
-            return lockMatrix(lockTargetDeg(gravityRollDeg(meanQ)), LOCK_CROP)
+            return lockMatrix(lockTargetDeg(gravityRollDeg(meanQ), maxLockAngleDeg(LOCK_CROP)), LOCK_CROP)
         }
 
         val window = snapshotWindow(frameTimestampNs) ?: return getMatrix()
@@ -1027,10 +1048,12 @@ class GyroStabilizer(context: Context) : SensorEventListener {
             hPortrait[6] += tx
             hPortrait[7] -= ty
         }
-        // Horizon lock composes on top (no extra crop — EIS margin covers ±10°).
+        // Horizon lock composes on top (no extra crop — rides the EIS cropZoom
+        // margin, so the lock angle is clamped to what cropZoom supports).
         // Roll from the heavy-smoothed orientation, not the instantaneous one.
         return if (horizonLockEnabled) {
-            mat3Mul(lockMatrix(lockTargetDeg(gravityRollDeg(smoothed)), 1.0), hPortrait)
+            val maxA = maxLockAngleDeg(cropZoom.toDouble())
+            mat3Mul(lockMatrix(lockTargetDeg(gravityRollDeg(smoothed), maxA), 1.0), hPortrait)
         } else hPortrait
     }
 

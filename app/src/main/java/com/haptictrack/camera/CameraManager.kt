@@ -101,16 +101,10 @@ class CameraManager(private val context: Context) {
      * Recording preset. false = 4K30 (UHD — the hardware's 4K fps cap).
      * true = FHD 1080p60 with vendor VDIS: 60fps is only available at
      * 1080p-class sizes, and Samsung grants third-party VDIS real corrective
-     * margin below 4K (vdisPreviewMargin=0 at UHD → inert). Changing the
-     * preset requires recreating VideoCapture + rebind.
+     * margin below 4K (vdisPreviewMargin=0 at UHD → inert). Takes effect on the
+     * next rebind() (bindUseCases recreates VideoCapture from this flag).
      */
     var fhd60VdisPreset: Boolean = false
-        set(value) {
-            if (field != value) {
-                field = value
-                videoCapture = createVideoCapture()
-            }
-        }
 
     private fun createVideoCapture(): VideoCapture<Recorder> {
         val qualities = if (fhd60VdisPreset) listOf(Quality.FHD, Quality.HD)
@@ -215,64 +209,6 @@ class CameraManager(private val context: Context) {
                     android.util.Range(60, 60)
                 )
             }
-            // DIAGNOSTIC: ground-truth probe of what the HAL returns to THIS app —
-            // applied stabilization mode (VDIS verification) + vendor OIS hall data
-            // visibility (tag 0x81340006 exists in the registry but isn't advertised;
-            // vendor key visibility is per-client on Samsung, so dumpsys isn't proof).
-            setSessionCaptureCallback(object : android.hardware.camera2.CameraCaptureSession.CaptureCallback() {
-                private var logged = false
-                override fun onCaptureCompleted(
-                    session: android.hardware.camera2.CameraCaptureSession,
-                    request: CaptureRequest,
-                    result: android.hardware.camera2.TotalCaptureResult
-                ) {
-                    if (logged) return
-                    logged = true
-                    val applied = result.get(android.hardware.camera2.CaptureResult.CONTROL_VIDEO_STABILIZATION_MODE)
-                    val oisMode = result.get(android.hardware.camera2.CaptureResult.LENS_OPTICAL_STABILIZATION_MODE)
-                    Log.i(TAG, "PROBE applied videoStab=$applied oisMode=$oisMode (requested vdis=$useVdis)")
-                    val vendor = result.keys.filter { k ->
-                        val n = k.name
-                        n.startsWith("samsung.") || n.startsWith("com.samsung") || n.startsWith("org.quic")
-                    }
-                    Log.i(TAG, "PROBE vendor result keys (${vendor.size}): ${vendor.joinToString { it.name }}")
-                    try {
-                        @Suppress("UNCHECKED_CAST")
-                        val hallKey = android.hardware.camera2.CaptureResult.Key(
-                            "samsung.android.statistics.oisHallInfo", LongArray::class.java)
-                        val hall = result.get(hallKey)
-                        Log.i(TAG, "PROBE oisHallInfo explicit read: " +
-                            (hall?.let { "${it.size} values, first=${it.take(4)}" } ?: "null"))
-                    } catch (e: Throwable) {
-                        Log.i(TAG, "PROBE oisHallInfo explicit read threw: ${e.message}")
-                    }
-                }
-            })
-            // ISP tracker probe: log Qualcomm T2T results while registered (#ISP-tracker
-            // experiment). Separate callback so it logs continuously, not once.
-            setSessionCaptureCallback(object : android.hardware.camera2.CameraCaptureSession.CaptureCallback() {
-                private var frame = 0L
-                override fun onCaptureCompleted(
-                    session: android.hardware.camera2.CameraCaptureSession,
-                    request: CaptureRequest,
-                    result: android.hardware.camera2.TotalCaptureResult
-                ) {
-                    if (!ispTrackerActive) return
-                    if (frame++ % 5 != 0L) return
-                    try {
-                        val status = result.get(android.hardware.camera2.CaptureResult.Key(
-                            "org.quic.camera2.objectTrackingResults.TrackerStatus", Int::class.javaObjectType))
-                        val roi = result.get(android.hardware.camera2.CaptureResult.Key(
-                            "org.quic.camera2.objectTrackingResults.ResultROI", IntArray::class.java))
-                        val score = result.get(android.hardware.camera2.CaptureResult.Key(
-                            "org.quic.camera2.objectTrackingResults.TrackerScore", Int::class.javaObjectType))
-                        Log.i("IspTracker", "f=$frame status=$status score=$score roi=${roi?.joinToString()}")
-                    } catch (e: Throwable) {
-                        Log.i("IspTracker", "result read threw: ${e.message}")
-                        ispTrackerActive = false
-                    }
-                }
-            })
         }
         Log.i(TAG, if (useVdis) "VDIS ON (vendor video stabilization via interop)"
                else if (ispStabilizationEnabled) "VDIS OFF (gyro EIS takes over)"
@@ -430,6 +366,7 @@ class CameraManager(private val context: Context) {
 
     @Suppress("UnsafeOptInUsageError")
     fun ispTrackerCancel() {
+        if (!ispTrackerProbeEnabled) return
         val cc = cameraControl ?: return
         ispTrackerActive = false
         try {

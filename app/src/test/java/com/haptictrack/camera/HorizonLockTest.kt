@@ -92,17 +92,50 @@ class HorizonLockTest {
         return Math.toDegrees(atan2(d, a))
     }
 
+    /** Corner excursion of a column-major mat3 (how far texcoords fall outside [0,1] = black). */
+    private fun cornerExcursion(m: FloatArray): Double {
+        var e = 0.0
+        for (cu in 0..1) for (cv in 0..1) {
+            val u = cu.toFloat(); val v = cv.toFloat()
+            val tu = m[0] * u + m[3] * v + m[6]
+            val tv = m[1] * u + m[4] * v + m[7]
+            e = maxOf(e, (-tu).toDouble(), (tu - 1f).toDouble(), (-tv).toDouble(), (tv - 1f).toDouble())
+        }
+        return e
+    }
+
     @Test
-    fun `lock counter-rotates by the device roll with EIS off`() {
+    fun `lock counter-rotates by the device roll within the crop limit`() {
         val stab = GyroStabilizer(RuntimeEnvironment.getApplication())
         stab.enabled = false
         stab.horizonLockEnabled = true
-        feed(stab, rollDeg = 6.0, fromNs = 1_000_000_000L, toNs = 4_000_000_000L)  // > 5x LOCK_TC
+        feed(stab, rollDeg = 4.0, fromNs = 1_000_000_000L, toNs = 4_000_000_000L)  // < ±4.95° LOCK_CROP limit
         val m = stab.getMatrix()
-        assertEquals("counter-rotation must equal -roll", -6.0, matrixRollDeg(m), 0.3)
-        // crop applied: uniform scale 1/1.15 in pixel space
+        assertEquals("counter-rotation must equal -roll", -4.0, matrixRollDeg(m), 0.3)
         val scale = Math.hypot(m[0].toDouble(), m[1].toDouble() * GyroStabilizer.LOCK_STREAM_ASPECT)
         assertEquals(1.0 / 1.15, scale, 0.01)
+    }
+
+    @Test
+    fun `maxLockAngleDeg matches the crop geometry`() {
+        assertEquals(4.95, GyroStabilizer.maxLockAngleDeg(1.15), 0.1)
+        assertEquals(10.2, GyroStabilizer.maxLockAngleDeg(1.30), 0.1)
+        assertTrue("monotonic in crop",
+            GyroStabilizer.maxLockAngleDeg(1.30) > GyroStabilizer.maxLockAngleDeg(1.15))
+    }
+
+    @Test
+    fun `large roll is clamped to the crop limit, never black corners`() {
+        val stab = GyroStabilizer(RuntimeEnvironment.getApplication())
+        stab.enabled = false
+        stab.horizonLockEnabled = true
+        // 10° tilt exceeds what LOCK_CROP=1.15 can level (~4.95°): the applied
+        // angle must clamp and the matrix must NOT expose black corners.
+        feed(stab, rollDeg = 10.0, fromNs = 1_000_000_000L, toNs = 4_000_000_000L)
+        val m = stab.getMatrix()
+        val applied = -matrixRollDeg(m)  // image counter-rotates -roll; applied magnitude
+        assertEquals("clamped to crop limit", GyroStabilizer.maxLockAngleDeg(1.15), applied, 0.2)
+        assertTrue("no black corners (excursion ${cornerExcursion(m)})", cornerExcursion(m) < 0.002)
     }
 
     @Test
@@ -131,9 +164,10 @@ class HorizonLockTest {
         val stab = GyroStabilizer(RuntimeEnvironment.getApplication())
         stab.enabled = false
         stab.horizonLockEnabled = true
-        feed(stab, rollDeg = 6.0, fromNs = 1_000_000_000L, toNs = 2_000_000_000L)
+        feed(stab, rollDeg = 4.0, fromNs = 1_000_000_000L, toNs = 2_000_000_000L)  // within crop limit
         val m = stab.getVideoMatrix(1_500_000_000L)
-        assertEquals(-6.0, matrixRollDeg(m), 0.3)
+        assertEquals(-4.0, matrixRollDeg(m), 0.3)
+        assertTrue("no black corners (excursion ${cornerExcursion(m)})", cornerExcursion(m) < 0.002)
     }
 
     @Test
@@ -142,12 +176,12 @@ class HorizonLockTest {
         stab.enabled = false
         stab.horizonLockEnabled = true
         feed(stab, rollDeg = 0.0, fromNs = 1_000_000_000L, toNs = 1_500_000_000L)
-        // roll steps to 8 deg; after 100ms the low-pass (TC=0.4s) must be at
-        // ~22% of the step, not snapped to -8 — the lock is a slow leveler.
-        feed(stab, rollDeg = 8.0, fromNs = 1_505_000_000L, toNs = 1_600_000_000L)
+        // roll steps to 4 deg (within the crop limit); after 100ms the low-pass
+        // (TC=0.4s) must be partway, not snapped — the lock is a slow leveler.
+        feed(stab, rollDeg = 4.0, fromNs = 1_505_000_000L, toNs = 1_600_000_000L)
         val mid = matrixRollDeg(stab.getMatrix())
-        assertTrue("expected partial leveling, got $mid", mid < -1.0 && mid > -4.0)
-        feed(stab, rollDeg = 8.0, fromNs = 1_605_000_000L, toNs = 4_000_000_000L)
-        assertEquals(-8.0, matrixRollDeg(stab.getMatrix()), 0.3)
+        assertTrue("expected partial leveling, got $mid", mid < -0.2 && mid > -3.5)
+        feed(stab, rollDeg = 4.0, fromNs = 1_605_000_000L, toNs = 4_000_000_000L)
+        assertEquals(-4.0, matrixRollDeg(stab.getMatrix()), 0.3)
     }
 }
