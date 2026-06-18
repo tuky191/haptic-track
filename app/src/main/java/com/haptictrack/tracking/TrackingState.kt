@@ -44,7 +44,9 @@ data class TrackedObject(
     /** OSNet person re-ID embedding (512-dim). Only computed for person candidates. */
     val reIdEmbedding: FloatArray? = null,
     /** MobileFaceNet face embedding (192-dim). Only computed when face is visible. */
-    val faceEmbedding: FloatArray? = null
+    val faceEmbedding: FloatArray? = null,
+    /** Gender/age estimate. Only computed when a face is visible and the sentry/debug attribute pass runs. */
+    val faceAttributes: FaceAttributes? = null
 ) {
     // INVARIANT: embedding, colorHistogram, reIdEmbedding, and faceEmbedding are
     // excluded from equals/hashCode. These are transient ML output, not part of the

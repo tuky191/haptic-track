@@ -34,8 +34,12 @@ class ObjectTracker(
     private val detector: ObjectDetector
     private val appearanceEmbedder: AppearanceEmbedder
     private val faceEmbedder: FaceEmbedder
+    private val faceAttributeClassifier: FaceAttributeClassifier
     private val personReId: PersonReIdEmbedder
     private val scenarioRecorder = ScenarioRecorder()
+
+    /** Gender/age of the currently locked person (computed at lock time). Shown in overlay (#sentry Phase 2). */
+    @Volatile private var lockedFaceAttributes: FaceAttributes? = null
 
     /** Embedding-input audit (#92): periodic crops + per-embedder stability log. */
     private val cropDebugCapture: CropDebugCapture
@@ -224,6 +228,7 @@ class ObjectTracker(
         val colorHist: FloatArray?,
         val reIdEmb: FloatArray?,
         val faceEmb: FloatArray?,
+        val faceAttrs: FaceAttributes?,
         val sceneNegatives: List<FloatArray>,
         /** Face+body embeddings for OTHER persons visible at lock time — seeds
          *  the [SessionRoster] (#108) so the open-set rejection has data from
@@ -264,7 +269,8 @@ class ObjectTracker(
         detector = ObjectDetector.createFromOptions(context, options)
 
         onLoadingStatus?.invoke("Loading face models (GPU)...")
-        faceEmbedder = FaceEmbedder(context)
+        faceAttributeClassifier = FaceAttributeClassifier(context)
+        faceEmbedder = FaceEmbedder(context, attributeClassifier = faceAttributeClassifier)
         personReId = PersonReIdEmbedder(context)
 
         cropDebugCapture = CropDebugCapture(appearanceEmbedder, personReId, faceEmbedder, auditExecutor)
@@ -313,6 +319,7 @@ class ObjectTracker(
                 val isPerson = label == "person"
                 val reIdEmb = if (isPerson) personReId.embed(snapshotBmp, boundingBox) else null
                 val faceEmb = if (isPerson) faceEmbedder.embedFace(snapshotBmp, boundingBox) else null
+                val faceAttrs = if (isPerson) faceEmbedder.classifyAttributes(snapshotBmp, boundingBox) else null
 
                 // Scene negatives: embed every other detection visible at lock time.
                 // boundingBox is screen-space; remap to rotated-image space to crop.
@@ -344,6 +351,7 @@ class ObjectTracker(
                     colorHist = colorHist,
                     reIdEmb = reIdEmb,
                     faceEmb = faceEmb,
+                    faceAttrs = faceAttrs,
                     sceneNegatives = sceneNegs,
                     sceneRosterObservations = rosterObservations,
                     deviceRotation = snapshotDevRot,
@@ -366,6 +374,8 @@ class ObjectTracker(
     private fun applyPendingLockIfAny() {
         val result = pendingLockResult.getAndSet(null) ?: return
         try {
+            lockedFaceAttributes = result.faceAttrs
+            result.faceAttrs?.let { debugCapture.log("[Sentry] lock attrs: ${it.genderLabel} age=${it.age} conf=${"%.2f".format(it.genderConfidence)}") }
             reacquisition.lock(result.trackingId, result.boundingBox, result.label,
                 result.gallery, result.colorHist,
                 cocoLabel = result.label, reIdEmbedding = result.reIdEmb, faceEmbedding = result.faceEmb)
@@ -408,6 +418,7 @@ class ObjectTracker(
     }
 
     fun clearLock() {
+        lockedFaceAttributes = null
         scenarioRecorder.recordEvent("CLEAR")
         scenarioRecorder.stop()
         debugCapture.log("CLEAR by user")
@@ -825,7 +836,8 @@ class ObjectTracker(
                             id = reacquisition.lockedId ?: -1,
                             boundingBox = smoothedBox,
                             label = reacquisition.lastKnownLabel,
-                            confidence = vtResult.confidence
+                            confidence = vtResult.confidence,
+                            faceAttributes = lockedFaceAttributes
                         )
                         // Include the visual tracker's box, but remove detector
                         // boxes that overlap it to avoid duplicate rectangles.
@@ -1042,6 +1054,7 @@ class ObjectTracker(
 
             // Re-acquisition
             val lockedObject = reacquisition.processFrame(filtered)
+                ?.let { if (lockedFaceAttributes != null) it.copy(faceAttributes = lockedFaceAttributes) else it }
 
             // Record events for scenario replay
             val nowLost = reacquisition.framesLost
@@ -1341,6 +1354,7 @@ class ObjectTracker(
         pendingLockResult.getAndSet(null)?.snapshotBmp?.recycle()
         detector.close()
         faceEmbedder.close()
+        faceAttributeClassifier.close()
         personReId.close()
         appearanceEmbedder.shutdown()
         visualTracker.stop()

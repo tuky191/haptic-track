@@ -35,6 +35,8 @@ class FaceEmbedder(
     context: Context,
     sharedFaceDetector: FaceDetector? = null,
     private val cropper: CanonicalCropper = CanonicalCropper(),
+    /** Optional gender/age classifier — when set, [classifyAttributes] is available. */
+    private val attributeClassifier: FaceAttributeClassifier? = null,
 ) {
 
     companion object {
@@ -155,6 +157,46 @@ class FaceEmbedder(
         } catch (e: Exception) {
             Log.w(TAG, "Face embedding failed: ${e.message}")
             null
+        }
+    }
+
+    /**
+     * Detect the largest face in a person bbox and classify gender/age, reusing
+     * the same BlazeFace pass + aligned face crop as [embedFace]. Returns null if
+     * the person crop is too small, no face is found, or no classifier is set.
+     */
+    @Synchronized
+    fun classifyAttributes(bitmap: Bitmap, personBox: RectF): FaceAttributes? {
+        val classifier = attributeClassifier ?: return null
+        val personCanonical = cropper.prepare(
+            bitmap, personBox,
+            targetWidth = PERSON_CANONICAL_SIZE, targetHeight = PERSON_CANONICAL_SIZE,
+            minSourcePixels = MIN_PERSON_SOURCE_PIXELS,
+        ) ?: return null
+        val personCrop = personCanonical.bitmap
+        return try {
+            val mpImage = BitmapImageBuilder(personCrop).build()
+            val faces = synchronized(faceDetector) { faceDetector.detect(mpImage) }
+            val face = faces.detections().maxByOrNull {
+                it.boundingBox().width() * it.boundingBox().height()
+            } ?: return null
+            val faceNormBox = normalizeFaceBox(face.boundingBox(), personCrop.width, personCrop.height)
+                ?: return null
+            val faceCanonical = cropper.prepare(
+                personCrop, faceNormBox,
+                targetWidth = INPUT_SIZE, targetHeight = INPUT_SIZE,
+                paddingFraction = 0f, minSourcePixels = 16,
+            ) ?: return null
+            try {
+                classifier.classify(faceCanonical.bitmap)
+            } finally {
+                faceCanonical.bitmap.recycle()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Attribute classify failed: ${e.message}")
+            null
+        } finally {
+            personCrop.recycle()
         }
     }
 

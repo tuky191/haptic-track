@@ -827,6 +827,10 @@ private fun TrackingOverlay(
             scale(lockScale, pivot = Offset(cx, cy)) {
                 drawRoundedGlow(left, top, right, bottom, color)
             }
+            // Sentry Phase 2: gender/age label above the locked subject.
+            state.trackedObject.faceAttributes?.let { attr ->
+                drawAttributeLabel("${attr.genderLabel} · ${attr.age}", left, top, bracketOpacity)
+            }
         } else if (isLost && state.trackedObject != null && lostOpacity > 0.01f) {
             val color = HapticRed.copy(alpha = lostOpacity * 0.7f)
             val (ll, lt, lr, lb) = mapBox(state.trackedObject.boundingBox, transform)
@@ -847,6 +851,20 @@ private val innerGlowPaint = android.graphics.Paint().apply {
     isAntiAlias = true
     strokeWidth = 15f
     maskFilter = android.graphics.BlurMaskFilter(20f, android.graphics.BlurMaskFilter.Blur.NORMAL)
+}
+
+private val attrLabelPaint = android.graphics.Paint().apply {
+    isAntiAlias = true
+    textSize = 38f
+    typeface = android.graphics.Typeface.DEFAULT_BOLD
+    color = android.graphics.Color.WHITE
+    setShadowLayer(6f, 0f, 0f, android.graphics.Color.BLACK)
+}
+
+private fun DrawScope.drawAttributeLabel(text: String, left: Float, top: Float, alpha: Float) {
+    attrLabelPaint.alpha = (alpha * 255f).toInt().coerceIn(0, 255)
+    val y = (top - 14f).coerceAtLeast(40f)
+    drawContext.canvas.nativeCanvas.drawText(text, left, y, attrLabelPaint)
 }
 
 private fun DrawScope.drawRoundedGlow(
