@@ -99,7 +99,9 @@ data class TrackingUiState(
     /** OIS compensation active (scale correction to avoid overcorrecting). */
     val oisCompensation: Boolean = true,
     /** Optical-flow translation correction on top of gyro rotation EIS. */
-    val translationEis: Boolean = true,
+    val translationEis: Boolean = false,
     /** Which object categories to show and allow tracking. */
-    val trackingFilter: TrackingFilter = TrackingFilter.ALL
+    val trackingFilter: TrackingFilter = TrackingFilter.ALL,
+    /** Haptic vibration strength 0.0–1.0. */
+    val hapticStrength: Float = 0.5f
 )

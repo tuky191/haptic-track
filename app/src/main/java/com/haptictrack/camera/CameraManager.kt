@@ -212,7 +212,7 @@ class CameraManager(private val context: Context) {
                 onFrame = { bitmap -> onAnalysisFrame?.invoke(bitmap) },
                 onViewfinderFrame = { bitmap -> onViewfinderFrame?.invoke(bitmap) },
                 stabMatrixProvider = { gyroStabilizer.getMatrix() },
-                onRawFrame = { bitmap -> gyroStabilizer.onRawFrame(bitmap) }
+                onRawFrame = { bitmap, ts -> gyroStabilizer.onRawFrame(bitmap, ts) }
             )
             val readerSurface = reader.start()
             frameReader = reader

@@ -5,48 +5,111 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
 import com.haptictrack.tracking.TrackingStatus
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlin.math.abs
 
 class HapticFeedbackManager(context: Context) {
+
+    companion object {
+        private const val DEAD_ZONE = 0.05f
+        private const val URGENCY_RANGE = 0.45f
+
+        private const val INTERVAL_CENTER_MS = 120f
+        private const val INTERVAL_EDGE_MS = 800f
+        private const val PULSE_MS = 25L
+
+        private const val DOUBLE_PULSE_GAP_MS = 45L
+
+        private const val LOST_GRACE_MS = 800L
+    }
 
     private val vibrator: Vibrator = run {
         val manager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
         manager.defaultVibrator
     }
 
-    private var currentStatus: TrackingStatus? = null
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    private var heartbeatJob: Job? = null
+    private var graceJob: Job? = null
 
-    fun updateTrackingStatus(status: TrackingStatus, edgeProximity: Float = 0f) {
-        if (status == currentStatus && status != TrackingStatus.LOCKED) return
+    @Volatile private var currentStatus: TrackingStatus = TrackingStatus.IDLE
+    @Volatile private var driftX: Float = 0f
+    @Volatile private var driftY: Float = 0f
+
+    /** Vibration amplitude 0.0–1.0. Controls how strong each click feels, not frequency. */
+    @Volatile var strength: Float = 0.5f
+
+    @Synchronized
+    fun updateTrackingStatus(status: TrackingStatus, driftX: Float = 0f, driftY: Float = 0f) {
+        this.driftX = driftX
+        this.driftY = driftY
+
+        if (status == currentStatus) return
         currentStatus = status
 
+        graceJob?.cancel()
+
         when (status) {
-            TrackingStatus.LOCKED -> vibrateLockedPulse(edgeProximity)
-            TrackingStatus.SEARCHING -> vibrateSearching()
-            TrackingStatus.LOST -> stopVibration()
-            TrackingStatus.IDLE -> stopVibration()
+            TrackingStatus.LOCKED -> {
+                if (heartbeatJob?.isActive != true) {
+                    heartbeatJob = scope.launch { geigerLoop() }
+                }
+            }
+            TrackingStatus.LOST, TrackingStatus.SEARCHING -> {
+                graceJob = scope.launch {
+                    delay(LOST_GRACE_MS)
+                    heartbeatJob?.cancel()
+                    vibrator.cancel()
+                }
+            }
+            TrackingStatus.IDLE -> {
+                heartbeatJob?.cancel()
+                vibrator.cancel()
+            }
         }
     }
 
-    private fun vibrateLockedPulse(edgeProximity: Float) {
-        // edgeProximity: 0.0 = centered, 1.0 = at edge of frame
-        // Subtle: gentle tick when centered, moderate nudge at edge
-        val amplitude = (20 + (edgeProximity * 80)).toInt().coerceIn(1, 100)
-        val effect = VibrationEffect.createOneShot(60, amplitude)
-        vibrator.vibrate(effect)
+    private suspend fun CoroutineScope.geigerLoop() {
+        while (isActive) {
+            val currentStrength = strength
+            if (currentStrength <= 0f) {
+                delay(100L)
+                continue
+            }
+
+            val dx = abs(driftX)
+            val dy = abs(driftY)
+            val edgeProximity = maxOf(dx, dy).coerceIn(0f, 1f)
+            val horizontalDominant = dx >= dy
+
+            val centering = 1f - ((edgeProximity - DEAD_ZONE) / URGENCY_RANGE).coerceIn(0f, 1f)
+
+            val intervalMs = lerp(INTERVAL_EDGE_MS, INTERVAL_CENTER_MS, centering).toLong()
+            val amp = (currentStrength * 255f).toInt().coerceIn(1, 255)
+
+            if (!horizontalDominant && centering < 0.95f) {
+                vibrator.vibrate(VibrationEffect.createOneShot(PULSE_MS, (amp * 0.7f).toInt().coerceIn(1, 255)))
+                delay(PULSE_MS + DOUBLE_PULSE_GAP_MS)
+                vibrator.vibrate(VibrationEffect.createOneShot(PULSE_MS, amp))
+                delay(maxOf(intervalMs - PULSE_MS * 2 - DOUBLE_PULSE_GAP_MS, 30L))
+            } else {
+                vibrator.vibrate(VibrationEffect.createOneShot(PULSE_MS, amp))
+                delay(intervalMs)
+            }
+        }
     }
 
-    private fun vibrateSearching() {
-        val timings = longArrayOf(0, 30, 150, 30)
-        val amplitudes = intArrayOf(0, 40, 0, 40)
-        val effect = VibrationEffect.createWaveform(timings, amplitudes, -1)
-        vibrator.vibrate(effect)
-    }
-
-    private fun stopVibration() {
-        vibrator.cancel()
-    }
+    private fun lerp(a: Float, b: Float, t: Float): Float = a + (b - a) * t
 
     fun shutdown() {
+        scope.cancel()
         vibrator.cancel()
     }
 }

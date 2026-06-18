@@ -64,6 +64,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     init {
         orientationListener.start()
         setGyroStrength(_uiState.value.gyroStrength)
+        // Gyro EIS default is device-gated (off on S26 — hardware OIS wins);
+        // sync the UI toggle to the stabilizer's actual state.
+        _uiState.update { it.copy(gyroEis = cameraManager.gyroStabilizer.enabled) }
 
         // Load ML models on background thread — takes ~20s with GPU delegate init
         viewModelScope.launch(Dispatchers.Default) {
@@ -87,8 +90,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     else -> TrackingStatus.SEARCHING
                 }
 
-                val edgeProximity = lockedObject?.let {
-                    zoomController.calculateEdgeProximity(it.boundingBox)
+                val driftX = lockedObject?.let {
+                    (it.boundingBox.centerX() - 0.5f) * 2f
+                } ?: 0f
+                val driftY = lockedObject?.let {
+                    (it.boundingBox.centerY() - 0.5f) * 2f
                 } ?: 0f
 
                 val targetZoom = if (lockedObject != null) {
@@ -113,7 +119,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     ).also { cameraManager.setZoomTarget(it) }
                 } else null
 
-                hapticManager.updateTrackingStatus(status, edgeProximity)
+                hapticManager.updateTrackingStatus(status, driftX, driftY)
 
                 val displayObjects = if (status == TrackingStatus.IDLE) {
                     smoothIdleDetections(allObjects)
@@ -270,6 +276,12 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         toggleRecording()
     }
 
+    fun setHapticStrength(strength: Float) {
+        val clamped = strength.coerceIn(0f, 1f)
+        hapticManager.strength = clamped
+        _uiState.update { it.copy(hapticStrength = clamped) }
+    }
+
     fun cycleTrackingFilter() {
         val next = when (_uiState.value.trackingFilter) {
             TrackingFilter.ALL -> TrackingFilter.PERSON_ONLY
@@ -365,7 +377,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         zoomController.reset()
         hapticManager.updateTrackingStatus(TrackingStatus.IDLE)
         _uiState.update {
-            TrackingUiState(status = TrackingStatus.IDLE, isRecording = false, captureMode = it.captureMode, stealthMode = it.stealthMode, isReady = it.isReady, ispStabilization = it.ispStabilization, gyroEis = it.gyroEis, gyroStrength = it.gyroStrength, adaptiveEis = it.adaptiveEis, leashEnabled = it.leashEnabled, oisCompensation = it.oisCompensation, translationEis = it.translationEis, trackingFilter = it.trackingFilter)
+            TrackingUiState(status = TrackingStatus.IDLE, isRecording = false, captureMode = it.captureMode, stealthMode = it.stealthMode, isReady = it.isReady, ispStabilization = it.ispStabilization, gyroEis = it.gyroEis, gyroStrength = it.gyroStrength, adaptiveEis = it.adaptiveEis, leashEnabled = it.leashEnabled, oisCompensation = it.oisCompensation, translationEis = it.translationEis, trackingFilter = it.trackingFilter, hapticStrength = it.hapticStrength)
         }
     }
 
