@@ -399,6 +399,8 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                         uiState = uiState,
                         onToggleIsp = { viewModel.toggleIspStabilization() },
                         onToggleGyro = { viewModel.toggleGyroEis() },
+                        onToggleHorizonLock = { viewModel.toggleHorizonLock() },
+                        onToggleFhd60Vdis = { viewModel.toggleFhd60Vdis() },
                         onGyroStrengthChange = { viewModel.setGyroStrength(it) },
                         onToggleAdaptive = { viewModel.toggleAdaptiveEis() },
                         onToggleTranslation = { viewModel.toggleTranslationEis() },
@@ -915,6 +917,8 @@ private fun DebugBottomSheet(
     uiState: TrackingUiState,
     onToggleIsp: () -> Unit,
     onToggleGyro: () -> Unit,
+    onToggleHorizonLock: () -> Unit,
+    onToggleFhd60Vdis: () -> Unit,
     onGyroStrengthChange: (Float) -> Unit,
     onToggleAdaptive: () -> Unit,
     onToggleTranslation: () -> Unit,
@@ -944,6 +948,8 @@ private fun DebugBottomSheet(
 
             SettingRow("ISP Stabilization", uiState.ispStabilization, onToggleIsp)
             SettingRow("Gyro EIS", uiState.gyroEis, onToggleGyro)
+            SettingRow("Horizon Lock", uiState.horizonLock, onToggleHorizonLock)
+            SettingRow("FHD 60fps + VDIS (off = 4K30)", uiState.fhd60Vdis, onToggleFhd60Vdis)
 
             if (uiState.gyroEis) {
                 // Strength slider

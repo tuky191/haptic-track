@@ -50,6 +50,21 @@ class CameraManager(private val context: Context) {
     /** Whether to request ISP-level preview stabilization on next bind. */
     var ispStabilizationEnabled: Boolean = false
 
+    /** ISP tracker probe (#ISP-tracker experiment): result logging gate. */
+    @Volatile private var ispTrackerActive = false
+
+    /**
+     * ISP tracker probe — PERMANENTLY OFF on S26 Ultra. The vendor channel is
+     * open (config keys accepted, result keys returned) and the source-verified
+     * CamX T2T protocol was used (one-shot register, square active-array ROI),
+     * but Samsung's HAL SEGFAULTS natively in CamX::TrackerNode::TrackerThreadCb
+     * on any registration (2026-06-11, camera.qcom.core.so +2524) — their
+     * 3rd-party topology likely never wires the node's FD buffer port. Not
+     * fixable from an app. com.qti.stats.tracker.so ships on the device; keys
+     * and protocol kept for reference should another device wire the node.
+     */
+    var ispTrackerProbeEnabled: Boolean = false
+
     /** Current lens facing — back by default. */
     var isFrontCamera: Boolean = false
         private set
@@ -82,11 +97,22 @@ class CameraManager(private val context: Context) {
     var videoCapture = createVideoCapture()
         private set
 
+    /**
+     * Recording preset. false = 4K30 (UHD — the hardware's 4K fps cap).
+     * true = FHD 1080p60 with vendor VDIS: 60fps is only available at
+     * 1080p-class sizes, and Samsung grants third-party VDIS real corrective
+     * margin below 4K (vdisPreviewMargin=0 at UHD → inert). Takes effect on the
+     * next rebind() (bindUseCases recreates VideoCapture from this flag).
+     */
+    var fhd60VdisPreset: Boolean = false
+
     private fun createVideoCapture(): VideoCapture<Recorder> {
+        val qualities = if (fhd60VdisPreset) listOf(Quality.FHD, Quality.HD)
+                        else listOf(Quality.UHD, Quality.FHD, Quality.HD)
         val recorder = Recorder.Builder()
             .setQualitySelector(
                 QualitySelector.fromOrderedList(
-                    listOf(Quality.UHD, Quality.FHD, Quality.HD),
+                    qualities,
                     FallbackStrategy.higherQualityOrLowerThan(Quality.FHD)
                 )
             )
@@ -155,29 +181,38 @@ class CameraManager(private val context: Context) {
                        else CameraSelector.DEFAULT_BACK_CAMERA
 
         val previewBuilder = Preview.Builder()
-        if (ispStabilizationEnabled && !gyroStabilizer.enabled) {
-            try {
-                val caps = Preview.getPreviewCapabilities(provider.getCameraInfo(selector))
-                if (caps.isStabilizationSupported) {
-                    previewBuilder.setPreviewStabilizationEnabled(true)
-                    Log.i(TAG, "ISP stabilization ON")
-                } else {
-                    Log.i(TAG, "ISP stabilization requested but not supported on this device")
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to query stabilization caps: ${e.message}")
-            }
-        } else if (ispStabilizationEnabled && gyroStabilizer.enabled) {
-            Log.i(TAG, "ISP stabilization OFF (gyro EIS takes over)")
-        } else {
-            Log.i(TAG, "ISP stabilization OFF (user toggle)")
-        }
+        val useVdis = (ispStabilizationEnabled || fhd60VdisPreset) && !gyroStabilizer.enabled
         @Suppress("UnsafeOptInUsageError")
-        Camera2Interop.Extender(previewBuilder)
-            .setCaptureRequestOption(
+        Camera2Interop.Extender(previewBuilder).apply {
+            setCaptureRequestOption(
                 CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
                 CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON
             )
+            if (useVdis) {
+                // Vendor VDIS (CONTROL_VIDEO_STABILIZATION_MODE_ON): Samsung's own
+                // digital stabilization — zero-phase, RS-aware, translation-handling.
+                // Applies to the whole repeating request (both streams). The S26
+                // advertises modes [OFF, ON, PREVIEW_STABILIZATION]; whether the
+                // HAL honors ON at 4K is what this build tests. The old CameraX
+                // setPreviewStabilizationEnabled used mode 2, which Snapdragon
+                // ISPs cap at 1080p.
+                setCaptureRequestOption(
+                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON
+                )
+            }
+            if (fhd60VdisPreset) {
+                // 60fps pin — legal at FHD (minFrameDuration 16.6ms); forces
+                // exposures <= 1/60s, so indoor footage gets a bit darker.
+                setCaptureRequestOption(
+                    CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                    android.util.Range(60, 60)
+                )
+            }
+        }
+        Log.i(TAG, if (useVdis) "VDIS ON (vendor video stabilization via interop)"
+               else if (ispStabilizationEnabled) "VDIS OFF (gyro EIS takes over)"
+               else "VDIS OFF (user toggle)")
         if (gyroStabilizer.enabled) {
             gyroStabilizer.oisCompensation = 0.40
             Log.i(TAG, "OIS + gyro EIS: oisCompensation=${gyroStabilizer.oisCompensation}")
@@ -262,6 +297,90 @@ class CameraManager(private val context: Context) {
         val clamped = ratio.coerceIn(getMinZoom(), getMaxZoom())
         cameraControl?.setZoomRatio(clamped)
         gyroStabilizer.setZoomImmediate(clamped)
+    }
+
+    /**
+     * Register a region with the Qualcomm ISP object tracker (Touch-to-Track) —
+     * probe experiment. [normBox] is in portrait-normalized view coords; converted
+     * to sensor active-array coords (orientation 90, zoom-visible region).
+     * ROI layout assumed [x, y, w, h]; status/score/ROI are logged per frame by the
+     * IspTracker capture callback for offline comparison against VisualTracker.
+     */
+    @Suppress("UnsafeOptInUsageError")
+    fun ispTrackerRegister(normBox: android.graphics.RectF, zoomRatio: Float) {
+        if (!ispTrackerProbeEnabled) return
+        val cc = cameraControl ?: return
+        try {
+            val aw = 4080f; val ah = 3060f  // S26 active array (probe-only; TODO read from characteristics)
+            val z = maxOf(zoomRatio, 1f)
+            val visW = aw / z; val visH = ah / z
+            val cx0 = (aw - visW) / 2f; val cy0 = (ah - visH) / 2f
+            // portrait norm -> sensor (SENSOR_ORIENTATION 90): sx = py, sy = 1 - px
+            fun sx(py: Float) = cx0 + py * visW
+            fun sy(px: Float) = cy0 + (1f - px) * visH
+            val x1 = sx(normBox.top); val x2 = sx(normBox.bottom)
+            val y1 = sy(normBox.right); val y2 = sy(normBox.left)
+            val l = minOf(x1, x2); val t = minOf(y1, y2)
+            val w = kotlin.math.abs(x2 - x1); val h = kotlin.math.abs(y2 - y1)
+            // The HAL forces the ROI square (width := height) — send it square,
+            // centered on the original box (camxtrackernode.cpp).
+            val side = minOf(w, h)
+            val roi = intArrayOf(
+                (l + w / 2f - side / 2f).toInt(), (t + h / 2f - side / 2f).toInt(),
+                side.toInt(), side.toInt()
+            )
+            val c2 = androidx.camera.camera2.interop.Camera2CameraControl.from(cc)
+            c2.addCaptureRequestOptions(
+                androidx.camera.camera2.interop.CaptureRequestOptions.Builder()
+                    .setCaptureRequestOption(CaptureRequest.Key(
+                        "org.quic.camera2.objectTrackingConfig.Enable", Byte::class.javaObjectType), 1.toByte())
+                    .setCaptureRequestOption(CaptureRequest.Key(
+                        "org.quic.camera2.objectTrackingConfig.RegisterROI", IntArray::class.java), roi)
+                    .setCaptureRequestOption(CaptureRequest.Key(
+                        "org.quic.camera2.objectTrackingConfig.CmdTrigger", Int::class.javaObjectType), 1)
+                    .build()
+            )
+            ispTrackerActive = true
+            Log.i("IspTracker", "REGISTER roi=${roi.joinToString()} (zoom=$z, normBox=$normBox)")
+            // One-shot emulation: demote the trigger to Track (0) after a few frames.
+            // A sticky Reg re-registers whenever zoom changes the crop-translated ROI
+            // (HAL dedup compares post-translation) — that storm froze round 1.
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                if (!ispTrackerActive) return@postDelayed
+                try {
+                    c2.addCaptureRequestOptions(
+                        androidx.camera.camera2.interop.CaptureRequestOptions.Builder()
+                            .setCaptureRequestOption(CaptureRequest.Key(
+                                "org.quic.camera2.objectTrackingConfig.CmdTrigger", Int::class.javaObjectType), 0)
+                            .build()
+                    )
+                    Log.i("IspTracker", "TRIGGER demoted to Track")
+                } catch (e: Throwable) {
+                    Log.w("IspTracker", "trigger demote failed: ${e.message}")
+                }
+            }, 150)
+        } catch (e: Throwable) {
+            Log.w("IspTracker", "register failed: ${e.message}")
+        }
+    }
+
+    @Suppress("UnsafeOptInUsageError")
+    fun ispTrackerCancel() {
+        if (!ispTrackerProbeEnabled) return
+        val cc = cameraControl ?: return
+        ispTrackerActive = false
+        try {
+            val opts = androidx.camera.camera2.interop.CaptureRequestOptions.Builder()
+                .setCaptureRequestOption(CaptureRequest.Key(
+                    "org.quic.camera2.objectTrackingConfig.Enable", Byte::class.javaObjectType), 0.toByte())
+                .setCaptureRequestOption(CaptureRequest.Key(
+                    "org.quic.camera2.objectTrackingConfig.CmdTrigger", Int::class.javaObjectType), 2)
+                .build()
+            androidx.camera.camera2.interop.Camera2CameraControl.from(cc).addCaptureRequestOptions(opts)
+            Log.i("IspTracker", "CANCEL")
+        } catch (e: Throwable) {
+            Log.w("IspTracker", "cancel failed: ${e.message}")
+        }
     }
 
     fun getMinZoom(): Float = cameraInfo?.zoomState?.value?.minZoomRatio ?: 1f
