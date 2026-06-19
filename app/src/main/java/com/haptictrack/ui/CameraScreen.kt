@@ -835,7 +835,8 @@ private fun TrackingOverlay(
             }
             // Sentry Phase 2: gender/age label above the locked subject.
             state.trackedObject.faceAttributes?.let { attr ->
-                drawAttributeLabel("${attr.genderLabel} · ${attr.age}", left, top, bracketOpacity)
+                val ageText = attr.ageBucket.ifEmpty { attr.age.toString() }
+                drawAttributeLabel("${attr.genderLabel} · $ageText", left, top, bracketOpacity)
             }
         } else if (isLost && state.trackedObject != null && lostOpacity > 0.01f) {
             val color = HapticRed.copy(alpha = lostOpacity * 0.7f)

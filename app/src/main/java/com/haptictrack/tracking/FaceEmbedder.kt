@@ -44,8 +44,8 @@ class FaceEmbedder(
         private const val MODEL_ASSET = "mobilefacenet.tflite"
         private const val FACE_MODEL_ASSET = "blaze_face_short_range.tflite"
         const val INPUT_SIZE = 112
-        /** genderage classifier input size — its crop is aligned separately from the identity crop. */
-        private const val GENDERAGE_SIZE = 96
+        /** Attribute-classifier crop size (FairFace = 224) — aligned separately from the identity crop. */
+        private const val ATTR_SIZE = 224
         private const val EMBEDDING_DIM = 192
         private const val FACE_MIN_CONFIDENCE = 0.5f
 
@@ -171,7 +171,7 @@ class FaceEmbedder(
      * [embedFace] (which letterboxes the face box — fine for MobileFaceNet
      * identity), genderage's AGE head is alignment-sensitive, so we warp the
      * face to the ArcFace template using BlazeFace's eye keypoints (5-point
-     * alignment, scaled to GENDERAGE_SIZE) — matching the off-device de-risk
+     * alignment, scaled to ATTR_SIZE) — matching the off-device de-risk
      * (tools/sentry_genderage.py). Falls back to a letterbox crop if keypoints
      * are unavailable. Returns null if no face / no classifier / crop too small.
      */
@@ -196,7 +196,7 @@ class FaceEmbedder(
             // Fallback letterbox crop too (for A/B comparison of alignment effect).
             val faceNormBox = normalizeFaceBox(face.boundingBox(), personCrop.width, personCrop.height)
             val letterbox = faceNormBox?.let {
-                cropper.prepare(personCrop, it, targetWidth = GENDERAGE_SIZE, targetHeight = GENDERAGE_SIZE,
+                cropper.prepare(personCrop, it, targetWidth = ATTR_SIZE, targetHeight = ATTR_SIZE,
                     paddingFraction = 0f, minSourcePixels = 16)?.bitmap
             }
             if (debugSaveAttributeCrops) saveDebugCrops(personCrop, aligned, letterbox, kps)
@@ -217,7 +217,7 @@ class FaceEmbedder(
     }
 
     /**
-     * Warp the face in [personCrop] to a GENDERAGE_SIZE² ArcFace-aligned crop
+     * Warp the face in [personCrop] to a ATTR_SIZE² ArcFace-aligned crop
      * using BlazeFace eye keypoints (index 0 = right eye, 1 = left eye, in
      * normalized personCrop coords). A 2-point similarity (Android setPolyToPoly,
      * pointCount=2) places the eyes on the template eye line — rotation + scale +
@@ -228,14 +228,14 @@ class FaceEmbedder(
         val w = personCrop.width; val h = personCrop.height
         val rightEyeX = kps[0].x() * w; val rightEyeY = kps[0].y() * h
         val leftEyeX = kps[1].x() * w; val leftEyeY = kps[1].y() * h
-        // ArcFace eye template (112) scaled to GENDERAGE_SIZE. Template index 0 is
+        // ArcFace eye template (112) scaled to ATTR_SIZE. Template index 0 is
         // image-left = subject's right eye = BlazeFace kp[0].
-        val s = GENDERAGE_SIZE / 112f
+        val s = ATTR_SIZE / 112f
         val src = floatArrayOf(rightEyeX, rightEyeY, leftEyeX, leftEyeY)
         val dst = floatArrayOf(38.2946f * s, 51.6963f * s, 73.5318f * s, 51.5014f * s)
         val m = android.graphics.Matrix()
         if (!m.setPolyToPoly(src, 0, dst, 0, 2)) return null
-        val out = Bitmap.createBitmap(GENDERAGE_SIZE, GENDERAGE_SIZE, Bitmap.Config.ARGB_8888)
+        val out = Bitmap.createBitmap(ATTR_SIZE, ATTR_SIZE, Bitmap.Config.ARGB_8888)
         android.graphics.Canvas(out).drawBitmap(personCrop, m, android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG))
         return out
     }

@@ -37,3 +37,4 @@ tools/models/tflite/*/assets/
 
 # sentry Phase 1 de-risk scratch (models staged to assets in Phase 2)
 tools/sentry_faces/
+tools/age_gender_eval/
