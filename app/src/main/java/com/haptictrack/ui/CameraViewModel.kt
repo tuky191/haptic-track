@@ -43,6 +43,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private val zoomController = ZoomController()
     private val orientationListener = DeviceOrientationListener(application)
     private var sentry: SentryController? = null
+    private val sentryLogger = com.haptictrack.tracking.SentryLogger(application)
+    private var sentryInspected = 0
+    private var sentryMatched = 0
 
     private val _uiState = MutableStateFlow(TrackingUiState())
     val uiState: StateFlow<TrackingUiState> = _uiState.asStateFlow()
@@ -174,6 +177,15 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 classify = { obj -> tracker.classifyPersonAttributes(obj.boundingBox) },
                 lock = { obj -> sentryLock(obj) },
                 haptic = { cue -> hapticManager.sentryCue(cue) },
+                onEvent = { type, box, attr, note ->
+                    sentryLogger.event(type, box, attr, note)
+                    if (type == "INSPECT_START") sentryInspected++
+                    if (type == "MATCH") sentryMatched++
+                    // Capture the frame at each decision point (re-croppable offline via the box).
+                    if (type == "INSPECT_START" || type == "MATCH" || type == "REJECT") {
+                        tracker.currentFrameForLog()?.let { sentryLogger.saveFrame(type, it) }
+                    }
+                },
             )
             // Wire the pool-release callback so the tracker can return the previous
             // lastFrameBitmap (and any un-retained frame) back to the pool.
@@ -240,6 +252,12 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     /** Toggle the sentry active auto-lock. */
     fun toggleSentry() {
         val newVal = !_uiState.value.sentryEnabled
+        if (newVal) {
+            sentryInspected = 0; sentryMatched = 0
+            sentryLogger.arm(_uiState.value.sentryCriteria)
+        } else {
+            sentryLogger.disarm(matched = sentryMatched, inspected = sentryInspected)
+        }
         sentry?.setEnabled(newVal)
         _uiState.update { it.copy(sentryEnabled = newVal, sentryPhase = sentry?.phase ?: com.haptictrack.tracking.SentryPhase.OFF) }
     }

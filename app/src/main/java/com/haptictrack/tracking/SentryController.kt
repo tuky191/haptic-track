@@ -34,6 +34,8 @@ class SentryController(
     /** Lock + start recording on a matched candidate. */
     private val lock: (TrackedObject) -> Unit,
     private val haptic: (SentryCue) -> Unit,
+    /** Structured event sink for session logging (type, candidate box, attrs, note). No-op by default. */
+    private val onEvent: (type: String, box: RectF?, attr: FaceAttributes?, note: String?) -> Unit = { _, _, _, _ -> },
 ) {
     companion object {
         const val SCAN_ZOOM = 1.0f
@@ -121,6 +123,7 @@ class SentryController(
             state = State.INSPECTING
             setZoomTarget(inspectZoomFor(candidate.boundingBox))  // start zooming in immediately
             haptic(SentryCue.INSPECTING)
+            onEvent("INSPECT_START", candidate.boundingBox, null, null)
         }
         // else: not centered enough — stay scanning (handheld: user pans toward them).
     }
@@ -129,7 +132,7 @@ class SentryController(
         val candidate = matchCandidate(persons)
         if (candidate == null) {
             // Lost the candidate (walked off / occluded) — back to scanning.
-            rejectCurrent(); return
+            rejectCurrent(null, "lost"); return
         }
         inspectBox = RectF(candidate.boundingBox)
         setZoomTarget(inspectZoomFor(candidate.boundingBox))
@@ -139,21 +142,25 @@ class SentryController(
         if ((inspectFrames - 1) % CLASSIFY_INTERVAL == 0) {
             val attr = classify(candidate)
             if (attr != null) {
-                if (criteria().matches(attr)) {
+                val matched = criteria().matches(attr)
+                onEvent("CLASSIFY", candidate.boundingBox, attr, if (matched) "match" else "no-match")
+                if (matched) {
                     state = State.MATCHED
                     haptic(SentryCue.MATCH)
+                    onEvent("MATCH", candidate.boundingBox, attr, null)
                     lock(candidate)
                     resetInspect()
                     return
                 } else {
-                    rejectCurrent(); return
+                    rejectCurrent(attr, "no-match"); return
                 }
             }
         }
-        if (inspectFrames >= INSPECT_TIMEOUT) rejectCurrent()
+        if (inspectFrames >= INSPECT_TIMEOUT) rejectCurrent(null, "timeout-no-face")
     }
 
-    private fun rejectCurrent() {
+    private fun rejectCurrent(attr: FaceAttributes?, reason: String) {
+        onEvent("REJECT", inspectBox, attr, reason)
         inspectKey?.let { cooldowns[it] = REJECT_COOLDOWN }
         resetInspect()
         state = State.SCANNING

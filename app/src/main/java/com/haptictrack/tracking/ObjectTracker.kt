@@ -384,6 +384,14 @@ class ObjectTracker(
         return faceEmbedder.classifyAttributes(bmp, rotBox)
     }
 
+    /** A copy of the latest analysis frame (display orientation) for logging. Caller recycles. Null if none. */
+    fun currentFrameForLog(): Bitmap? {
+        synchronized(lastFrameLock) {
+            val src = lastFrameBitmap ?: return null
+            return src.copy(src.config ?: Bitmap.Config.ARGB_8888, false)
+        }
+    }
+
     /**
      * Apply a completed off-thread lock result on the processing thread. Called at
      * the start of [processBitmapInternal] so all state mutation happens on the
