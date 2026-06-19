@@ -106,6 +106,26 @@ class HapticFeedbackManager(context: Context) {
         }
     }
 
+    /** Distinct one-shot cues for the sentry state machine. Amplitude follows [strength]. */
+    fun sentryCue(cue: com.haptictrack.tracking.SentryCue) {
+        val amp = (strength * 255f).toInt().coerceIn(1, 255)
+        scope.launch {
+            when (cue) {
+                com.haptictrack.tracking.SentryCue.SCANNING ->
+                    vibrator.vibrate(VibrationEffect.createOneShot(20L, (amp * 0.5f).toInt().coerceIn(1, 255)))
+                com.haptictrack.tracking.SentryCue.INSPECTING -> {
+                    vibrator.vibrate(VibrationEffect.createOneShot(20L, (amp * 0.6f).toInt().coerceIn(1, 255)))
+                    delay(70L)
+                    vibrator.vibrate(VibrationEffect.createOneShot(20L, (amp * 0.6f).toInt().coerceIn(1, 255)))
+                }
+                com.haptictrack.tracking.SentryCue.MATCH ->
+                    vibrator.vibrate(VibrationEffect.createOneShot(400L, amp))
+                com.haptictrack.tracking.SentryCue.REJECT ->
+                    vibrator.vibrate(VibrationEffect.createOneShot(60L, (amp * 0.4f).toInt().coerceIn(1, 255)))
+            }
+        }
+    }
+
     private fun lerp(a: Float, b: Float, t: Float): Float = a + (b - a) * t
 
     fun shutdown() {

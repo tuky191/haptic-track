@@ -22,6 +22,32 @@ enum class TrackingFilter {
     NON_PERSON_ONLY
 }
 
+/** Sentry auto-lock gender criterion. */
+enum class GenderFilter { ANY, MALE, FEMALE }
+
+/**
+ * Criteria the sentry auto-lock matches a person against. [ageMin]/[ageMax] are
+ * inclusive years; default span accepts any age. A person matches when its
+ * estimated gender and age both fall within the criteria.
+ */
+data class SentryCriteria(
+    val gender: GenderFilter = GenderFilter.ANY,
+    val ageMin: Int = 0,
+    val ageMax: Int = 120,
+) {
+    fun matches(attr: FaceAttributes): Boolean {
+        val genderOk = when (gender) {
+            GenderFilter.ANY -> true
+            GenderFilter.MALE -> attr.isMale
+            GenderFilter.FEMALE -> !attr.isMale
+        }
+        return genderOk && attr.age in ageMin..ageMax
+    }
+}
+
+/** Sentry state for UI display. */
+enum class SentryPhase { OFF, SCANNING, INSPECTING, MATCHED }
+
 private val ANIMAL_LABELS = setOf(
     "cat", "dog", "bird", "horse", "sheep", "cow",
     "elephant", "bear", "zebra", "giraffe"
@@ -107,5 +133,10 @@ data class TrackingUiState(
     /** Which object categories to show and allow tracking. */
     val trackingFilter: TrackingFilter = TrackingFilter.ALL,
     /** Haptic vibration strength 0.0–1.0. */
-    val hapticStrength: Float = 0.5f
+    val hapticStrength: Float = 0.5f,
+    /** Sentry auto-lock: actively scan + zoom-inspect for a person matching criteria. */
+    val sentryEnabled: Boolean = false,
+    val sentryCriteria: SentryCriteria = SentryCriteria(),
+    /** Live sentry phase for UI display. */
+    val sentryPhase: SentryPhase = SentryPhase.OFF
 )

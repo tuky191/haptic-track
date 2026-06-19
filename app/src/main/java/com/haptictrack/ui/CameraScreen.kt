@@ -407,6 +407,10 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                         onToggleLeash = { viewModel.toggleLeash() },
                         onToggleOis = { viewModel.toggleOisCompensation() },
                         onHapticStrengthChange = { viewModel.setHapticStrength(it) },
+                        onToggleSentry = { viewModel.toggleSentry() },
+                        onSentryGenderCycle = { viewModel.cycleSentryGender() },
+                        onSentryAgeCycle = { viewModel.cycleSentryAgeGroup() },
+                        sentryAgeLabel = viewModel.sentryAgeLabel(),
                         onDismiss = { showDebugSheet = false }
                     )
                 }
@@ -943,6 +947,10 @@ private fun DebugBottomSheet(
     onToggleLeash: () -> Unit,
     onToggleOis: () -> Unit,
     onHapticStrengthChange: (Float) -> Unit,
+    onToggleSentry: () -> Unit,
+    onSentryGenderCycle: () -> Unit,
+    onSentryAgeCycle: () -> Unit,
+    sentryAgeLabel: String,
     onDismiss: () -> Unit
 ) {
     ModalBottomSheet(
@@ -1049,7 +1057,45 @@ private fun DebugBottomSheet(
                     Text("Max", color = Color.White.copy(alpha = 0.35f), fontSize = 11.sp)
                 }
             }
+
+            Spacer(Modifier.height(8.dp))
+
+            Text(
+                text = "SENTRY (AUTO-LOCK)",
+                color = Color.White.copy(alpha = 0.4f),
+                fontSize = 11.sp,
+                fontWeight = FontWeight.SemiBold,
+                letterSpacing = 1.5.sp,
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp)
+            )
+
+            SettingRow("Active scan", uiState.sentryEnabled, onToggleSentry)
+            if (uiState.sentryEnabled) {
+                SentryChoiceRow("Gender", uiState.sentryCriteria.gender.name, onSentryGenderCycle)
+                SentryChoiceRow("Age group", sentryAgeLabel, onSentryAgeCycle)
+                Text(
+                    "Status: ${uiState.sentryPhase}",
+                    color = HapticCyan.copy(alpha = 0.8f),
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 6.dp)
+                )
+            }
         }
+    }
+}
+
+/** A settings row whose right side shows the current choice and cycles on tap. */
+@Composable
+private fun SentryChoiceRow(label: String, value: String, onCycle: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onCycle() }
+            .padding(horizontal = 24.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(label, color = Color.White, fontSize = 14.sp, modifier = Modifier.weight(1f))
+        Text(value, color = HapticCyan, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
     }
 }
 

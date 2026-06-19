@@ -271,6 +271,7 @@ class ObjectTracker(
         onLoadingStatus?.invoke("Loading face models (GPU)...")
         faceAttributeClassifier = FaceAttributeClassifier(context)
         faceEmbedder = FaceEmbedder(context, attributeClassifier = faceAttributeClassifier)
+        faceEmbedder.debugSaveAttributeCrops = true  // TEMP: verify genderage crop vs offline harness
         personReId = PersonReIdEmbedder(context)
 
         cropDebugCapture = CropDebugCapture(appearanceEmbedder, personReId, faceEmbedder, auditExecutor)
@@ -364,6 +365,24 @@ class ObjectTracker(
                 snapshotBmp.recycle()
             }
         }
+    }
+
+    /**
+     * Classify gender/age of a person given its SCREEN-space bbox, against the
+     * latest frame. Used by the sentry to inspect a candidate. Maps the box into
+     * the frame's rotated space (same remap as scene negatives) before cropping.
+     * Intended to be called from the [onDetectionResult] callback (processing
+     * thread), where [lastFrameBitmap] is stable. Returns null if no frame, no
+     * face, or the classifier is unavailable.
+     */
+    fun classifyPersonAttributes(screenBox: RectF): FaceAttributes? {
+        val bmp: Bitmap; val rot: Int
+        synchronized(lastFrameLock) {
+            bmp = lastFrameBitmap ?: return null
+            rot = lastFrameDeviceRotation
+        }
+        val rotBox = mapToRotated(screenBox.left, screenBox.top, screenBox.right, screenBox.bottom, rot)
+        return faceEmbedder.classifyAttributes(bmp, rotBox)
     }
 
     /**

@@ -19,6 +19,9 @@ import com.haptictrack.tracking.TrackingUiState
 import com.haptictrack.tracking.CaptureMode
 import com.haptictrack.tracking.TrackingFilter
 import com.haptictrack.tracking.labelMatchesFilter
+import com.haptictrack.tracking.SentryController
+import com.haptictrack.tracking.SentryCriteria
+import com.haptictrack.tracking.GenderFilter
 import com.haptictrack.zoom.ZoomController
 import java.io.File
 import java.text.SimpleDateFormat
@@ -39,6 +42,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private val hapticManager = HapticFeedbackManager(application)
     private val zoomController = ZoomController()
     private val orientationListener = DeviceOrientationListener(application)
+    private var sentry: SentryController? = null
 
     private val _uiState = MutableStateFlow(TrackingUiState())
     val uiState: StateFlow<TrackingUiState> = _uiState.asStateFlow()
@@ -55,6 +59,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         private const val GYRO_TC_RANGE = 0.60      // TC swing: 1.00 - 0.60 = 0.40 at strength=1
         private const val GYRO_CROP_MIN = 1.15f     // crop zoom at strength=0 (light stabilization)
         private const val GYRO_CROP_RANGE = 0.30f   // crop swing: 1.15 + 0.30 = 1.45 at strength=1
+        /** Sentry age-group presets: label → inclusive [min,max] years. */
+        private val AGE_GROUPS = listOf(
+            "Any" to (0 to 120), "Child" to (0 to 12), "Teen" to (13 to 19),
+            "Adult" to (20 to 59), "Senior" to (60 to 120)
+        )
     }
 
     /** Smooths idle detections by keeping objects alive for a few frames after they disappear. */
@@ -128,6 +137,12 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     allObjects
                 }
 
+                // Sentry: drive the active scan from IDLE on this frame's person detections.
+                // onFrame may classify (sync, ~30ms during inspect) and lock on a match.
+                if (_uiState.value.sentryEnabled && status == TrackingStatus.IDLE) {
+                    sentry?.onFrame(displayObjects.filter { it.label == "person" })
+                }
+
                 _uiState.update { current ->
                     current.copy(
                         status = status,
@@ -137,12 +152,22 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                         sourceImageHeight = imgHeight,
                         currentZoomRatio = targetZoom ?: current.currentZoomRatio,
                         lockedContour = if (status == TrackingStatus.LOCKED) contour else
-                            if (status == TrackingStatus.LOST) current.lockedContour else emptyList()
+                            if (status == TrackingStatus.LOST) current.lockedContour else emptyList(),
+                        sentryPhase = sentry?.phase ?: com.haptictrack.tracking.SentryPhase.OFF
                     )
                 }
             }
 
             objectTracker = tracker
+            sentry = SentryController(
+                criteria = { _uiState.value.sentryCriteria },
+                setZoomTarget = { cameraManager.setZoomTarget(it) },
+                minZoom = { cameraManager.getMinZoom() },
+                maxZoom = { cameraManager.getMaxZoom() },
+                classify = { obj -> tracker.classifyPersonAttributes(obj.boundingBox) },
+                lock = { obj -> sentryLock(obj) },
+                haptic = { cue -> hapticManager.sentryCue(cue) },
+            )
             // Wire the pool-release callback so the tracker can return the previous
             // lastFrameBitmap (and any un-retained frame) back to the pool.
             tracker.bitmapRecycler = { bmp -> cameraManager.releaseAnalysisBitmap(bmp) }
@@ -195,6 +220,49 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             // tracker for side-by-side comparison (logcat tag IspTracker)
             cameraManager.ispTrackerRegister(tapped.boundingBox, cameraManager.gyroStabilizer.zoomRatio)
         }
+    }
+
+    /** Sentry auto-lock on a matched candidate. Mirrors onTapToLock minus the UI mutation
+     *  (the next frame's normal flow reflects LOCKED once the async lock applies). */
+    private fun sentryLock(obj: TrackedObject) {
+        objectTracker.lockOnObject(obj.id, obj.boundingBox, obj.label)
+        if (!_uiState.value.isRecording) toggleRecording()
+        Log.i(TAG, "Sentry auto-locked person id=${obj.id}")
+    }
+
+    /** Toggle the sentry active auto-lock. */
+    fun toggleSentry() {
+        val newVal = !_uiState.value.sentryEnabled
+        sentry?.setEnabled(newVal)
+        _uiState.update { it.copy(sentryEnabled = newVal, sentryPhase = sentry?.phase ?: com.haptictrack.tracking.SentryPhase.OFF) }
+    }
+
+    fun setSentryGender(gender: GenderFilter) {
+        _uiState.update { it.copy(sentryCriteria = it.sentryCriteria.copy(gender = gender)) }
+    }
+
+    fun setSentryAgeRange(min: Int, max: Int) {
+        _uiState.update { it.copy(sentryCriteria = it.sentryCriteria.copy(ageMin = min, ageMax = max)) }
+    }
+
+    fun cycleSentryGender() {
+        val vals = GenderFilter.values()
+        setSentryGender(vals[(_uiState.value.sentryCriteria.gender.ordinal + 1) % vals.size])
+    }
+
+    /** Cycle the age-group preset. */
+    fun cycleSentryAgeGroup() {
+        val c = _uiState.value.sentryCriteria
+        val idx = AGE_GROUPS.indexOfFirst { it.second.first == c.ageMin && it.second.second == c.ageMax }
+        val next = AGE_GROUPS[(if (idx < 0) 0 else (idx + 1)) % AGE_GROUPS.size]
+        setSentryAgeRange(next.second.first, next.second.second)
+    }
+
+    /** Human label for the current age-group preset (or "Custom"). */
+    fun sentryAgeLabel(): String {
+        val c = _uiState.value.sentryCriteria
+        return AGE_GROUPS.firstOrNull { it.second.first == c.ageMin && it.second.second == c.ageMax }?.first
+            ?: "${c.ageMin}-${c.ageMax}"
     }
 
     /** Merge current detections with recently-seen ones to prevent flickering. */
@@ -394,9 +462,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         objectTracker.clearLock()
         zoomController.reset()
         cameraManager.ispTrackerCancel()
+        sentry?.onLockCleared()  // re-arm scanning if sentry still on
         hapticManager.updateTrackingStatus(TrackingStatus.IDLE)
         _uiState.update {
-            TrackingUiState(status = TrackingStatus.IDLE, isRecording = false, captureMode = it.captureMode, stealthMode = it.stealthMode, isReady = it.isReady, ispStabilization = it.ispStabilization, gyroEis = it.gyroEis, gyroStrength = it.gyroStrength, adaptiveEis = it.adaptiveEis, leashEnabled = it.leashEnabled, oisCompensation = it.oisCompensation, translationEis = it.translationEis, horizonLock = it.horizonLock, fhd60Vdis = it.fhd60Vdis, trackingFilter = it.trackingFilter, hapticStrength = it.hapticStrength)
+            TrackingUiState(status = TrackingStatus.IDLE, isRecording = false, captureMode = it.captureMode, stealthMode = it.stealthMode, isReady = it.isReady, ispStabilization = it.ispStabilization, gyroEis = it.gyroEis, gyroStrength = it.gyroStrength, adaptiveEis = it.adaptiveEis, leashEnabled = it.leashEnabled, oisCompensation = it.oisCompensation, translationEis = it.translationEis, horizonLock = it.horizonLock, fhd60Vdis = it.fhd60Vdis, trackingFilter = it.trackingFilter, hapticStrength = it.hapticStrength, sentryEnabled = it.sentryEnabled, sentryCriteria = it.sentryCriteria, sentryPhase = sentry?.phase ?: com.haptictrack.tracking.SentryPhase.OFF)
         }
     }
 
