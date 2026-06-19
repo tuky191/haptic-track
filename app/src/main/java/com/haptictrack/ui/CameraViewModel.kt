@@ -99,6 +99,19 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     else -> TrackingStatus.SEARCHING
                 }
 
+                // Sentry: drive the active scan from IDLE on this frame's person detections.
+                // onFrame may classify (sync, ~30ms during inspect) and lock on a match.
+                // A match initiates an async lock (applies next frame), so on the match
+                // frame we nudge status to SEARCHING — otherwise the machine pins IDLE
+                // (its first rule) and the IDLE->LOCKED transition never fires.
+                val sentryPhaseBefore = sentry?.phase
+                if (_uiState.value.sentryEnabled && status == TrackingStatus.IDLE) {
+                    sentry?.onFrame(allObjects.filter { it.label == "person" })
+                }
+                val sentryMatchedNow = sentryPhaseBefore != com.haptictrack.tracking.SentryPhase.MATCHED &&
+                    sentry?.phase == com.haptictrack.tracking.SentryPhase.MATCHED
+                val effectiveStatus = if (sentryMatchedNow) TrackingStatus.SEARCHING else status
+
                 val driftX = lockedObject?.let {
                     (it.boundingBox.centerX() - 0.5f) * 2f
                 } ?: 0f
@@ -118,7 +131,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                         cameraManager.getMinZoom(),
                         cameraManager.getMaxZoom()
                     ).also { cameraManager.setZoomTarget(it) }
-                } else if (status == TrackingStatus.LOST) {
+                } else if (effectiveStatus == TrackingStatus.LOST) {
                     cameraManager.gyroStabilizer.clearTracking()
                     // Gradual zoom-out: delays 5 frames then pulls back 15% per frame.
                     // Gives reacquisition a chance at the original zoom before widening FOV.
@@ -128,31 +141,25 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     ).also { cameraManager.setZoomTarget(it) }
                 } else null
 
-                hapticManager.updateTrackingStatus(status, driftX, driftY)
+                hapticManager.updateTrackingStatus(effectiveStatus, driftX, driftY)
 
-                val displayObjects = if (status == TrackingStatus.IDLE) {
+                val displayObjects = if (effectiveStatus == TrackingStatus.IDLE) {
                     smoothIdleDetections(allObjects)
                 } else {
                     recentDetections.clear()
                     allObjects
                 }
 
-                // Sentry: drive the active scan from IDLE on this frame's person detections.
-                // onFrame may classify (sync, ~30ms during inspect) and lock on a match.
-                if (_uiState.value.sentryEnabled && status == TrackingStatus.IDLE) {
-                    sentry?.onFrame(displayObjects.filter { it.label == "person" })
-                }
-
                 _uiState.update { current ->
                     current.copy(
-                        status = status,
-                        trackedObject = lockedObject ?: if (status == TrackingStatus.LOST) current.trackedObject else null,
+                        status = effectiveStatus,
+                        trackedObject = lockedObject ?: if (effectiveStatus == TrackingStatus.LOST) current.trackedObject else null,
                         detectedObjects = displayObjects,
                         sourceImageWidth = imgWidth,
                         sourceImageHeight = imgHeight,
                         currentZoomRatio = targetZoom ?: current.currentZoomRatio,
-                        lockedContour = if (status == TrackingStatus.LOCKED) contour else
-                            if (status == TrackingStatus.LOST) current.lockedContour else emptyList(),
+                        lockedContour = if (effectiveStatus == TrackingStatus.LOCKED) contour else
+                            if (effectiveStatus == TrackingStatus.LOST) current.lockedContour else emptyList(),
                         sentryPhase = sentry?.phase ?: com.haptictrack.tracking.SentryPhase.OFF
                     )
                 }
