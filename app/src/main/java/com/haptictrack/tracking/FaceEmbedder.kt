@@ -44,6 +44,8 @@ class FaceEmbedder(
         private const val MODEL_ASSET = "mobilefacenet.tflite"
         private const val FACE_MODEL_ASSET = "blaze_face_short_range.tflite"
         const val INPUT_SIZE = 112
+        /** genderage classifier input size — its crop is aligned separately from the identity crop. */
+        private const val GENDERAGE_SIZE = 96
         private const val EMBEDDING_DIM = 192
         private const val FACE_MIN_CONFIDENCE = 0.5f
 
@@ -62,6 +64,10 @@ class FaceEmbedder(
     private val interpreter: Interpreter get() = gpu.interpreter
     private val faceDetector: FaceDetector
     private val ownsFaceDetector: Boolean
+    private val appContext = context.applicationContext
+
+    /** Debug: when true, classifyAttributes saves the exact 96² crops it feeds genderage. */
+    var debugSaveAttributeCrops = false
 
     // Pre-allocated buffers — this MobileFaceNet variant has fixed batch=2
     private val inputBuffer: ByteBuffer = ByteBuffer.allocateDirect(4 * 2 * INPUT_SIZE * INPUT_SIZE * 3).apply {
@@ -161,9 +167,13 @@ class FaceEmbedder(
     }
 
     /**
-     * Detect the largest face in a person bbox and classify gender/age, reusing
-     * the same BlazeFace pass + aligned face crop as [embedFace]. Returns null if
-     * the person crop is too small, no face is found, or no classifier is set.
+     * Detect the largest face in a person bbox and classify gender/age. Unlike
+     * [embedFace] (which letterboxes the face box — fine for MobileFaceNet
+     * identity), genderage's AGE head is alignment-sensitive, so we warp the
+     * face to the ArcFace template using BlazeFace's eye keypoints (5-point
+     * alignment, scaled to GENDERAGE_SIZE) — matching the off-device de-risk
+     * (tools/sentry_genderage.py). Falls back to a letterbox crop if keypoints
+     * are unavailable. Returns null if no face / no classifier / crop too small.
      */
     @Synchronized
     fun classifyAttributes(bitmap: Bitmap, personBox: RectF): FaceAttributes? {
@@ -180,23 +190,75 @@ class FaceEmbedder(
             val face = faces.detections().maxByOrNull {
                 it.boundingBox().width() * it.boundingBox().height()
             } ?: return null
+
+            val kps = face.keypoints().orElse(emptyList())
+            val aligned = alignFaceToTemplate(personCrop, kps)
+            // Fallback letterbox crop too (for A/B comparison of alignment effect).
             val faceNormBox = normalizeFaceBox(face.boundingBox(), personCrop.width, personCrop.height)
-                ?: return null
-            val faceCanonical = cropper.prepare(
-                personCrop, faceNormBox,
-                targetWidth = INPUT_SIZE, targetHeight = INPUT_SIZE,
-                paddingFraction = 0f, minSourcePixels = 16,
-            ) ?: return null
-            try {
-                classifier.classify(faceCanonical.bitmap)
-            } finally {
-                faceCanonical.bitmap.recycle()
+            val letterbox = faceNormBox?.let {
+                cropper.prepare(personCrop, it, targetWidth = GENDERAGE_SIZE, targetHeight = GENDERAGE_SIZE,
+                    paddingFraction = 0f, minSourcePixels = 16)?.bitmap
+            }
+            if (debugSaveAttributeCrops) saveDebugCrops(personCrop, aligned, letterbox, kps)
+
+            return when {
+                aligned != null -> try { classifier.classify(aligned) } finally {
+                    aligned.recycle(); letterbox?.recycle()
+                }
+                letterbox != null -> try { classifier.classify(letterbox) } finally { letterbox.recycle() }
+                else -> null
             }
         } catch (e: Exception) {
             Log.w(TAG, "Attribute classify failed: ${e.message}")
             null
         } finally {
             personCrop.recycle()
+        }
+    }
+
+    /**
+     * Warp the face in [personCrop] to a GENDERAGE_SIZE² ArcFace-aligned crop
+     * using BlazeFace eye keypoints (index 0 = right eye, 1 = left eye, in
+     * normalized personCrop coords). A 2-point similarity (Android setPolyToPoly,
+     * pointCount=2) places the eyes on the template eye line — rotation + scale +
+     * position — which is what genderage's age head needs. Null if <2 keypoints.
+     */
+    private fun alignFaceToTemplate(personCrop: Bitmap, kps: List<com.google.mediapipe.tasks.components.containers.NormalizedKeypoint>): Bitmap? {
+        if (kps.size < 2) return null
+        val w = personCrop.width; val h = personCrop.height
+        val rightEyeX = kps[0].x() * w; val rightEyeY = kps[0].y() * h
+        val leftEyeX = kps[1].x() * w; val leftEyeY = kps[1].y() * h
+        // ArcFace eye template (112) scaled to GENDERAGE_SIZE. Template index 0 is
+        // image-left = subject's right eye = BlazeFace kp[0].
+        val s = GENDERAGE_SIZE / 112f
+        val src = floatArrayOf(rightEyeX, rightEyeY, leftEyeX, leftEyeY)
+        val dst = floatArrayOf(38.2946f * s, 51.6963f * s, 73.5318f * s, 51.5014f * s)
+        val m = android.graphics.Matrix()
+        if (!m.setPolyToPoly(src, 0, dst, 0, 2)) return null
+        val out = Bitmap.createBitmap(GENDERAGE_SIZE, GENDERAGE_SIZE, Bitmap.Config.ARGB_8888)
+        android.graphics.Canvas(out).drawBitmap(personCrop, m, android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG))
+        return out
+    }
+
+    private fun saveDebugCrops(
+        personCrop: Bitmap, aligned: Bitmap?, letterbox: Bitmap?,
+        kps: List<com.google.mediapipe.tasks.components.containers.NormalizedKeypoint>
+    ) {
+        try {
+            val dir = java.io.File(appContext.getExternalFilesDir(null), "sentry_debug").apply { mkdirs() }
+            fun save(bmp: Bitmap?, name: String) = bmp?.let {
+                java.io.File(dir, name).outputStream().use { os -> it.compress(Bitmap.CompressFormat.PNG, 100, os) }
+            }
+            save(personCrop, "person.png")
+            save(aligned, "aligned.png")
+            save(letterbox, "letterbox.png")
+            java.io.File(dir, "keypoints.txt").writeText(
+                "personCrop=${personCrop.width}x${personCrop.height}\n" +
+                kps.mapIndexed { i, k -> "kp$i=${k.x()},${k.y()}" }.joinToString("\n")
+            )
+            Log.i(TAG, "Saved attribute debug crops to ${dir.absolutePath} (kps=${kps.size})")
+        } catch (e: Exception) {
+            Log.w(TAG, "saveDebugCrops failed: ${e.message}")
         }
     }
 

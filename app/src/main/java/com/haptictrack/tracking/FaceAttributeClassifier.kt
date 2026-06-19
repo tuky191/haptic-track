@@ -58,6 +58,7 @@ class FaceAttributeClassifier(context: Context) {
         if (scaled !== face) scaled.recycle()
         interpreter.run(inputBuffer, output)
         val (female, male, ageRaw) = output[0]
+        Log.i(TAG, "raw output: female=$female male=$male ageRaw=$ageRaw -> age=${(ageRaw*100).toInt()}")
         FaceAttributes(
             isMale = male > female,
             age = (ageRaw * 100f).toInt().coerceIn(0, 120),

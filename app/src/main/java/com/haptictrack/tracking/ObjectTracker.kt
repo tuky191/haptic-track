@@ -271,7 +271,6 @@ class ObjectTracker(
         onLoadingStatus?.invoke("Loading face models (GPU)...")
         faceAttributeClassifier = FaceAttributeClassifier(context)
         faceEmbedder = FaceEmbedder(context, attributeClassifier = faceAttributeClassifier)
-        faceEmbedder.debugSaveAttributeCrops = true  // TEMP: verify genderage crop vs offline harness
         personReId = PersonReIdEmbedder(context)
 
         cropDebugCapture = CropDebugCapture(appearanceEmbedder, personReId, faceEmbedder, auditExecutor)
