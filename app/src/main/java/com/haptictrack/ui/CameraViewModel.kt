@@ -61,8 +61,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         private const val GYRO_CROP_RANGE = 0.30f   // crop swing: 1.15 + 0.30 = 1.45 at strength=1
         /** Sentry age-group presets: label → inclusive [min,max] years. */
         private val AGE_GROUPS = listOf(
-            "Any" to (0 to 120), "Child" to (0 to 12), "Teen" to (13 to 19),
-            "Adult" to (20 to 59), "Senior" to (60 to 120)
+            "Any" to (0 to 120), "Child" to (0 to 14),
+            "Teen+Adult" to (15 to 45), "Senior" to (46 to 120)
         )
     }
 

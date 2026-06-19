@@ -154,6 +154,7 @@ class HorizonLockTest {
     fun `lock off and EIS off yields identity`() {
         val stab = GyroStabilizer(RuntimeEnvironment.getApplication())
         stab.enabled = false
+        stab.horizonLockEnabled = false  // on by default now — disable to assert pure identity
         feed(stab, rollDeg = 6.0, fromNs = 1_000_000_000L, toNs = 1_200_000_000L)
         val m = stab.getMatrix()
         assertEquals(1f, m[0]); assertEquals(1f, m[4]); assertEquals(0f, m[6]); assertEquals(0f, m[7])

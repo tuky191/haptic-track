@@ -387,6 +387,17 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                     showFlip = uiState.status == TrackingStatus.IDLE,
                     showClear = uiState.status != TrackingStatus.IDLE,
                     isIdle = uiState.status == TrackingStatus.IDLE,
+                    sentryEnabled = uiState.sentryEnabled,
+                    sentrySummary = run {
+                        val who = when (uiState.sentryCriteria.gender) {
+                            com.haptictrack.tracking.GenderFilter.MALE -> "Men"
+                            com.haptictrack.tracking.GenderFilter.FEMALE -> "Women"
+                            com.haptictrack.tracking.GenderFilter.ANY -> "Anyone"
+                        }
+                        val phase = if (uiState.sentryEnabled) " · ${uiState.sentryPhase}" else ""
+                        "$who · ${viewModel.sentryAgeLabel()}$phase"
+                    },
+                    onSentryToggle = { viewModel.toggleSentry() },
                     onShutterClick = { viewModel.toggleRecording() },
                     onFlipClick = { viewModel.switchCamera() },
                     onClearClick = { viewModel.clearTracking() },
@@ -565,6 +576,9 @@ private fun BottomControls(
     showFlip: Boolean,
     showClear: Boolean,
     isIdle: Boolean,
+    sentryEnabled: Boolean,
+    sentrySummary: String,
+    onSentryToggle: () -> Unit,
     onShutterClick: () -> Unit,
     onFlipClick: () -> Unit,
     onClearClick: () -> Unit,
@@ -579,6 +593,12 @@ private fun BottomControls(
             .navigationBarsPadding()
             .padding(bottom = 24.dp)
     ) {
+        // Sentry auto-lock pill — visible while idle, or whenever sentry is armed.
+        if ((isIdle && !isRecording) || sentryEnabled) {
+            SentryPill(sentryEnabled, sentrySummary, onSentryToggle)
+            Spacer(Modifier.height(8.dp))
+        }
+
         // Tracking filter (IDLE only)
         if (isIdle && !isRecording) {
             TrackingFilterPill(trackingFilter, onFilterCycle)
@@ -761,6 +781,31 @@ private fun TrackingFilterPill(
             .clickable(onClick = onCycle)
             .background(Color.Black.copy(alpha = 0.3f), RoundedCornerShape(12.dp))
             .padding(horizontal = 14.dp, vertical = 4.dp)
+    )
+}
+
+/** Main-screen sentry auto-lock toggle. Tap to arm/disarm; shows criteria + live phase when armed. */
+@Composable
+private fun SentryPill(
+    enabled: Boolean,
+    summary: String,
+    onToggle: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val color = if (enabled) HapticAmber else Color.White.copy(alpha = 0.55f)
+    Text(
+        text = if (enabled) "◎ SENTRY · $summary" else "○ SENTRY",
+        color = color,
+        fontSize = 12.sp,
+        fontWeight = FontWeight.SemiBold,
+        modifier = modifier
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onToggle)
+            .background(
+                if (enabled) HapticAmber.copy(alpha = 0.18f) else Color.Black.copy(alpha = 0.3f),
+                RoundedCornerShape(12.dp)
+            )
+            .padding(horizontal = 14.dp, vertical = 5.dp)
     )
 }
 

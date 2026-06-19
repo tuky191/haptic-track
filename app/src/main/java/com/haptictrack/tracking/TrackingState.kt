@@ -114,8 +114,8 @@ data class TrackingUiState(
     val isReady: Boolean = false,
     /** Loading status messages shown during model init. */
     val loadingStatus: String = "Initializing...",
-    /** ISP-level preview stabilization toggle. */
-    val ispStabilization: Boolean = false,
+    /** ISP-level (vendor VDIS) stabilization toggle — on by default. */
+    val ispStabilization: Boolean = true,
     /** Software gyro-based EIS toggle. */
     val gyroEis: Boolean = true,
     /** Gyro EIS strength 0.0–1.0 (0 = light, 1 = aggressive). */
@@ -128,7 +128,7 @@ data class TrackingUiState(
     val oisCompensation: Boolean = true,
     /** Optical-flow translation correction on top of gyro rotation EIS. */
     val translationEis: Boolean = false,
-    val horizonLock: Boolean = false,
+    val horizonLock: Boolean = true,
     val fhd60Vdis: Boolean = false,
     /** Which object categories to show and allow tracking. */
     val trackingFilter: TrackingFilter = TrackingFilter.ALL,
@@ -136,7 +136,8 @@ data class TrackingUiState(
     val hapticStrength: Float = 0.5f,
     /** Sentry auto-lock: actively scan + zoom-inspect for a person matching criteria. */
     val sentryEnabled: Boolean = false,
-    val sentryCriteria: SentryCriteria = SentryCriteria(),
+    /** Default search: women, teen/adult (15-45). */
+    val sentryCriteria: SentryCriteria = SentryCriteria(GenderFilter.FEMALE, 15, 45),
     /** Live sentry phase for UI display. */
     val sentryPhase: SentryPhase = SentryPhase.OFF
 )

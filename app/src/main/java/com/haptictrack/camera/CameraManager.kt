@@ -47,8 +47,8 @@ class CameraManager(private val context: Context) {
     /** Software gyro-based EIS, stacks on top of ISP stabilization. */
     val gyroStabilizer = GyroStabilizer(context)
 
-    /** Whether to request ISP-level preview stabilization on next bind. */
-    var ispStabilizationEnabled: Boolean = false
+    /** Whether to request ISP-level (vendor VDIS) stabilization on next bind. On by default. */
+    var ispStabilizationEnabled: Boolean = true
 
     /** ISP tracker probe (#ISP-tracker experiment): result logging gate. */
     @Volatile private var ispTrackerActive = false
