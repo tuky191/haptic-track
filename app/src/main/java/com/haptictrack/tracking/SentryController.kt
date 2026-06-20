@@ -27,6 +27,8 @@ enum class SentryCue { SCANNING, INSPECTING, MATCH, REJECT }
 class SentryController(
     private val criteria: () -> SentryCriteria,
     private val setZoomTarget: (Float) -> Unit,
+    /** Current applied camera zoom — inspect zoom is computed relative to this so it converges. */
+    private val currentZoom: () -> Float,
     private val minZoom: () -> Float,
     private val maxZoom: () -> Float,
     /** Classify a candidate against the current frame. Null = no usable face this frame. */
@@ -51,6 +53,16 @@ class SentryController(
         const val REJECT_COOLDOWN = 90
         /** IoU above which a candidate is considered "the same" across frames when id is unstable. */
         const val SAME_CANDIDATE_IOU = 0.3f
+        /** Candidate must stay centered this many consecutive scan frames before we commit to inspect
+         *  (avoids zooming in on a 1-frame flicker, esp. at distance). */
+        const val CONFIRM_FRAMES = 3
+        /** Tolerate this many consecutive missing-detection frames during inspect before declaring lost
+         *  (distant subjects flicker; a single miss shouldn't abort + zoom out). */
+        const val INSPECT_MISS_TOLERANCE = 8
+        /** Occupancy deadzone: hold zoom when the box is within ±this fraction of INSPECT_OCCUPANCY. */
+        const val INSPECT_DEADZONE = 0.15f
+        /** A candidate overlapping a recently-rejected (wide-zoom) box by ≥ this IoU is skipped. */
+        const val COOLDOWN_IOU = 0.3f
     }
 
     enum class State { OFF, SCANNING, INSPECTING, MATCHED }
@@ -66,20 +78,26 @@ class SentryController(
     }
 
     private var inspectKey: String? = null
-    private var inspectBox: RectF? = null
+    private var inspectBox: RectF? = null         // latest candidate box (zoomed frame)
+    private var inspectStartBox: RectF? = null    // box at inspect start (wide zoom) — used for cooldown
     private var inspectFrames = 0
-    private val cooldowns = HashMap<String, Int>()
+    private var inspectMissed = 0                  // consecutive frames the candidate wasn't found
+    private var centeringKey: String? = null      // candidate currently building a centering streak
+    private var centeringStreak = 0
+    /** Recently-rejected wide-zoom boxes (+ frames remaining) — skip candidates overlapping these. */
+    private val cooled = ArrayList<Pair<RectF, Int>>()
 
     fun setEnabled(enabled: Boolean) {
         if (enabled) {
             if (state == State.OFF) {
                 state = State.SCANNING
+                resetScanState()
                 haptic(SentryCue.SCANNING)
             }
         } else {
             state = State.OFF
             resetInspect()
-            cooldowns.clear()
+            resetScanState()
         }
     }
 
@@ -88,19 +106,19 @@ class SentryController(
         if (state == State.MATCHED) {
             state = State.SCANNING
             resetInspect()
+            resetScanState()
             haptic(SentryCue.SCANNING)
         }
     }
 
     /** Drive one detection frame. [persons] are person detections in normalized screen coords. */
     fun onFrame(persons: List<TrackedObject>) {
-        // Age out cooldowns every frame.
-        if (cooldowns.isNotEmpty()) {
-            val iter = cooldowns.entries.iterator()
-            while (iter.hasNext()) {
-                val e = iter.next()
-                val v = e.value - 1
-                if (v <= 0) iter.remove() else e.setValue(v)
+        // Age out the cooldown list every frame.
+        if (cooled.isNotEmpty()) {
+            val it = cooled.listIterator()
+            while (it.hasNext()) {
+                val (box, n) = it.next()
+                if (n - 1 <= 0) it.remove() else it.set(box to (n - 1))
             }
         }
         when (state) {
@@ -113,27 +131,40 @@ class SentryController(
     private fun scan(persons: List<TrackedObject>) {
         setZoomTarget(SCAN_ZOOM)
         val candidate = persons
-            .filter { keyOf(it) !in cooldowns }
+            .filter { !isCooled(it.boundingBox) }
             .minByOrNull { centerDistance(it.boundingBox) }
-            ?: return
-        if (centerDistance(candidate.boundingBox) <= CENTER_TOLERANCE) {
-            inspectKey = keyOf(candidate)
-            inspectBox = RectF(candidate.boundingBox)
-            inspectFrames = 0
-            state = State.INSPECTING
-            setZoomTarget(inspectZoomFor(candidate.boundingBox))  // start zooming in immediately
-            haptic(SentryCue.INSPECTING)
-            onEvent("INSPECT_START", candidate.boundingBox, null, null)
+        if (candidate == null || centerDistance(candidate.boundingBox) > CENTER_TOLERANCE) {
+            centeringKey = null; centeringStreak = 0
+            return
         }
-        // else: not centered enough — stay scanning (handheld: user pans toward them).
+        // Build a centering streak — only commit once the same candidate has held center,
+        // so we don't zoom in on a transient/flickery detection (the distance failure mode).
+        val k = keyOf(candidate)
+        if (k == centeringKey) centeringStreak++ else { centeringKey = k; centeringStreak = 1 }
+        if (centeringStreak < CONFIRM_FRAMES) return
+
+        inspectKey = k
+        inspectBox = RectF(candidate.boundingBox)
+        inspectStartBox = RectF(candidate.boundingBox)
+        inspectFrames = 0
+        inspectMissed = 0
+        centeringKey = null; centeringStreak = 0
+        state = State.INSPECTING
+        setZoomTarget(inspectZoomFor(candidate.boundingBox))  // start zooming in
+        haptic(SentryCue.INSPECTING)
+        onEvent("INSPECT_START", candidate.boundingBox, null, null)
     }
 
     private fun inspect(persons: List<TrackedObject>) {
         val candidate = matchCandidate(persons)
         if (candidate == null) {
-            // Lost the candidate (walked off / occluded) — back to scanning.
-            rejectCurrent(null, "lost"); return
+            // Distant subjects flicker — tolerate a few missing frames before giving up,
+            // and hold the zoom rather than yo-yoing back out on a single dropped detection.
+            inspectMissed++
+            if (inspectMissed > INSPECT_MISS_TOLERANCE) rejectCurrent(null, "lost")
+            return
         }
+        inspectMissed = 0
         inspectBox = RectF(candidate.boundingBox)
         setZoomTarget(inspectZoomFor(candidate.boundingBox))
         inspectFrames++
@@ -161,7 +192,10 @@ class SentryController(
 
     private fun rejectCurrent(attr: FaceAttributes?, reason: String) {
         onEvent("REJECT", inspectBox, attr, reason)
-        inspectKey?.let { cooldowns[it] = REJECT_COOLDOWN }
+        // Cool the candidate by its WIDE-ZOOM box so the cooldown survives zooming back out
+        // (a zoomed box wouldn't match the wide-zoom box next scan, and the same person would
+        // be re-inspected instantly — the thrash we saw in the logs).
+        inspectStartBox?.let { cooled.add(RectF(it) to REJECT_COOLDOWN) }
         resetInspect()
         state = State.SCANNING
         setZoomTarget(SCAN_ZOOM)
@@ -169,8 +203,17 @@ class SentryController(
     }
 
     private fun resetInspect() {
-        inspectKey = null; inspectBox = null; inspectFrames = 0
+        inspectKey = null; inspectBox = null; inspectStartBox = null
+        inspectFrames = 0; inspectMissed = 0
     }
+
+    private fun resetScanState() {
+        centeringKey = null; centeringStreak = 0
+        cooled.clear()
+    }
+
+    private fun isCooled(box: RectF): Boolean =
+        cooled.any { FrameToFrameTracker.computeIou(it.first, box) >= COOLDOWN_IOU }
 
     /** Re-locate the inspected candidate in this frame by id, else by IoU to the last box. */
     private fun matchCandidate(persons: List<TrackedObject>): TrackedObject? {
@@ -183,11 +226,17 @@ class SentryController(
             .maxByOrNull { it.second }?.first
     }
 
-    /** Zoom that brings [box] to INSPECT_OCCUPANCY of frame height, relative to current scan zoom. */
+    /**
+     * Zoom that brings [box] to INSPECT_OCCUPANCY of frame height, relative to the CURRENT
+     * applied zoom (so it converges instead of oscillating). Holds when already in the deadzone.
+     */
     private fun inspectZoomFor(box: RectF): Float {
-        val h = box.height().coerceAtLeast(0.01f)
-        val target = SCAN_ZOOM * (INSPECT_OCCUPANCY / h)
-        return target.coerceIn(minZoom(), maxZoom())
+        val z = currentZoom().coerceAtLeast(0.1f)
+        val h = box.height().coerceAtLeast(0.02f)
+        if (h in INSPECT_OCCUPANCY * (1f - INSPECT_DEADZONE)..INSPECT_OCCUPANCY * (1f + INSPECT_DEADZONE)) {
+            return z  // already framed — hold
+        }
+        return (z * (INSPECT_OCCUPANCY / h)).coerceIn(minZoom(), maxZoom())
     }
 
     private fun centerDistance(box: RectF): Float =

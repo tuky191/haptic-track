@@ -172,6 +172,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             sentry = SentryController(
                 criteria = { _uiState.value.sentryCriteria },
                 setZoomTarget = { cameraManager.setZoomTarget(it) },
+                currentZoom = { cameraManager.gyroStabilizer.zoomRatio },
                 minZoom = { cameraManager.getMinZoom() },
                 maxZoom = { cameraManager.getMaxZoom() },
                 classify = { obj -> tracker.classifyPersonAttributes(obj.boundingBox) },
