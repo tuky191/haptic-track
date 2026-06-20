@@ -18,16 +18,16 @@ class SentryControllerTest {
     ) {
         var zoom = 1f; var locked: TrackedObject? = null
         val cues = mutableListOf<SentryCue>()
+        var zoomChanges = 0
         val ctrl = SentryController(
             criteria = { criteria },
-            setZoomTarget = { zoom = it },
+            setZoomTarget = { if (it != zoom) zoomChanges++; zoom = it },
             currentZoom = { zoom },
             minZoom = { 1f }, maxZoom = { 10f },
             classify = { classifyResult(it) },
             lock = { locked = it },
             haptic = { cues.add(it) },
         )
-        /** Feed the same centered person for N frames. */
         fun feed(p: TrackedObject, n: Int) = repeat(n) { ctrl.onFrame(listOf(p)) }
     }
 
@@ -42,12 +42,11 @@ class SentryControllerTest {
     }
 
     @Test
-    fun `centered person triggers inspection and zoom-in after confirm frames`() {
+    fun `centered person enters inspection after confirm frames`() {
         val h = Harness()
         h.ctrl.setEnabled(true)
         h.feed(person(1, 0.5f, 0.5f), CONFIRM)
         assertEquals(SentryController.State.INSPECTING, h.ctrl.state)
-        assertTrue("should zoom in past scan zoom", h.zoom > SentryController.SCAN_ZOOM)
         assertTrue(SentryCue.INSPECTING in h.cues)
     }
 
@@ -55,7 +54,7 @@ class SentryControllerTest {
     fun `single centered frame does not commit to inspection`() {
         val h = Harness()
         h.ctrl.setEnabled(true)
-        h.ctrl.onFrame(listOf(person(1, 0.5f, 0.5f)))  // one frame only
+        h.ctrl.onFrame(listOf(person(1, 0.5f, 0.5f)))
         assertEquals(SentryController.State.SCANNING, h.ctrl.state)
     }
 
@@ -63,39 +62,48 @@ class SentryControllerTest {
     fun `off-center person is not inspected`() {
         val h = Harness()
         h.ctrl.setEnabled(true)
-        h.feed(person(1, 0.95f, 0.5f), CONFIRM + 2)  // far right, never centers
+        h.feed(person(1, 0.95f, 0.5f), CONFIRM + 2)
         assertEquals(SentryController.State.SCANNING, h.ctrl.state)
     }
 
     @Test
-    fun `matching candidate locks and records`() {
+    fun `classifiable match locks WITHOUT moving the camera`() {
         val h = Harness(criteria = SentryCriteria(GenderFilter.MALE, 30, 50))
         h.classifyResult = { FaceAttributes(isMale = true, age = 40, genderConfidence = 5f) }
         h.ctrl.setEnabled(true)
         h.feed(person(1, 0.5f, 0.5f), CONFIRM + 2)
         assertEquals(SentryController.State.MATCHED, h.ctrl.state)
-        assertNotNull("should have locked", h.locked)
-        assertTrue(SentryCue.MATCH in h.cues)
+        assertNotNull(h.locked)
+        assertEquals("must not zoom for a readable subject", SentryController.SCAN_ZOOM, h.zoom, 1e-4f)
     }
 
     @Test
-    fun `non-matching candidate is rejected and cooled down`() {
+    fun `classifiable non-match does NOT yo-yo the zoom`() {
+        // The reported bug: a readable non-match (e.g. a boy when filtering for women) caused
+        // constant zoom in/out. It must classify at the current zoom and never move the camera.
         val h = Harness(criteria = SentryCriteria(GenderFilter.FEMALE))
-        h.classifyResult = { FaceAttributes(isMale = true, age = 40, genderConfidence = 5f) }  // male, filter female
+        h.classifyResult = { FaceAttributes(isMale = true, age = 12, genderConfidence = 5f) }
         h.ctrl.setEnabled(true)
-        h.feed(person(1, 0.5f, 0.5f), CONFIRM + 2)
+        h.feed(person(1, 0.5f, 0.5f), CONFIRM + 30)  // well past a settle cycle
         assertEquals(SentryController.State.SCANNING, h.ctrl.state)
         assertNull(h.locked)
-        assertTrue(SentryCue.REJECT in h.cues)
-        // Same centered person must NOT be re-inspected (IoU cooldown holds it).
-        h.feed(person(1, 0.5f, 0.5f), CONFIRM + 2)
-        assertEquals(SentryController.State.SCANNING, h.ctrl.state)
+        assertEquals("readable non-match must not move the camera", 0, h.zoomChanges)
+    }
+
+    @Test
+    fun `unreadable face triggers zoom-in`() {
+        // No face at the current zoom -> the controller should zoom in to enlarge it.
+        val h = Harness()
+        h.classifyResult = { null }
+        h.ctrl.setEnabled(true)
+        h.feed(person(1, 0.5f, 0.5f, w = 0.06f, h = 0.12f), CONFIRM + SentryController.NO_FACE_BEFORE_ZOOM * SentryController.CLASSIFY_INTERVAL + 2)
+        assertTrue("should zoom in when no face is found", h.zoom > SentryController.SCAN_ZOOM)
     }
 
     @Test
     fun `no usable face times out to rejection`() {
         val h = Harness()
-        h.classifyResult = { null }  // never a face
+        h.classifyResult = { null }
         h.ctrl.setEnabled(true)
         h.feed(person(1, 0.5f, 0.5f), CONFIRM + SentryController.INSPECT_TIMEOUT + 2)
         assertEquals(SentryController.State.SCANNING, h.ctrl.state)
@@ -107,32 +115,11 @@ class SentryControllerTest {
         val h = Harness(criteria = SentryCriteria(GenderFilter.MALE))
         h.classifyResult = { FaceAttributes(isMale = true, age = 30, genderConfidence = 5f) }
         h.ctrl.setEnabled(true)
-        h.feed(person(1, 0.5f, 0.5f), CONFIRM)        // enter INSPECTING
-        h.ctrl.onFrame(emptyList())                    // one dropped frame — must NOT abort
+        h.feed(person(1, 0.5f, 0.5f), CONFIRM)         // enter INSPECTING
+        h.ctrl.onFrame(emptyList())                     // one dropped frame — must NOT abort
         assertEquals(SentryController.State.INSPECTING, h.ctrl.state)
-        h.feed(person(1, 0.5f, 0.5f), 2)               // recovers, classifies, matches
+        h.feed(person(1, 0.5f, 0.5f), 2)                // recovers, classifies, matches
         assertEquals(SentryController.State.MATCHED, h.ctrl.state)
-    }
-
-    @Test
-    fun `inspect zoom converges and does not oscillate`() {
-        // A far subject (small box) should ramp zoom UP monotonically toward the target,
-        // never back down — the bug was target computed from a fixed base, causing in/out.
-        val h = Harness(criteria = SentryCriteria(GenderFilter.FEMALE))  // never matches male -> stays inspecting
-        h.classifyResult = { null }
-        h.ctrl.setEnabled(true)
-        h.feed(person(1, 0.5f, 0.5f, w = 0.06f, h = 0.12f), CONFIRM)  // small/far
-        val zooms = mutableListOf(h.zoom)
-        // Simulate the subject growing as we zoom in (box height tracks zoom).
-        repeat(6) {
-            val z = h.zoom
-            val grownH = (0.12f * z).coerceAtMost(0.95f)
-            h.ctrl.onFrame(listOf(person(1, 0.5f, 0.5f, w = grownH * 0.4f, h = grownH)))
-            zooms.add(h.zoom)
-        }
-        // Monotonic non-decreasing (allow tiny float noise), and it settles (last two ~equal).
-        for (i in 1 until zooms.size) assertTrue("zoom dipped: $zooms", zooms[i] >= zooms[i - 1] - 0.05f)
-        assertTrue("should converge", kotlin.math.abs(zooms.last() - zooms[zooms.size - 2]) < 0.3f)
     }
 
     @Test

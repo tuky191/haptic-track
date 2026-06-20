@@ -63,6 +63,12 @@ class SentryController(
         const val INSPECT_DEADZONE = 0.15f
         /** A candidate overlapping a recently-rejected (wide-zoom) box by ≥ this IoU is skipped. */
         const val COOLDOWN_IOU = 0.3f
+        /** Failed classify attempts at the current zoom before we start zooming in (face too small).
+         *  Classifiable subjects are decided WITHOUT moving the camera — no zoom yo-yo. */
+        const val NO_FACE_BEFORE_ZOOM = 2
+        /** After a reject, pause starting a new inspection for this many frames (throttles a
+         *  moving non-match that keeps re-entering center). */
+        const val SCAN_SETTLE_FRAMES = 24
     }
 
     enum class State { OFF, SCANNING, INSPECTING, MATCHED }
@@ -82,6 +88,8 @@ class SentryController(
     private var inspectStartBox: RectF? = null    // box at inspect start (wide zoom) — used for cooldown
     private var inspectFrames = 0
     private var inspectMissed = 0                  // consecutive frames the candidate wasn't found
+    private var noFaceStreak = 0                   // consecutive classify attempts with no usable face
+    private var settleFrames = 0                   // post-reject pause before a new inspection
     private var centeringKey: String? = null      // candidate currently building a centering streak
     private var centeringStreak = 0
     /** Recently-rejected wide-zoom boxes (+ frames remaining) — skip candidates overlapping these. */
@@ -130,6 +138,13 @@ class SentryController(
 
     private fun scan(persons: List<TrackedObject>) {
         setZoomTarget(SCAN_ZOOM)
+        // After a reject, hold off re-inspecting briefly so a moving non-match that keeps
+        // drifting back to center doesn't get re-inspected several times a second.
+        if (settleFrames > 0) {
+            settleFrames--
+            centeringKey = null; centeringStreak = 0
+            return
+        }
         val candidate = persons
             .filter { !isCooled(it.boundingBox) }
             .minByOrNull { centerDistance(it.boundingBox) }
@@ -138,7 +153,7 @@ class SentryController(
             return
         }
         // Build a centering streak — only commit once the same candidate has held center,
-        // so we don't zoom in on a transient/flickery detection (the distance failure mode).
+        // so we don't commit to a transient/flickery detection.
         val k = keyOf(candidate)
         if (k == centeringKey) centeringStreak++ else { centeringKey = k; centeringStreak = 1 }
         if (centeringStreak < CONFIRM_FRAMES) return
@@ -148,9 +163,12 @@ class SentryController(
         inspectStartBox = RectF(candidate.boundingBox)
         inspectFrames = 0
         inspectMissed = 0
+        noFaceStreak = 0
         centeringKey = null; centeringStreak = 0
         state = State.INSPECTING
-        setZoomTarget(inspectZoomFor(candidate.boundingBox))  // start zooming in
+        // NB: do NOT zoom in yet — try to classify at the current zoom first. Most subjects
+        // are readable without zooming, so we avoid the in/out churn entirely. We only zoom
+        // in (below) if the face proves too small to classify.
         haptic(SentryCue.INSPECTING)
         onEvent("INSPECT_START", candidate.boundingBox, null, null)
     }
@@ -166,13 +184,16 @@ class SentryController(
         }
         inspectMissed = 0
         inspectBox = RectF(candidate.boundingBox)
-        setZoomTarget(inspectZoomFor(candidate.boundingBox))
+        // Only zoom in once we've failed to read a face at the current zoom (face too small).
+        // A subject classifiable as-is never triggers camera movement.
+        if (noFaceStreak >= NO_FACE_BEFORE_ZOOM) setZoomTarget(inspectZoomFor(candidate.boundingBox))
         inspectFrames++
 
         // Classify on the first inspect frame, then every CLASSIFY_INTERVAL.
         if ((inspectFrames - 1) % CLASSIFY_INTERVAL == 0) {
             val attr = classify(candidate)
             if (attr != null) {
+                noFaceStreak = 0
                 val matched = criteria().matches(attr)
                 onEvent("CLASSIFY", candidate.boundingBox, attr, if (matched) "match" else "no-match")
                 if (matched) {
@@ -185,6 +206,8 @@ class SentryController(
                 } else {
                     rejectCurrent(attr, "no-match"); return
                 }
+            } else {
+                noFaceStreak++  // face too small/absent at this zoom — may trigger zoom-in next frame
             }
         }
         if (inspectFrames >= INSPECT_TIMEOUT) rejectCurrent(null, "timeout-no-face")
@@ -196,6 +219,7 @@ class SentryController(
         // (a zoomed box wouldn't match the wide-zoom box next scan, and the same person would
         // be re-inspected instantly — the thrash we saw in the logs).
         inspectStartBox?.let { cooled.add(RectF(it) to REJECT_COOLDOWN) }
+        settleFrames = SCAN_SETTLE_FRAMES
         resetInspect()
         state = State.SCANNING
         setZoomTarget(SCAN_ZOOM)
@@ -204,11 +228,12 @@ class SentryController(
 
     private fun resetInspect() {
         inspectKey = null; inspectBox = null; inspectStartBox = null
-        inspectFrames = 0; inspectMissed = 0
+        inspectFrames = 0; inspectMissed = 0; noFaceStreak = 0
     }
 
     private fun resetScanState() {
         centeringKey = null; centeringStreak = 0
+        settleFrames = 0
         cooled.clear()
     }
 
