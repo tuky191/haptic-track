@@ -96,7 +96,8 @@ class SentryControllerTest {
         val h = Harness()
         h.classifyResult = { null }
         h.ctrl.setEnabled(true)
-        h.feed(person(1, 0.5f, 0.5f, w = 0.06f, h = 0.12f), CONFIRM + SentryController.NO_FACE_BEFORE_ZOOM * SentryController.CLASSIFY_INTERVAL + 2)
+        // Enough frames for the eased ramp to clearly engage (stays under INSPECT_TIMEOUT).
+        h.feed(person(1, 0.5f, 0.5f, w = 0.06f, h = 0.12f), CONFIRM + 20)
         assertTrue("should zoom in when no face is found", h.zoom > SentryController.SCAN_ZOOM)
     }
 

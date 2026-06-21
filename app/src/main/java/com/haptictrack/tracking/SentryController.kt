@@ -69,6 +69,10 @@ class SentryController(
         /** After a reject, pause starting a new inspection for this many frames (throttles a
          *  moving non-match that keeps re-entering center). */
         const val SCAN_SETTLE_FRAMES = 24
+        /** Max fraction the inspect zoom target may move from the current zoom per frame, so the
+         *  zoom EASES in rather than snapping — gives the candidate-match (and post-lock tracker)
+         *  time to follow instead of losing the subject mid-zoom. ~6%/frame ≈ a smooth ~0.5s ramp. */
+        const val ZOOM_STEP_FRAC = 0.06f
     }
 
     enum class State { OFF, SCANNING, INSPECTING, MATCHED }
@@ -261,7 +265,11 @@ class SentryController(
         if (h in INSPECT_OCCUPANCY * (1f - INSPECT_DEADZONE)..INSPECT_OCCUPANCY * (1f + INSPECT_DEADZONE)) {
             return z  // already framed — hold
         }
-        return (z * (INSPECT_OCCUPANCY / h)).coerceIn(minZoom(), maxZoom())
+        val desired = (z * (INSPECT_OCCUPANCY / h)).coerceIn(minZoom(), maxZoom())
+        // Ease toward the desired zoom — cap the per-frame step so the frame doesn't lurch
+        // and lose the subject before the candidate-match / tracker can follow.
+        val maxStep = z * ZOOM_STEP_FRAC
+        return desired.coerceIn(z - maxStep, z + maxStep)
     }
 
     private fun centerDistance(box: RectF): Float =
