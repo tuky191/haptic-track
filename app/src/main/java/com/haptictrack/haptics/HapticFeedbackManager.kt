@@ -126,6 +126,20 @@ class HapticFeedbackManager(context: Context) {
         }
     }
 
+    /**
+     * Unmistakable alarm when recording stops unexpectedly (error, screen-off teardown, mic lost).
+     * Three long strong buzzes — deliberately distinct from the geiger/sentry cues and at full
+     * strength regardless of [strength], since a silent recording failure is the whole problem.
+     */
+    fun recordingFailureAlert() {
+        scope.launch {
+            repeat(3) {
+                vibrator.vibrate(VibrationEffect.createOneShot(300L, 255))
+                delay(450L)
+            }
+        }
+    }
+
     private fun lerp(a: Float, b: Float, t: Float): Float = a + (b - a) * t
 
     fun shutdown() {

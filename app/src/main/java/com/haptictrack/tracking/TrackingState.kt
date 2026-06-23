@@ -97,6 +97,8 @@ data class TrackingUiState(
     val status: TrackingStatus = TrackingStatus.IDLE,
     val trackedObject: TrackedObject? = null,
     val isRecording: Boolean = false,
+    /** True when recording finalized with an error (unexpected stop) — drives the failure banner. */
+    val recordingError: Boolean = false,
     val currentZoomRatio: Float = 1f,
     val detectedObjects: List<TrackedObject> = emptyList(),
     /** Source image width (post-rotation, i.e. portrait width). */

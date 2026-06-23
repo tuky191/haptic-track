@@ -515,14 +515,27 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             recordingManager.startRecording(cameraManager.videoCapture) { event ->
                 when (event) {
                     is VideoRecordEvent.Start ->
-                        _uiState.update { it.copy(isRecording = true) }
+                        _uiState.update { it.copy(isRecording = true, recordingError = false) }
                     is VideoRecordEvent.Finalize -> {
                         cameraManager.gyroStabilizer.endBenchCapture()
-                        _uiState.update { it.copy(isRecording = false) }
+                        // A clean user stop finalizes with ERROR_NONE; any error here means the
+                        // recording died unexpectedly (screen-off teardown, mic revoked, storage
+                        // full). Surface it loudly so a hands-free failure isn't silent.
+                        val errored = event.hasError()
+                        if (errored) {
+                            android.util.Log.w("Recording", "Finalize error=${event.error}: ${event.cause?.message}")
+                            hapticManager.recordingFailureAlert()
+                        }
+                        _uiState.update { it.copy(isRecording = false, recordingError = errored) }
                     }
                 }
             }
         }
+    }
+
+    /** Dismiss the recording-failure banner. */
+    fun dismissRecordingError() {
+        _uiState.update { it.copy(recordingError = false) }
     }
 
     override fun onCleared() {

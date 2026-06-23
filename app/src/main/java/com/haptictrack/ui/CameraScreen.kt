@@ -49,6 +49,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -72,6 +73,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.pointerInteropFilter
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
@@ -161,6 +163,17 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
     )
 
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+
+    // Keep the screen awake for the whole session (recording, tracking, or sentry armed) so a
+    // display timeout can't tear down the camera mid-shoot. Stealth mode still blacks the screen.
+    val view = LocalView.current
+    val sessionActive = uiState.isRecording ||
+        uiState.status != TrackingStatus.IDLE ||
+        uiState.sentryEnabled
+    DisposableEffect(sessionActive) {
+        view.keepScreenOn = sessionActive
+        onDispose { view.keepScreenOn = false }
+    }
 
     if (permissions.allPermissionsGranted) {
         val lifecycleOwner = LocalLifecycleOwner.current
@@ -377,6 +390,9 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                         status = uiState.status,
                         label = uiState.trackedObject?.label
                     )
+                    if (uiState.recordingError && !uiState.isRecording) {
+                        RecordingErrorBanner(onDismiss = { viewModel.dismissRecordingError() })
+                    }
                 }
 
                 // Bottom controls
@@ -437,6 +453,23 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
             Text("Camera and microphone permissions required", color = Color.White.copy(alpha = 0.7f), fontSize = 14.sp)
         }
     }
+}
+
+/** Loud banner shown when recording stopped unexpectedly. Tap to dismiss. */
+@Composable
+private fun RecordingErrorBanner(onDismiss: () -> Unit) {
+    Text(
+        text = "● RECORDING STOPPED — tap to dismiss",
+        color = Color.White,
+        fontSize = 13.sp,
+        fontWeight = FontWeight.Bold,
+        modifier = Modifier
+            .padding(top = 8.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(onClick = onDismiss)
+            .background(Color(0xFFD32F2F), RoundedCornerShape(8.dp))
+            .padding(horizontal = 16.dp, vertical = 8.dp)
+    )
 }
 
 // ---------------------------------------------------------------------------
