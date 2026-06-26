@@ -541,14 +541,16 @@ package com.haptictrack.tracking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CuePhraseTest {
     @Test fun `none has no phrase`() { assertNull(cuePhrase(Cue.NONE)) }
     @Test fun `every other cue has a non-blank phrase`() {
         for (c in Cue.entries) if (c != Cue.NONE) {
-            val p = cuePhrase(c); assertNotNull("missing phrase for $c", p); assertEquals(p, p!!.trim())
-            assert(p.isNotEmpty())
+            val p = cuePhrase(c)
+            assertNotNull("missing phrase for $c", p)
+            assertTrue("blank phrase for $c", p!!.isNotBlank())  // assertTrue, not Kotlin assert (disabled w/o -ea)
         }
     }
     @Test fun `move left says left`() { assertEquals("move left", cuePhrase(Cue.MOVE_LEFT)) }
@@ -1153,7 +1155,7 @@ adb pull /sdcard/Movies/HapticTrack/   # newest clip
 
 - [ ] **Step 4: Regression** — confirm with COACH `off` that haptics + recording behave exactly as before this feature.
 
-- [ ] **Step 5: Commit any tuning** (cue thresholds, MIN_GAP_MS, occupancy targets) discovered during device testing.
+- [ ] **Step 5: Commit any tuning** (cue thresholds, MIN_GAP_MS, occupancy targets) discovered during device testing. **Also tune cue WORDING against real BT audio** (review deferred): `CUT_OFF` "they're cut off" is descriptive/homophone-ambiguous — prefer an imperative like "recenter"; drop filler words ("level the camera" → "level"). Confirm each phrase is an actionable imperative the operator can follow instantly.
 
 ```bash
 git add -A && git commit -m "tune(guidance): on-device cue thresholds + cadence"

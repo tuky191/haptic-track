@@ -59,3 +59,18 @@ fun estimateYawDeg(rightEye: PointF, leftEye: PointF, nose: PointF): Float? {
     val deg = (offset / 0.5f) * 60f                       // scale: half-eye-span ≈ 60°
     return deg.coerceIn(-60f, 60f)
 }
+
+/** Short spoken phrase for a cue; null = say nothing. Keep phrases ≤3 words for low BT latency. */
+fun cuePhrase(cue: Cue): String? = when (cue) {
+    Cue.NONE -> null
+    Cue.LEVEL -> "level the camera"
+    Cue.CUT_OFF -> "they're cut off"
+    Cue.MOVE_LEFT -> "move left"
+    Cue.MOVE_RIGHT -> "move right"
+    Cue.TILT_UP -> "tilt up"
+    Cue.TILT_DOWN -> "tilt down"
+    Cue.STEP_CLOSER -> "step closer"
+    Cue.STEP_BACK -> "step back"
+    Cue.FACING_AWAY -> "facing away"
+    Cue.HOLD -> "good, hold"
+}
