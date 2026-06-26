@@ -22,6 +22,11 @@ import com.haptictrack.tracking.labelMatchesFilter
 import com.haptictrack.tracking.SentryController
 import com.haptictrack.tracking.SentryCriteria
 import com.haptictrack.tracking.GenderFilter
+import com.haptictrack.tracking.GuidanceEngine
+import com.haptictrack.tracking.GuidanceMode
+import com.haptictrack.tracking.FramingInput
+import com.haptictrack.tracking.next
+import com.haptictrack.audio.VoiceGuide
 import com.haptictrack.zoom.ZoomController
 import java.io.File
 import java.text.SimpleDateFormat
@@ -42,6 +47,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private val hapticManager = HapticFeedbackManager(application)
     private val zoomController = ZoomController()
     private val orientationListener = DeviceOrientationListener(application)
+    private val guidanceEngine = GuidanceEngine()
+    private val voiceGuide = VoiceGuide(application).also { it.start() }
     private var sentry: SentryController? = null
     private val sentryLogger = com.haptictrack.tracking.SentryLogger(application)
     // Mutated on the camera processing thread (onEvent), read/reset on the main thread.
@@ -153,7 +160,33 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     ).also { cameraManager.setZoomTarget(it) }
                 } else null
 
-                hapticManager.updateTrackingStatus(effectiveStatus, driftX, driftY)
+                // Single updateTrackingStatus call per frame: guidance path or passthrough.
+                val mode = _uiState.value.guidanceMode
+                val guidanceActive = mode != GuidanceMode.OFF &&
+                    effectiveStatus == TrackingStatus.LOCKED && lockedObject != null
+                if (guidanceActive) {
+                    val input = FramingInput(
+                        status = effectiveStatus,
+                        subject = lockedObject!!.boundingBox,
+                        face = tracker.lockedFaceFraming,
+                        rollDeg = cameraManager.gyroStabilizer.currentRollDeg(),
+                        zoomRatio = cameraManager.gyroStabilizer.zoomRatio,
+                        minZoom = cameraManager.getMinZoom(),
+                        maxZoom = cameraManager.getMaxZoom(),
+                        target = _uiState.value.framingTarget,
+                        frameTimeMs = android.os.SystemClock.elapsedRealtime(),
+                    )
+                    val a = guidanceEngine.assess(input)
+                    zoomController.occupancyTarget = a.desiredOccupancy
+                    val useBullseye = mode == GuidanceMode.HAPTIC || mode == GuidanceMode.BOTH
+                    hapticManager.updateTrackingStatus(effectiveStatus, if (useBullseye) a.driftX else driftX, if (useBullseye) a.driftY else driftY)
+                    if (mode == GuidanceMode.VOICE || mode == GuidanceMode.BOTH) {
+                        voiceGuide.speak(guidanceEngine.throttle(a.cue, input.frameTimeMs))
+                    }
+                } else {
+                    zoomController.resetOccupancyTarget()  // don't leak a guidance occupancy into normal auto-zoom
+                    hapticManager.updateTrackingStatus(effectiveStatus, driftX, driftY)
+                }
 
                 val displayObjects = if (effectiveStatus == TrackingStatus.IDLE) {
                     smoothIdleDetections(allObjects)
@@ -461,6 +494,16 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         _uiState.update { it.copy(translationEis = newValue) }
     }
 
+    fun cycleGuidanceMode() {
+        val next = _uiState.value.guidanceMode.next()
+        guidanceEngine.reset()
+        _uiState.update { it.copy(guidanceMode = next) }
+    }
+
+    fun cycleFramingTarget() {
+        _uiState.update { it.copy(framingTarget = it.framingTarget.next()) }
+    }
+
     fun toggleHorizonLock() {
         val newValue = !_uiState.value.horizonLock
         cameraManager.gyroStabilizer.horizonLockEnabled = newValue
@@ -501,6 +544,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         zoomController.reset()
         cameraManager.ispTrackerCancel()
         sentry?.onLockCleared()  // re-arm scanning if sentry still on
+        guidanceEngine.reset()
         hapticManager.updateTrackingStatus(TrackingStatus.IDLE)
         _uiState.update {
             TrackingUiState(status = TrackingStatus.IDLE, isRecording = false, captureMode = it.captureMode, stealthMode = it.stealthMode, isReady = it.isReady, ispStabilization = it.ispStabilization, gyroEis = it.gyroEis, gyroStrength = it.gyroStrength, adaptiveEis = it.adaptiveEis, leashEnabled = it.leashEnabled, oisCompensation = it.oisCompensation, translationEis = it.translationEis, horizonLock = it.horizonLock, fhd60Vdis = it.fhd60Vdis, trackingFilter = it.trackingFilter, hapticStrength = it.hapticStrength, sentryEnabled = it.sentryEnabled, sentryCriteria = it.sentryCriteria, sentryPhase = sentry?.phase ?: com.haptictrack.tracking.SentryPhase.OFF, guidanceMode = it.guidanceMode, framingTarget = it.framingTarget)
@@ -560,6 +604,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     override fun onCleared() {
         super.onCleared()
         orientationListener.stop()
+        voiceGuide.shutdown()
         if (isTrackerReady) objectTracker.shutdown()
         hapticManager.shutdown()
         cameraManager.shutdown()

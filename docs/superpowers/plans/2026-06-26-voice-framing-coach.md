@@ -488,10 +488,11 @@ Expected: FAIL — `throttle`/`reset`/`MIN_GAP_MS` unresolved.
 Add `const val MIN_GAP_MS = 1800L` to the `companion object`, and add these members to `GuidanceEngine`:
 
 ```kotlin
-    private var lastSpokenCue: Cue = Cue.NONE
+    // @Volatile: throttle() runs on the camera processing thread, reset() from the main thread.
+    @Volatile private var lastSpokenCue: Cue = Cue.NONE
     // Seeded one gap in the past so the first cue always clears MIN_GAP_MS. (Do NOT use
     // Long.MIN_VALUE — `frameTimeMs - Long.MIN_VALUE` overflows and silences the first cue.)
-    private var lastSpokenMs: Long = -MIN_GAP_MS
+    @Volatile private var lastSpokenMs: Long = -MIN_GAP_MS
 
     /** Decide whether [cue] should actually be spoken this frame; see Task 4 rules. */
     fun throttle(cue: Cue, frameTimeMs: Long): Cue {
@@ -701,6 +702,8 @@ In `ZoomController.kt`, the constructor has `private val targetFrameOccupancy: F
 ```kotlin
     /** Runtime-adjustable occupancy target (framing coach overrides per target). */
     @Volatile var occupancyTarget: Float = targetFrameOccupancy
+    // ... and a reset so the framing coach doesn't leak its occupancy into normal auto-zoom:
+    //   fun resetOccupancyTarget() { occupancyTarget = targetFrameOccupancy }
 ```
 
 Then in `calculateZoom` replace the `targetFrameOccupancy` usage (`:85`, `val areaRatio = ... targetFrameOccupancy / boxArea ...`) with `occupancyTarget`. Leave the constructor param as the default source.
@@ -1020,6 +1023,8 @@ In `onDetectionResult`, after `effectiveStatus` and the drift block are computed
 ```
 
 > Note: when `mode` includes HAPTIC, this REPLACES the existing dead-center `hapticManager.updateTrackingStatus(effectiveStatus, driftX, driftY)` call for the locked frame (drift now points at the bullseye). Leave the original haptic call in place for `mode == OFF` so default behavior is unchanged — i.e. guard the original call with `if (mode == GuidanceMode.OFF)` or restructure so exactly one haptic update fires per frame. Do not double-call `updateTrackingStatus`.
+>
+> The `else` (guidance-inactive) branch MUST call `zoomController.resetOccupancyTarget()` — otherwise a guidance occupancy (0.45/0.40/0.22) set while active leaks permanently into normal auto-zoom after guidance is turned OFF.
 
 - [ ] **Step 3: Add the zoom-occupancy setter on CameraManager**
 

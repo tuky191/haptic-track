@@ -23,10 +23,11 @@ class GuidanceEngine {
         private const val ZOOM_LIMIT_EPS = 0.05f
     }
 
-    private var lastSpokenCue: Cue = Cue.NONE
+    // @Volatile: throttle() runs on the camera processing thread, reset() from the main thread.
+    @Volatile private var lastSpokenCue: Cue = Cue.NONE
     // Seeded one gap in the past so the first cue always clears MIN_GAP_MS. (Do NOT use
     // Long.MIN_VALUE — `frameTimeMs - Long.MIN_VALUE` overflows and silences the first cue.)
-    private var lastSpokenMs: Long = -MIN_GAP_MS
+    @Volatile private var lastSpokenMs: Long = -MIN_GAP_MS
 
     /** Decide whether [cue] should actually be spoken this frame; see Task 4 rules. */
     fun throttle(cue: Cue, frameTimeMs: Long): Cue {

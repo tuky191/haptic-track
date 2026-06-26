@@ -162,6 +162,9 @@ class ZoomController(
         smoothedArea = -1f
     }
 
+    /** Restore the constructor occupancy default (when the framing coach stops overriding it). */
+    fun resetOccupancyTarget() { occupancyTarget = targetFrameOccupancy }
+
     /** Current zoom level (for pinch gesture to use as baseline). */
     fun getCurrentZoom(): Float = currentZoom
 }
