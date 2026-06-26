@@ -665,14 +665,12 @@ private fun BottomControls(
             Spacer(Modifier.height(8.dp))
         }
 
-        // Guidance coach toggles (active session only)
-        if (!isIdle) {
-            GuidancePill(guidanceMode, onGuidanceCycle)
+        // Guidance coach toggle (always visible so users can arm it before locking)
+        GuidancePill(guidanceMode, onGuidanceCycle)
+        Spacer(Modifier.height(8.dp))
+        if (guidanceMode != GuidanceMode.OFF) {
+            FramingPill(framingTarget, onFramingCycle)
             Spacer(Modifier.height(8.dp))
-            if (guidanceMode != GuidanceMode.OFF) {
-                FramingPill(framingTarget, onFramingCycle)
-                Spacer(Modifier.height(8.dp))
-            }
         }
 
         // Mode selector

@@ -10,7 +10,7 @@ enum class FramingTarget { FULL_BODY, UPPER_BODY, FACE_HEAD }
 enum class GuidanceMode { OFF, HAPTIC, VOICE, BOTH }
 
 /** The single correction the coach surfaces this frame (NONE = stay silent). */
-enum class Cue { NONE, LEVEL, CUT_OFF, MOVE_LEFT, MOVE_RIGHT, TILT_UP, TILT_DOWN, STEP_CLOSER, STEP_BACK, FACING_AWAY, HOLD }
+enum class Cue { NONE, LEVEL, MOVE_LEFT, MOVE_RIGHT, TILT_UP, TILT_DOWN, STEP_CLOSER, STEP_BACK, FACING_AWAY, HOLD }
 
 fun FramingTarget.next(): FramingTarget =
     FramingTarget.entries[(ordinal + 1) % FramingTarget.entries.size]
@@ -64,7 +64,6 @@ fun estimateYawDeg(rightEye: PointF, leftEye: PointF, nose: PointF): Float? {
 fun cuePhrase(cue: Cue): String? = when (cue) {
     Cue.NONE -> null
     Cue.LEVEL -> "level the camera"
-    Cue.CUT_OFF -> "they're cut off"
     Cue.MOVE_LEFT -> "move left"
     Cue.MOVE_RIGHT -> "move right"
     Cue.TILT_UP -> "tilt up"

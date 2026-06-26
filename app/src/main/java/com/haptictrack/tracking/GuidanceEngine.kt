@@ -17,7 +17,6 @@ class GuidanceEngine {
         const val OCC_LOW = 0.7f
         const val OCC_HIGH = 1.4f
         const val YAW_PROFILE_DEG = 35f
-        const val EDGE_MARGIN = 0.04f
         const val MIN_GAP_MS = 1800L
         private const val HEADROOM_TOP = 0.18f
         private const val ZOOM_LIMIT_EPS = 0.05f
@@ -88,8 +87,6 @@ class GuidanceEngine {
         input: FramingInput, region: RectF, desiredOcc: Float, driftX: Float, driftY: Float,
     ): Cue {
         if (abs(input.rollDeg) > LEVEL_TOL_DEG) return Cue.LEVEL
-        if (region.left < EDGE_MARGIN || region.top < EDGE_MARGIN ||
-            region.right > 1f - EDGE_MARGIN || region.bottom > 1f - EDGE_MARGIN) return Cue.CUT_OFF
 
         val area = (region.width() * region.height()).coerceAtLeast(1e-6f)
         val occRatio = desiredOcc / area  // >1 = too small, <1 = too big

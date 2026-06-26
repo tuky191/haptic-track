@@ -26,9 +26,6 @@ class GuidanceEngineTest {
     @Test fun `tilted camera asks to level first`() {
         assertEquals(Cue.LEVEL, eng.assess(input(roll = 14f)).cue)
     }
-    @Test fun `subject at left edge is cut off`() {
-        assertEquals(Cue.CUT_OFF, eng.assess(input(subject = RectF(0.0f, 0.3f, 0.18f, 0.9f))).cue)
-    }
     @Test fun `subject left of bullseye asks move right`() {
         // Frontal full-body bullseye x = 0.5; put subject center at 0.30 -> need MOVE_RIGHT.
         val a = eng.assess(input(subject = RectF(0.20f, 0.30f, 0.40f, 0.90f)))
@@ -60,7 +57,7 @@ class GuidanceEngineTest {
     }
     @Test fun `face target with profile face says facing away`() {
         // Face region sits ON its bullseye (yaw>0 -> left third x=0.33; top=0.18 -> driftY=0) so
-        // level/cut-off/drift/zoom cues don't pre-empt and FACING_AWAY is the surfaced cue.
+        // level/drift/zoom cues don't pre-empt and FACING_AWAY is the surfaced cue.
         val face = FaceFraming(RectF(0.27f, 0.18f, 0.39f, 0.30f), yawDeg = 50f)
         val a = eng.assess(input(subject = RectF(0.20f, 0.10f, 0.50f, 1.0f), face = face, target = FramingTarget.FACE_HEAD))
         assertEquals(Cue.FACING_AWAY, a.cue)
