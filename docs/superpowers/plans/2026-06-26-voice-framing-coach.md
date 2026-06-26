@@ -296,9 +296,10 @@ class GuidanceEngineTest {
         assertEquals(a.satisfied, a.cue == Cue.HOLD)
     }
     @Test fun `face target with profile face says facing away`() {
-        val face = FaceFraming(RectF(0.42f, 0.36f, 0.58f, 0.52f), yawDeg = 50f)
-        // Put the face region on its bullseye so drift/level don't pre-empt.
-        val a = eng.assess(input(subject = RectF(0.30f, 0.20f, 0.70f, 1.0f), face = face, target = FramingTarget.FACE_HEAD))
+        // Face region sits ON its bullseye (yaw>0 -> left third x=0.33; top=0.18 -> driftY=0) so
+        // level/cut-off/drift/zoom cues don't pre-empt and FACING_AWAY is the surfaced cue.
+        val face = FaceFraming(RectF(0.27f, 0.18f, 0.39f, 0.30f), yawDeg = 50f)
+        val a = eng.assess(input(subject = RectF(0.20f, 0.10f, 0.50f, 1.0f), face = face, target = FramingTarget.FACE_HEAD))
         assertEquals(Cue.FACING_AWAY, a.cue)
     }
 }
