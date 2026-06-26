@@ -836,22 +836,32 @@ data class FaceFramingLocal(val faceBoxInPerson: RectF, val yawDeg: Float?)
 
 - [ ] **Step 5: Wire the throttled update in ObjectTracker**
 
-In the detector-path block of `processBitmap`, right before the `onDetectionResult?.invoke(...)` at the detector path (~`:1170`), update the face framing every 5th frame when locked (mirrors `TEMPLATE_CHECK_INTERVAL`):
+Add `private const val FACE_FRAMING_INTERVAL = 5` to the companion object, and a shared private method (so it runs from BOTH the VT fast-path and the detector path — the VT fast-path returns early, and healthy locked tracking lives there, so a detector-path-only update would go stale during tracking):
 
 ```kotlin
-            if (lockedObject != null) {
-                faceFramingFrameCount++
-                if (faceFramingFrameCount % 5 == 0) {
-                    val local = faceEmbedder.detectFaceFraming(bitmap, lockedObject.boundingBox)
-                    lockedFaceFraming = local?.let {
-                        FaceFraming(mapFaceToScreen(it.faceBoxInPerson, lockedObject.boundingBox), it.yawDeg)
-                    }
-                }
-            } else {
-                lockedFaceFraming = null
-                faceFramingFrameCount = 0
-            }
+    /**
+     * Update [lockedFaceFraming] for the guidance coach. v1 LIMITATION: only computed in upright
+     * holds (deviceRotation == 0). Under rotation, `bitmap` is device-oriented while the locked box
+     * is screen-space; cropping + back-mapping the face box correctly across 90/180/270 is a
+     * follow-up. Geometric cues (level/drift/cut-off/distance) are unaffected — they use the subject
+     * bbox directly, in any orientation. Throttled to every FACE_FRAMING_INTERVAL frames.
+     */
+    private fun updateFaceFraming(bitmap: Bitmap, lockedBox: RectF?, deviceRotation: Int) {
+        if (lockedBox == null || deviceRotation != 0) {
+            lockedFaceFraming = null; faceFramingFrameCount = 0; return
+        }
+        faceFramingFrameCount++
+        if (faceFramingFrameCount % FACE_FRAMING_INTERVAL != 0) return
+        val local = faceEmbedder.detectFaceFraming(bitmap, lockedBox)
+        lockedFaceFraming = local?.let { FaceFraming(mapFaceToScreen(it.faceBoxInPerson, lockedBox), it.yawDeg) }
+    }
 ```
+
+Call it in BOTH paths, immediately before each `onDetectionResult?.invoke(...)`:
+- VT fast-path (before its early `return`): `updateFaceFraming(bitmap, lockedObj.boundingBox, deviceRotation)`
+- detector path: `updateFaceFraming(bitmap, lockedObject?.boundingBox, deviceRotation)`
+
+> **Why upright-gated:** every other locked-subject crop of `bitmap` (contour, `classifyPersonAttributes`) first maps screen→rotated via `mapToRotated(deviceRotation)`; cropping with the raw screen box only matches `bitmap` at `deviceRotation == 0`. Full-rotation face framing (crop the rotated box, un-rotate the returned face box back to screen) is a deliberate Phase-2 follow-up.
 
 - [ ] **Step 6: Run tests + full suite**
 

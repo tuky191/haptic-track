@@ -31,6 +31,8 @@ import java.nio.ByteOrder
  *
  * Preprocessing: (pixel - 127.5) / 128.0 → range [-1, +1] (InsightFace convention).
  */
+data class FaceFramingLocal(val faceBoxInPerson: RectF, val yawDeg: Float?)
+
 class FaceEmbedder(
     context: Context,
     sharedFaceDetector: FaceDetector? = null,
@@ -261,6 +263,38 @@ class FaceEmbedder(
             Log.i(TAG, "Saved attribute debug crops to ${dir.absolutePath} (kps=${kps.size})")
         } catch (e: Exception) {
             Log.w(TAG, "saveDebugCrops failed: ${e.message}")
+        }
+    }
+
+    /** Face box (normalized within personBox) + coarse yaw for the largest face. Null if none. */
+    @Synchronized
+    fun detectFaceFraming(bitmap: Bitmap, personBox: RectF): FaceFramingLocal? {
+        val personCanonical = cropper.prepare(
+            bitmap, personBox,
+            targetWidth = PERSON_CANONICAL_SIZE, targetHeight = PERSON_CANONICAL_SIZE,
+            paddingFraction = 0f, minSourcePixels = MIN_PERSON_SOURCE_PIXELS,
+        ) ?: return null
+        val personCrop = personCanonical.bitmap
+        return try {
+            val mpImage = BitmapImageBuilder(personCrop).build()
+            val faces = synchronized(faceDetector) { faceDetector.detect(mpImage) }
+            val face = faces.detections().maxByOrNull {
+                it.boundingBox().width() * it.boundingBox().height()
+            } ?: return null
+            val box = normalizeFaceBox(face.boundingBox(), personCrop.width, personCrop.height)
+                ?: return null
+            val kps = face.keypoints().orElse(emptyList())
+            val yaw = if (kps.size >= 3)
+                estimateYawDeg(
+                    PointF(kps[0].x(), kps[0].y()),
+                    PointF(kps[1].x(), kps[1].y()),
+                    PointF(kps[2].x(), kps[2].y()),
+                ) else null
+            FaceFramingLocal(box, yaw)
+        } catch (e: Exception) {
+            Log.w(TAG, "detectFaceFraming failed: ${e.message}"); null
+        } finally {
+            personCrop.recycle()
         }
     }
 

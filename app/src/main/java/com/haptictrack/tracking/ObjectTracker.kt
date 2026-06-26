@@ -29,6 +29,8 @@ class ObjectTracker(
         private const val AUDIT_STABILITY_INTERVAL = 5
         /** Save a crop composite every Nth confirmed frame (subset of stability cadence). */
         private const val AUDIT_COMPOSITE_INTERVAL = 30
+        /** Run face-framing detection every Nth frame on the locked subject. */
+        private const val FACE_FRAMING_INTERVAL = 5
     }
 
     private val detector: ObjectDetector
@@ -40,6 +42,10 @@ class ObjectTracker(
 
     /** Gender/age of the currently locked person (computed at lock time). Shown in overlay (#sentry Phase 2). */
     @Volatile private var lockedFaceAttributes: FaceAttributes? = null
+
+    /** Locked subject's face framing (screen-normalized) for the guidance coach; null if none. */
+    @Volatile var lockedFaceFraming: FaceFraming? = null
+    private var faceFramingFrameCount = 0
 
     /** Embedding-input audit (#92): periodic crops + per-embedder stability log. */
     private val cropDebugCapture: CropDebugCapture
@@ -456,6 +462,8 @@ class ObjectTracker(
 
     fun clearLock() {
         lockedFaceAttributes = null
+        lockedFaceFraming = null
+        faceFramingFrameCount = 0
         scenarioRecorder.recordEvent("CLEAR")
         scenarioRecorder.stop()
         debugCapture.log("CLEAR by user")
@@ -892,6 +900,8 @@ class ObjectTracker(
                             }
                         }
 
+                        updateFaceFraming(bitmap, lockedObj.boundingBox, deviceRotation)
+
                         lastDetections = displayObjects
                         onDetectionResult?.invoke(displayObjects, lockedObj, frameWidth, frameHeight, cachedContour)
                         emitGiveUpIfNeeded(lockedObj)
@@ -1166,12 +1176,31 @@ class ObjectTracker(
                 }
             }
 
+            updateFaceFraming(bitmap, lockedObject?.boundingBox, deviceRotation)
+
             lastDetections = displayObjects
             onDetectionResult?.invoke(displayObjects, lockedObject, frameWidth, frameHeight, cachedContour)
             emitGiveUpIfNeeded(lockedObject)
         } finally {
             releaseOnExit?.let { bitmapRecycler?.invoke(it) ?: it.recycle() }
         }
+    }
+
+    /**
+     * Update [lockedFaceFraming] for the guidance coach. v1 LIMITATION: only computed in upright
+     * holds (deviceRotation == 0). Under rotation, `bitmap` is device-oriented while the locked box
+     * is screen-space; cropping + back-mapping the face box correctly across 90/180/270 is a
+     * follow-up. Geometric cues (level/drift/cut-off/distance) are unaffected by this — they use the
+     * subject bbox directly, in any orientation. Throttled to every FACE_FRAMING_INTERVAL frames.
+     */
+    private fun updateFaceFraming(bitmap: Bitmap, lockedBox: RectF?, deviceRotation: Int) {
+        if (lockedBox == null || deviceRotation != 0) {
+            lockedFaceFraming = null; faceFramingFrameCount = 0; return
+        }
+        faceFramingFrameCount++
+        if (faceFramingFrameCount % FACE_FRAMING_INTERVAL != 0) return
+        val local = faceEmbedder.detectFaceFraming(bitmap, lockedBox)
+        lockedFaceFraming = local?.let { FaceFraming(mapFaceToScreen(it.faceBoxInPerson, lockedBox), it.yawDeg) }
     }
 
     /**
@@ -1408,6 +1437,17 @@ class ObjectTracker(
         uprightBuffer?.recycle()
         uprightBuffer = null
     }
+}
+
+/** Map a face box expressed in personBox-normalized coords into screen-normalized coords. */
+fun mapFaceToScreen(faceInPerson: RectF, personBox: RectF): RectF {
+    val w = personBox.width(); val h = personBox.height()
+    return RectF(
+        personBox.left + faceInPerson.left * w,
+        personBox.top + faceInPerson.top * h,
+        personBox.left + faceInPerson.right * w,
+        personBox.top + faceInPerson.bottom * h,
+    )
 }
 
 /**
