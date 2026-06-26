@@ -936,6 +936,7 @@ class VoiceGuide(private val context: Context) {
                 ready = true
             } else {
                 Log.w("VoiceGuide", "TTS init failed: $status")
+                tts?.shutdown(); tts = null  // release so a later start() can retry (don't leak a dead engine)
             }
         }
     }
