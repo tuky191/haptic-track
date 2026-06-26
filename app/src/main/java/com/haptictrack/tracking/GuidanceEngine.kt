@@ -8,7 +8,7 @@ import kotlin.math.abs
  * Pure per-frame framing assessment. Given the locked subject geometry + camera roll + the chosen
  * framing target, it computes a composition bullseye, the desired subject size, a drift vector
  * (for the haptic channel), and the single highest-priority correction cue (for the voice channel).
- * Stateless — see [throttle] (Task 4) for cadence.
+ * assess() is stateless; throttle()/reset() carry the spoken-cue cadence state.
  */
 class GuidanceEngine {
     companion object {
@@ -18,8 +18,29 @@ class GuidanceEngine {
         const val OCC_HIGH = 1.4f
         const val YAW_PROFILE_DEG = 35f
         const val EDGE_MARGIN = 0.04f
+        const val MIN_GAP_MS = 1800L
         private const val HEADROOM_TOP = 0.18f
         private const val ZOOM_LIMIT_EPS = 0.05f
+    }
+
+    private var lastSpokenCue: Cue = Cue.NONE
+    // Seeded one gap in the past so the first cue always clears MIN_GAP_MS. (Do NOT use
+    // Long.MIN_VALUE — `frameTimeMs - Long.MIN_VALUE` overflows and silences the first cue.)
+    private var lastSpokenMs: Long = -MIN_GAP_MS
+
+    /** Decide whether [cue] should actually be spoken this frame; see Task 4 rules. */
+    fun throttle(cue: Cue, frameTimeMs: Long): Cue {
+        if (cue == Cue.NONE) return Cue.NONE
+        if (cue == Cue.HOLD && lastSpokenCue == Cue.HOLD) return Cue.NONE  // hold spoken once
+        if (frameTimeMs - lastSpokenMs < MIN_GAP_MS) return Cue.NONE       // global min gap
+        lastSpokenCue = cue
+        lastSpokenMs = frameTimeMs
+        return cue
+    }
+
+    fun reset() {
+        lastSpokenCue = Cue.NONE
+        lastSpokenMs = -MIN_GAP_MS
     }
 
     fun assess(input: FramingInput): FramingAssessment {
