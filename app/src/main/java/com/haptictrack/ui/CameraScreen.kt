@@ -88,6 +88,8 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.rememberMultiplePermissionsState
 import com.haptictrack.tracking.CaptureMode
+import com.haptictrack.tracking.FramingTarget
+import com.haptictrack.tracking.GuidanceMode
 import com.haptictrack.tracking.TrackingFilter
 import com.haptictrack.tracking.TrackingStatus
 import com.haptictrack.tracking.labelMatchesFilter
@@ -430,12 +432,16 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                         val phase = if (uiState.sentryEnabled) " · ${uiState.sentryPhase}" else ""
                         "$who · ${viewModel.sentryAgeLabel()}$phase"
                     },
+                    guidanceMode = uiState.guidanceMode,
+                    framingTarget = uiState.framingTarget,
                     onSentryToggle = { viewModel.toggleSentry() },
                     onShutterClick = { viewModel.toggleRecording() },
                     onFlipClick = { viewModel.switchCamera() },
                     onClearClick = { viewModel.clearTracking() },
                     onModeToggle = { viewModel.toggleCaptureMode() },
                     onFilterCycle = { viewModel.cycleTrackingFilter() },
+                    onGuidanceCycle = { viewModel.cycleGuidanceMode() },
+                    onFramingCycle = { viewModel.cycleFramingTarget() },
                     modifier = Modifier.align(Alignment.BottomCenter)
                 )
 
@@ -628,12 +634,16 @@ private fun BottomControls(
     isIdle: Boolean,
     sentryEnabled: Boolean,
     sentrySummary: String,
+    guidanceMode: GuidanceMode,
+    framingTarget: FramingTarget,
     onSentryToggle: () -> Unit,
     onShutterClick: () -> Unit,
     onFlipClick: () -> Unit,
     onClearClick: () -> Unit,
     onModeToggle: () -> Unit,
     onFilterCycle: () -> Unit,
+    onGuidanceCycle: () -> Unit,
+    onFramingCycle: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -653,6 +663,16 @@ private fun BottomControls(
         if (isIdle && !isRecording) {
             TrackingFilterPill(trackingFilter, onFilterCycle)
             Spacer(Modifier.height(8.dp))
+        }
+
+        // Guidance coach toggles (active session only)
+        if (!isIdle) {
+            GuidancePill(guidanceMode, onGuidanceCycle)
+            Spacer(Modifier.height(8.dp))
+            if (guidanceMode != GuidanceMode.OFF) {
+                FramingPill(framingTarget, onFramingCycle)
+                Spacer(Modifier.height(8.dp))
+            }
         }
 
         // Mode selector
@@ -856,6 +876,50 @@ private fun SentryPill(
                 RoundedCornerShape(12.dp)
             )
             .padding(horizontal = 14.dp, vertical = 5.dp)
+    )
+}
+
+@Composable
+private fun GuidancePill(mode: GuidanceMode, onCycle: () -> Unit, modifier: Modifier = Modifier) {
+    val (label, on) = when (mode) {
+        GuidanceMode.OFF -> "COACH off" to false
+        GuidanceMode.HAPTIC -> "COACH · haptic" to true
+        GuidanceMode.VOICE -> "COACH · voice" to true
+        GuidanceMode.BOTH -> "COACH · both" to true
+    }
+    Text(
+        text = label,
+        color = if (on) HapticAmber else Color.White.copy(alpha = 0.55f),
+        fontSize = 12.sp,
+        fontWeight = FontWeight.SemiBold,
+        modifier = modifier
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onCycle)
+            .background(
+                if (on) HapticAmber.copy(alpha = 0.18f) else Color.Black.copy(alpha = 0.3f),
+                RoundedCornerShape(12.dp)
+            )
+            .padding(horizontal = 14.dp, vertical = 5.dp)
+    )
+}
+
+@Composable
+private fun FramingPill(target: FramingTarget, onCycle: () -> Unit, modifier: Modifier = Modifier) {
+    val label = when (target) {
+        FramingTarget.FULL_BODY -> "frame: full body"
+        FramingTarget.UPPER_BODY -> "frame: upper body"
+        FramingTarget.FACE_HEAD -> "frame: face"
+    }
+    Text(
+        text = label,
+        color = Color.White.copy(alpha = 0.8f),
+        fontSize = 12.sp,
+        fontWeight = FontWeight.Medium,
+        modifier = modifier
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onCycle)
+            .background(Color.Black.copy(alpha = 0.3f), RoundedCornerShape(12.dp))
+            .padding(horizontal = 14.dp, vertical = 4.dp)
     )
 }
 
