@@ -162,8 +162,8 @@ class GyroStabilizer(context: Context) : SensorEventListener {
     /** Current camera zoom ratio — used to scale TC (more smoothing at zoom). */
     @Volatile var zoomRatio: Float = 1f
 
-    /** Horizon lock: counter-rotate roll toward gravity. Works with EIS on or off. */
-    @Volatile var horizonLockEnabled: Boolean = false
+    /** Horizon lock: counter-rotate roll toward gravity. Works with EIS on or off. On by default. */
+    @Volatile var horizonLockEnabled: Boolean = true
     @Volatile private var lockAppliedDeg = 0.0
     private var lastLockNs = 0L
 

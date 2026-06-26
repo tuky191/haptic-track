@@ -16,6 +16,8 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -47,6 +49,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -70,12 +73,15 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.pointerInteropFilter
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -159,6 +165,32 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
     )
 
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+
+    // Keep the screen awake for the whole session (recording, tracking, or sentry armed) so a
+    // display timeout can't tear down the camera mid-shoot. Stealth mode still blacks the screen.
+    val view = LocalView.current
+    val sessionActive = uiState.isRecording ||
+        uiState.status != TrackingStatus.IDLE ||
+        uiState.sentryEnabled
+    DisposableEffect(sessionActive) {
+        view.keepScreenOn = sessionActive
+        onDispose { view.keepScreenOn = false }
+    }
+
+    // Track foreground state so a recording teardown from intentional backgrounding
+    // (home / app-switch) doesn't trigger the failure alarm.
+    val foregroundOwner = LocalLifecycleOwner.current
+    DisposableEffect(foregroundOwner) {
+        val obs = LifecycleEventObserver { _, e ->
+            when (e) {
+                Lifecycle.Event.ON_RESUME -> viewModel.setForeground(true)
+                Lifecycle.Event.ON_PAUSE -> viewModel.setForeground(false)
+                else -> {}
+            }
+        }
+        foregroundOwner.lifecycle.addObserver(obs)
+        onDispose { foregroundOwner.lifecycle.removeObserver(obs) }
+    }
 
     if (permissions.allPermissionsGranted) {
         val lifecycleOwner = LocalLifecycleOwner.current
@@ -375,6 +407,9 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                         status = uiState.status,
                         label = uiState.trackedObject?.label
                     )
+                    if (uiState.recordingError && !uiState.isRecording) {
+                        RecordingErrorBanner(onDismiss = { viewModel.dismissRecordingError() })
+                    }
                 }
 
                 // Bottom controls
@@ -385,6 +420,17 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                     showFlip = uiState.status == TrackingStatus.IDLE,
                     showClear = uiState.status != TrackingStatus.IDLE,
                     isIdle = uiState.status == TrackingStatus.IDLE,
+                    sentryEnabled = uiState.sentryEnabled,
+                    sentrySummary = run {
+                        val who = when (uiState.sentryCriteria.gender) {
+                            com.haptictrack.tracking.GenderFilter.MALE -> "Men"
+                            com.haptictrack.tracking.GenderFilter.FEMALE -> "Women"
+                            com.haptictrack.tracking.GenderFilter.ANY -> "Anyone"
+                        }
+                        val phase = if (uiState.sentryEnabled) " · ${uiState.sentryPhase}" else ""
+                        "$who · ${viewModel.sentryAgeLabel()}$phase"
+                    },
+                    onSentryToggle = { viewModel.toggleSentry() },
                     onShutterClick = { viewModel.toggleRecording() },
                     onFlipClick = { viewModel.switchCamera() },
                     onClearClick = { viewModel.clearTracking() },
@@ -407,6 +453,10 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                         onToggleLeash = { viewModel.toggleLeash() },
                         onToggleOis = { viewModel.toggleOisCompensation() },
                         onHapticStrengthChange = { viewModel.setHapticStrength(it) },
+                        onToggleSentry = { viewModel.toggleSentry() },
+                        onSentryGenderCycle = { viewModel.cycleSentryGender() },
+                        onSentryAgeCycle = { viewModel.cycleSentryAgeGroup() },
+                        sentryAgeLabel = viewModel.sentryAgeLabel(),
                         onDismiss = { showDebugSheet = false }
                     )
                 }
@@ -420,6 +470,23 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
             Text("Camera and microphone permissions required", color = Color.White.copy(alpha = 0.7f), fontSize = 14.sp)
         }
     }
+}
+
+/** Loud banner shown when recording stopped unexpectedly. Tap to dismiss. */
+@Composable
+private fun RecordingErrorBanner(onDismiss: () -> Unit) {
+    Text(
+        text = "● RECORDING STOPPED — tap to dismiss",
+        color = Color.White,
+        fontSize = 13.sp,
+        fontWeight = FontWeight.Bold,
+        modifier = Modifier
+            .padding(top = 8.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(onClick = onDismiss)
+            .background(Color(0xFFD32F2F), RoundedCornerShape(8.dp))
+            .padding(horizontal = 16.dp, vertical = 8.dp)
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -559,6 +626,9 @@ private fun BottomControls(
     showFlip: Boolean,
     showClear: Boolean,
     isIdle: Boolean,
+    sentryEnabled: Boolean,
+    sentrySummary: String,
+    onSentryToggle: () -> Unit,
     onShutterClick: () -> Unit,
     onFlipClick: () -> Unit,
     onClearClick: () -> Unit,
@@ -573,6 +643,12 @@ private fun BottomControls(
             .navigationBarsPadding()
             .padding(bottom = 24.dp)
     ) {
+        // Sentry auto-lock pill — visible while idle, or whenever sentry is armed.
+        if ((isIdle && !isRecording) || sentryEnabled) {
+            SentryPill(sentryEnabled, sentrySummary, onSentryToggle)
+            Spacer(Modifier.height(8.dp))
+        }
+
         // Tracking filter (IDLE only)
         if (isIdle && !isRecording) {
             TrackingFilterPill(trackingFilter, onFilterCycle)
@@ -758,6 +834,31 @@ private fun TrackingFilterPill(
     )
 }
 
+/** Main-screen sentry auto-lock toggle. Tap to arm/disarm; shows criteria + live phase when armed. */
+@Composable
+private fun SentryPill(
+    enabled: Boolean,
+    summary: String,
+    onToggle: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val color = if (enabled) HapticAmber else Color.White.copy(alpha = 0.55f)
+    Text(
+        text = if (enabled) "◎ SENTRY · $summary" else "○ SENTRY",
+        color = color,
+        fontSize = 12.sp,
+        fontWeight = FontWeight.SemiBold,
+        modifier = modifier
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onToggle)
+            .background(
+                if (enabled) HapticAmber.copy(alpha = 0.18f) else Color.Black.copy(alpha = 0.3f),
+                RoundedCornerShape(12.dp)
+            )
+            .padding(horizontal = 14.dp, vertical = 5.dp)
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -827,6 +928,11 @@ private fun TrackingOverlay(
             scale(lockScale, pivot = Offset(cx, cy)) {
                 drawRoundedGlow(left, top, right, bottom, color)
             }
+            // Sentry Phase 2: gender/age label above the locked subject.
+            state.trackedObject.faceAttributes?.let { attr ->
+                val ageText = attr.ageBucket.ifEmpty { attr.age.toString() }
+                drawAttributeLabel("${attr.genderLabel} · $ageText", left, top, bracketOpacity)
+            }
         } else if (isLost && state.trackedObject != null && lostOpacity > 0.01f) {
             val color = HapticRed.copy(alpha = lostOpacity * 0.7f)
             val (ll, lt, lr, lb) = mapBox(state.trackedObject.boundingBox, transform)
@@ -847,6 +953,20 @@ private val innerGlowPaint = android.graphics.Paint().apply {
     isAntiAlias = true
     strokeWidth = 15f
     maskFilter = android.graphics.BlurMaskFilter(20f, android.graphics.BlurMaskFilter.Blur.NORMAL)
+}
+
+private val attrLabelPaint = android.graphics.Paint().apply {
+    isAntiAlias = true
+    textSize = 38f
+    typeface = android.graphics.Typeface.DEFAULT_BOLD
+    color = android.graphics.Color.WHITE
+    setShadowLayer(6f, 0f, 0f, android.graphics.Color.BLACK)
+}
+
+private fun DrawScope.drawAttributeLabel(text: String, left: Float, top: Float, alpha: Float) {
+    attrLabelPaint.alpha = (alpha * 255f).toInt().coerceIn(0, 255)
+    val y = (top - 14f).coerceAtLeast(40f)
+    drawContext.canvas.nativeCanvas.drawText(text, left, y, attrLabelPaint)
 }
 
 private fun DrawScope.drawRoundedGlow(
@@ -925,6 +1045,10 @@ private fun DebugBottomSheet(
     onToggleLeash: () -> Unit,
     onToggleOis: () -> Unit,
     onHapticStrengthChange: (Float) -> Unit,
+    onToggleSentry: () -> Unit,
+    onSentryGenderCycle: () -> Unit,
+    onSentryAgeCycle: () -> Unit,
+    sentryAgeLabel: String,
     onDismiss: () -> Unit
 ) {
     ModalBottomSheet(
@@ -935,6 +1059,7 @@ private fun DebugBottomSheet(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
                 .padding(bottom = 32.dp)
         ) {
             Text(
@@ -1031,7 +1156,45 @@ private fun DebugBottomSheet(
                     Text("Max", color = Color.White.copy(alpha = 0.35f), fontSize = 11.sp)
                 }
             }
+
+            Spacer(Modifier.height(8.dp))
+
+            Text(
+                text = "SENTRY (AUTO-LOCK)",
+                color = Color.White.copy(alpha = 0.4f),
+                fontSize = 11.sp,
+                fontWeight = FontWeight.SemiBold,
+                letterSpacing = 1.5.sp,
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp)
+            )
+
+            SettingRow("Active scan", uiState.sentryEnabled, onToggleSentry)
+            if (uiState.sentryEnabled) {
+                SentryChoiceRow("Gender", uiState.sentryCriteria.gender.name, onSentryGenderCycle)
+                SentryChoiceRow("Age group", sentryAgeLabel, onSentryAgeCycle)
+                Text(
+                    "Status: ${uiState.sentryPhase}",
+                    color = HapticCyan.copy(alpha = 0.8f),
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 6.dp)
+                )
+            }
         }
+    }
+}
+
+/** A settings row whose right side shows the current choice and cycles on tap. */
+@Composable
+private fun SentryChoiceRow(label: String, value: String, onCycle: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onCycle() }
+            .padding(horizontal = 24.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(label, color = Color.White, fontSize = 14.sp, modifier = Modifier.weight(1f))
+        Text(value, color = HapticCyan, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
     }
 }
 

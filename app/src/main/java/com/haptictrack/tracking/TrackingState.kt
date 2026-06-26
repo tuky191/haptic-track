@@ -22,6 +22,32 @@ enum class TrackingFilter {
     NON_PERSON_ONLY
 }
 
+/** Sentry auto-lock gender criterion. */
+enum class GenderFilter { ANY, MALE, FEMALE }
+
+/**
+ * Criteria the sentry auto-lock matches a person against. [ageMin]/[ageMax] are
+ * inclusive years; default span accepts any age. A person matches when its
+ * estimated gender and age both fall within the criteria.
+ */
+data class SentryCriteria(
+    val gender: GenderFilter = GenderFilter.ANY,
+    val ageMin: Int = 0,
+    val ageMax: Int = 120,
+) {
+    fun matches(attr: FaceAttributes): Boolean {
+        val genderOk = when (gender) {
+            GenderFilter.ANY -> true
+            GenderFilter.MALE -> attr.isMale
+            GenderFilter.FEMALE -> !attr.isMale
+        }
+        return genderOk && attr.age in ageMin..ageMax
+    }
+}
+
+/** Sentry state for UI display. */
+enum class SentryPhase { OFF, SCANNING, INSPECTING, MATCHED }
+
 private val ANIMAL_LABELS = setOf(
     "cat", "dog", "bird", "horse", "sheep", "cow",
     "elephant", "bear", "zebra", "giraffe"
@@ -44,7 +70,9 @@ data class TrackedObject(
     /** OSNet person re-ID embedding (512-dim). Only computed for person candidates. */
     val reIdEmbedding: FloatArray? = null,
     /** MobileFaceNet face embedding (192-dim). Only computed when face is visible. */
-    val faceEmbedding: FloatArray? = null
+    val faceEmbedding: FloatArray? = null,
+    /** Gender/age estimate. Only computed when a face is visible and the sentry/debug attribute pass runs. */
+    val faceAttributes: FaceAttributes? = null
 ) {
     // INVARIANT: embedding, colorHistogram, reIdEmbedding, and faceEmbedding are
     // excluded from equals/hashCode. These are transient ML output, not part of the
@@ -69,6 +97,8 @@ data class TrackingUiState(
     val status: TrackingStatus = TrackingStatus.IDLE,
     val trackedObject: TrackedObject? = null,
     val isRecording: Boolean = false,
+    /** True when recording finalized with an error (unexpected stop) — drives the failure banner. */
+    val recordingError: Boolean = false,
     val currentZoomRatio: Float = 1f,
     val detectedObjects: List<TrackedObject> = emptyList(),
     /** Source image width (post-rotation, i.e. portrait width). */
@@ -86,8 +116,8 @@ data class TrackingUiState(
     val isReady: Boolean = false,
     /** Loading status messages shown during model init. */
     val loadingStatus: String = "Initializing...",
-    /** ISP-level preview stabilization toggle. */
-    val ispStabilization: Boolean = false,
+    /** ISP-level (vendor VDIS) stabilization toggle — on by default. */
+    val ispStabilization: Boolean = true,
     /** Software gyro-based EIS toggle. */
     val gyroEis: Boolean = true,
     /** Gyro EIS strength 0.0–1.0 (0 = light, 1 = aggressive). */
@@ -100,10 +130,16 @@ data class TrackingUiState(
     val oisCompensation: Boolean = true,
     /** Optical-flow translation correction on top of gyro rotation EIS. */
     val translationEis: Boolean = false,
-    val horizonLock: Boolean = false,
+    val horizonLock: Boolean = true,
     val fhd60Vdis: Boolean = false,
     /** Which object categories to show and allow tracking. */
     val trackingFilter: TrackingFilter = TrackingFilter.ALL,
     /** Haptic vibration strength 0.0–1.0. */
-    val hapticStrength: Float = 0.5f
+    val hapticStrength: Float = 0.5f,
+    /** Sentry auto-lock: actively scan + zoom-inspect for a person matching criteria. */
+    val sentryEnabled: Boolean = false,
+    /** Default search: women, teen/adult (15-45). */
+    val sentryCriteria: SentryCriteria = SentryCriteria(GenderFilter.FEMALE, 15, 45),
+    /** Live sentry phase for UI display. */
+    val sentryPhase: SentryPhase = SentryPhase.OFF
 )

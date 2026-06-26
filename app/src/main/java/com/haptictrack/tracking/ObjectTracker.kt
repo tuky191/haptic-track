@@ -34,8 +34,12 @@ class ObjectTracker(
     private val detector: ObjectDetector
     private val appearanceEmbedder: AppearanceEmbedder
     private val faceEmbedder: FaceEmbedder
+    private val faceAttributeClassifier: FaceAttributeClassifier
     private val personReId: PersonReIdEmbedder
     private val scenarioRecorder = ScenarioRecorder()
+
+    /** Gender/age of the currently locked person (computed at lock time). Shown in overlay (#sentry Phase 2). */
+    @Volatile private var lockedFaceAttributes: FaceAttributes? = null
 
     /** Embedding-input audit (#92): periodic crops + per-embedder stability log. */
     private val cropDebugCapture: CropDebugCapture
@@ -224,6 +228,7 @@ class ObjectTracker(
         val colorHist: FloatArray?,
         val reIdEmb: FloatArray?,
         val faceEmb: FloatArray?,
+        val faceAttrs: FaceAttributes?,
         val sceneNegatives: List<FloatArray>,
         /** Face+body embeddings for OTHER persons visible at lock time — seeds
          *  the [SessionRoster] (#108) so the open-set rejection has data from
@@ -236,6 +241,17 @@ class ObjectTracker(
 
     /** Callback: (displayObjects, lockedObject, imageWidth, imageHeight, contour) */
     var onDetectionResult: ((List<TrackedObject>, TrackedObject?, Int, Int, List<PointF>) -> Unit)? = null
+
+    /** Fired once when reacquisition gives up on a lost lock (timed out past maxFramesLost).
+     *  Lets the owner reset to IDLE and re-arm the sentry — a dead lock otherwise pins status
+     *  in LOST forever and the sentry never rescans. */
+    var onGiveUp: (() -> Unit)? = null
+    private val giveUpLatch = GiveUpLatch()
+
+    /** Emit a one-shot give-up signal when the engine has timed out with no live lock. */
+    private fun emitGiveUpIfNeeded(locked: TrackedObject?) {
+        if (giveUpLatch.update(locked != null, reacquisition.hasTimedOut)) onGiveUp?.invoke()
+    }
 
     // Contour extraction — disabled until the UI uses it (saves CPU/battery).
     // Enable by setting to true when contour-based overlay is implemented.
@@ -264,7 +280,8 @@ class ObjectTracker(
         detector = ObjectDetector.createFromOptions(context, options)
 
         onLoadingStatus?.invoke("Loading face models (GPU)...")
-        faceEmbedder = FaceEmbedder(context)
+        faceAttributeClassifier = FaceAttributeClassifier(context)
+        faceEmbedder = FaceEmbedder(context, attributeClassifier = faceAttributeClassifier)
         personReId = PersonReIdEmbedder(context)
 
         cropDebugCapture = CropDebugCapture(appearanceEmbedder, personReId, faceEmbedder, auditExecutor)
@@ -313,6 +330,7 @@ class ObjectTracker(
                 val isPerson = label == "person"
                 val reIdEmb = if (isPerson) personReId.embed(snapshotBmp, boundingBox) else null
                 val faceEmb = if (isPerson) faceEmbedder.embedFace(snapshotBmp, boundingBox) else null
+                val faceAttrs = if (isPerson) faceEmbedder.classifyAttributes(snapshotBmp, boundingBox) else null
 
                 // Scene negatives: embed every other detection visible at lock time.
                 // boundingBox is screen-space; remap to rotated-image space to crop.
@@ -344,6 +362,7 @@ class ObjectTracker(
                     colorHist = colorHist,
                     reIdEmb = reIdEmb,
                     faceEmb = faceEmb,
+                    faceAttrs = faceAttrs,
                     sceneNegatives = sceneNegs,
                     sceneRosterObservations = rosterObservations,
                     deviceRotation = snapshotDevRot,
@@ -359,6 +378,32 @@ class ObjectTracker(
     }
 
     /**
+     * Classify gender/age of a person given its SCREEN-space bbox, against the
+     * latest frame. Used by the sentry to inspect a candidate. Maps the box into
+     * the frame's rotated space (same remap as scene negatives) before cropping.
+     * Intended to be called from the [onDetectionResult] callback (processing
+     * thread), where [lastFrameBitmap] is stable. Returns null if no frame, no
+     * face, or the classifier is unavailable.
+     */
+    fun classifyPersonAttributes(screenBox: RectF): FaceAttributes? {
+        val bmp: Bitmap; val rot: Int
+        synchronized(lastFrameLock) {
+            bmp = lastFrameBitmap ?: return null
+            rot = lastFrameDeviceRotation
+        }
+        val rotBox = mapToRotated(screenBox.left, screenBox.top, screenBox.right, screenBox.bottom, rot)
+        return faceEmbedder.classifyAttributes(bmp, rotBox)
+    }
+
+    /** A copy of the latest analysis frame (display orientation) for logging. Caller recycles. Null if none. */
+    fun currentFrameForLog(): Bitmap? {
+        synchronized(lastFrameLock) {
+            val src = lastFrameBitmap ?: return null
+            return src.copy(src.config ?: Bitmap.Config.ARGB_8888, false)
+        }
+    }
+
+    /**
      * Apply a completed off-thread lock result on the processing thread. Called at
      * the start of [processBitmapInternal] so all state mutation happens on the
      * single thread that reads it. Recycles the snapshot bitmap once consumed.
@@ -366,6 +411,8 @@ class ObjectTracker(
     private fun applyPendingLockIfAny() {
         val result = pendingLockResult.getAndSet(null) ?: return
         try {
+            lockedFaceAttributes = result.faceAttrs
+            result.faceAttrs?.let { debugCapture.log("[Sentry] lock attrs: ${it.genderLabel} age=${it.age} conf=${"%.2f".format(it.genderConfidence)}") }
             reacquisition.lock(result.trackingId, result.boundingBox, result.label,
                 result.gallery, result.colorHist,
                 cocoLabel = result.label, reIdEmbedding = result.reIdEmb, faceEmbedding = result.faceEmb)
@@ -408,6 +455,7 @@ class ObjectTracker(
     }
 
     fun clearLock() {
+        lockedFaceAttributes = null
         scenarioRecorder.recordEvent("CLEAR")
         scenarioRecorder.stop()
         debugCapture.log("CLEAR by user")
@@ -825,7 +873,8 @@ class ObjectTracker(
                             id = reacquisition.lockedId ?: -1,
                             boundingBox = smoothedBox,
                             label = reacquisition.lastKnownLabel,
-                            confidence = vtResult.confidence
+                            confidence = vtResult.confidence,
+                            faceAttributes = lockedFaceAttributes
                         )
                         // Include the visual tracker's box, but remove detector
                         // boxes that overlap it to avoid duplicate rectangles.
@@ -845,7 +894,12 @@ class ObjectTracker(
 
                         lastDetections = displayObjects
                         onDetectionResult?.invoke(displayObjects, lockedObj, frameWidth, frameHeight, cachedContour)
+                        emitGiveUpIfNeeded(lockedObj)
 
+                        // NB: this VT fast-path fires the callback BEFORE retaining `bitmap` as
+                        // lastFrameBitmap, so classifyPersonAttributes()/currentFrameForLog() called
+                        // from here would read the PREVIOUS frame. Safe today because the sentry only
+                        // runs while IDLE and this path only runs while locked — mutually exclusive.
                         synchronized(lastFrameLock) {
                             val previous = lastFrameBitmap
                             lastFrameBitmap = bitmap
@@ -1042,6 +1096,7 @@ class ObjectTracker(
 
             // Re-acquisition
             val lockedObject = reacquisition.processFrame(filtered)
+                ?.let { if (lockedFaceAttributes != null) it.copy(faceAttributes = lockedFaceAttributes) else it }
 
             // Record events for scenario replay
             val nowLost = reacquisition.framesLost
@@ -1113,6 +1168,7 @@ class ObjectTracker(
 
             lastDetections = displayObjects
             onDetectionResult?.invoke(displayObjects, lockedObject, frameWidth, frameHeight, cachedContour)
+            emitGiveUpIfNeeded(lockedObject)
         } finally {
             releaseOnExit?.let { bitmapRecycler?.invoke(it) ?: it.recycle() }
         }
@@ -1341,6 +1397,7 @@ class ObjectTracker(
         pendingLockResult.getAndSet(null)?.snapshotBmp?.recycle()
         detector.close()
         faceEmbedder.close()
+        faceAttributeClassifier.close()
         personReId.close()
         appearanceEmbedder.shutdown()
         visualTracker.stop()
