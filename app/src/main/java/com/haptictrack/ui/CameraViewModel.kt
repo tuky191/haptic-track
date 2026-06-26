@@ -44,8 +44,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private val orientationListener = DeviceOrientationListener(application)
     private var sentry: SentryController? = null
     private val sentryLogger = com.haptictrack.tracking.SentryLogger(application)
-    private var sentryInspected = 0
-    private var sentryMatched = 0
+    // Mutated on the camera processing thread (onEvent), read/reset on the main thread.
+    private val sentryInspected = java.util.concurrent.atomic.AtomicInteger(0)
+    private val sentryMatched = java.util.concurrent.atomic.AtomicInteger(0)
 
     private val _uiState = MutableStateFlow(TrackingUiState())
     val uiState: StateFlow<TrackingUiState> = _uiState.asStateFlow()
@@ -87,6 +88,14 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 _uiState.update { it.copy(loadingStatus = status) }
             })
             tracker.deviceRotationProvider = { orientationListener.deviceRotation }
+            // A lost lock that times out otherwise pins status in LOST forever and the sentry
+            // never rescans. On give-up, reset to IDLE (which re-arms the sentry) — posted to the
+            // main thread and guarded so a fresh re-lock isn't clobbered.
+            tracker.onGiveUp = {
+                getApplication<Application>().mainExecutor.execute {
+                    if (_uiState.value.status == TrackingStatus.LOST) clearTracking()
+                }
+            }
             tracker.onSessionDir = { dir ->
                 if (dir != null) cameraManager.gyroStabilizer.startSessionLog(dir)
                 else cameraManager.gyroStabilizer.endSessionLog()
@@ -180,14 +189,17 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 haptic = { cue -> hapticManager.sentryCue(cue) },
                 onEvent = { type, box, attr, note ->
                     sentryLogger.event(type, box, attr, note)
-                    if (type == "INSPECT_START") sentryInspected++
-                    if (type == "MATCH") sentryMatched++
+                    if (type == "INSPECT_START") sentryInspected.incrementAndGet()
+                    if (type == "MATCH") sentryMatched.incrementAndGet()
                     // Capture the frame at each decision point (re-croppable offline via the box).
                     if (type == "INSPECT_START" || type == "MATCH" || type == "REJECT") {
                         tracker.currentFrameForLog()?.let { sentryLogger.saveFrame(type, it) }
                     }
                 },
             )
+            // The controller is built after the (slow) model load; if sentry was somehow armed
+            // before then, reflect that now so scanning actually starts.
+            sentry?.setEnabled(_uiState.value.sentryEnabled)
             // Wire the pool-release callback so the tracker can return the previous
             // lastFrameBitmap (and any un-retained frame) back to the pool.
             tracker.bitmapRecycler = { bmp -> cameraManager.releaseAnalysisBitmap(bmp) }
@@ -254,10 +266,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     fun toggleSentry() {
         val newVal = !_uiState.value.sentryEnabled
         if (newVal) {
-            sentryInspected = 0; sentryMatched = 0
+            sentryInspected.set(0); sentryMatched.set(0)
             sentryLogger.arm(_uiState.value.sentryCriteria)
         } else {
-            sentryLogger.disarm(matched = sentryMatched, inspected = sentryInspected)
+            sentryLogger.disarm(matched = sentryMatched.get(), inspected = sentryInspected.get())
         }
         sentry?.setEnabled(newVal)
         _uiState.update { it.copy(sentryEnabled = newVal, sentryPhase = sentry?.phase ?: com.haptictrack.tracking.SentryPhase.OFF) }
@@ -524,7 +536,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                         val errored = event.hasError()
                         if (errored) {
                             android.util.Log.w("Recording", "Finalize error=${event.error}: ${event.cause?.message}")
-                            hapticManager.recordingFailureAlert()
+                            // Don't alarm if we're backgrounded — that teardown is the user's own
+                            // doing (home/app-switch), not a failure they need buzzed about.
+                            if (appForeground) hapticManager.recordingFailureAlert()
                         }
                         _uiState.update { it.copy(isRecording = false, recordingError = errored) }
                     }
@@ -532,6 +546,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             }
         }
     }
+
+    /** Whether the app is foregrounded — gates the recording-failure alarm so an intentional
+     *  background (home button → CameraX unbind → ERROR_SOURCE_INACTIVE) doesn't false-alarm. */
+    @Volatile private var appForeground = true
+    fun setForeground(foreground: Boolean) { appForeground = foreground }
 
     /** Dismiss the recording-failure banner. */
     fun dismissRecordingError() {

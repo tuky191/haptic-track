@@ -169,11 +169,13 @@ class FaceEmbedder(
     /**
      * Detect the largest face in a person bbox and classify gender/age. Unlike
      * [embedFace] (which letterboxes the face box — fine for MobileFaceNet
-     * identity), genderage's AGE head is alignment-sensitive, so we warp the
-     * face to the ArcFace template using BlazeFace's eye keypoints (5-point
-     * alignment, scaled to ATTR_SIZE) — matching the off-device de-risk
-     * (tools/sentry_genderage.py). Falls back to a letterbox crop if keypoints
-     * are unavailable. Returns null if no face / no classifier / crop too small.
+     * identity), the FairFace age head is alignment-sensitive, so we warp the
+     * face to the ArcFace template using BlazeFace's eye keypoints — a 2-point
+     * (eyes-only) similarity, scaled to ATTR_SIZE. NB: the off-device FairFace
+     * eval (tools/age_gender_eval/eval_fairface.py) used a 5-point warp, so
+     * on-device attribute accuracy should be re-confirmed against it. Falls back
+     * to a letterbox crop if keypoints are unavailable. Returns null if no face
+     * / no classifier / crop too small.
      */
     @Synchronized
     fun classifyAttributes(bitmap: Bitmap, personBox: RectF): FaceAttributes? {

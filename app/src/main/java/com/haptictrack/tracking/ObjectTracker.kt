@@ -242,6 +242,21 @@ class ObjectTracker(
     /** Callback: (displayObjects, lockedObject, imageWidth, imageHeight, contour) */
     var onDetectionResult: ((List<TrackedObject>, TrackedObject?, Int, Int, List<PointF>) -> Unit)? = null
 
+    /** Fired once when reacquisition gives up on a lost lock (timed out past maxFramesLost).
+     *  Lets the owner reset to IDLE and re-arm the sentry — a dead lock otherwise pins status
+     *  in LOST forever and the sentry never rescans. */
+    var onGiveUp: (() -> Unit)? = null
+    private var gaveUpFired = false
+
+    /** Emit a one-shot give-up signal when the engine has timed out with no live lock. */
+    private fun emitGiveUpIfNeeded(locked: TrackedObject?) {
+        if (locked != null) { gaveUpFired = false; return }
+        if (reacquisition.hasTimedOut && !gaveUpFired) {
+            gaveUpFired = true
+            onGiveUp?.invoke()
+        }
+    }
+
     // Contour extraction — disabled until the UI uses it (saves CPU/battery).
     // Enable by setting to true when contour-based overlay is implemented.
     private val contourEnabled = false
@@ -883,7 +898,12 @@ class ObjectTracker(
 
                         lastDetections = displayObjects
                         onDetectionResult?.invoke(displayObjects, lockedObj, frameWidth, frameHeight, cachedContour)
+                        emitGiveUpIfNeeded(lockedObj)
 
+                        // NB: this VT fast-path fires the callback BEFORE retaining `bitmap` as
+                        // lastFrameBitmap, so classifyPersonAttributes()/currentFrameForLog() called
+                        // from here would read the PREVIOUS frame. Safe today because the sentry only
+                        // runs while IDLE and this path only runs while locked — mutually exclusive.
                         synchronized(lastFrameLock) {
                             val previous = lastFrameBitmap
                             lastFrameBitmap = bitmap
@@ -1152,6 +1172,7 @@ class ObjectTracker(
 
             lastDetections = displayObjects
             onDetectionResult?.invoke(displayObjects, lockedObject, frameWidth, frameHeight, cachedContour)
+            emitGiveUpIfNeeded(lockedObject)
         } finally {
             releaseOnExit?.let { bitmapRecycler?.invoke(it) ?: it.recycle() }
         }

@@ -80,6 +80,8 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -173,6 +175,21 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
     DisposableEffect(sessionActive) {
         view.keepScreenOn = sessionActive
         onDispose { view.keepScreenOn = false }
+    }
+
+    // Track foreground state so a recording teardown from intentional backgrounding
+    // (home / app-switch) doesn't trigger the failure alarm.
+    val foregroundOwner = LocalLifecycleOwner.current
+    DisposableEffect(foregroundOwner) {
+        val obs = LifecycleEventObserver { _, e ->
+            when (e) {
+                Lifecycle.Event.ON_RESUME -> viewModel.setForeground(true)
+                Lifecycle.Event.ON_PAUSE -> viewModel.setForeground(false)
+                else -> {}
+            }
+        }
+        foregroundOwner.lifecycle.addObserver(obs)
+        onDispose { foregroundOwner.lifecycle.removeObserver(obs) }
     }
 
     if (permissions.allPermissionsGranted) {

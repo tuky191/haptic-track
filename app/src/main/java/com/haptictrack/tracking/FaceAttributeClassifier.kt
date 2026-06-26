@@ -86,6 +86,9 @@ class FaceAttributeClassifier(context: Context) {
 
         val gender = outBuffers[genderOutIdx]!![0]   // [male, female] logits
         val ageLogits = outBuffers[ageOutIdx]!![0]   // 9 bucket logits
+        // FairFace gender index 0 = Male (verified in tools/age_gender_eval/eval_fairface.py).
+        // NB: this is the OPPOSITE of InsightFace genderage (pred[1] = Male), so don't crib
+        // the convention from the old tools/sentry_genderage.py.
         val isMale = gender[0] > gender[1]
         val probs = softmax(ageLogits)
         var pt = 0f

@@ -267,7 +267,9 @@ class SentryController(
         }
         val desired = (z * (INSPECT_OCCUPANCY / h)).coerceIn(minZoom(), maxZoom())
         // Ease toward the desired zoom — cap the per-frame step so the frame doesn't lurch
-        // and lose the subject before the candidate-match / tracker can follow.
+        // and lose the subject before the candidate-match / tracker can follow. This rate-limits
+        // the TARGET; GyroStabilizer.interpolateZoom then ramps the applied zoom toward it. The
+        // double-smoothing is intentional — capping the target is what bounds per-frame box motion.
         val maxStep = z * ZOOM_STEP_FRAC
         return desired.coerceIn(z - maxStep, z + maxStep)
     }

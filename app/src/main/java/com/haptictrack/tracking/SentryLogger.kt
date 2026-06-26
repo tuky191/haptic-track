@@ -8,6 +8,7 @@ import org.json.JSONObject
 import java.io.File
 import java.io.PrintWriter
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Per-activation sentry session log for off-device troubleshooting.
@@ -33,7 +34,7 @@ class SentryLogger(context: Context) {
 
     @Volatile private var sessionDir: File? = null
     @Volatile private var events: PrintWriter? = null
-    private var seq = 0
+    private val seq = AtomicInteger(0)  // incremented on the processing thread, reset on main
     private var startNs = 0L
 
     val active: Boolean get() = sessionDir != null
@@ -86,7 +87,7 @@ class SentryLogger(context: Context) {
     fun saveFrame(tag: String, bmp: Bitmap) {
         val dir = sessionDir
         if (dir == null) { bmp.recycle(); return }
-        val n = seq++
+        val n = seq.getAndIncrement()
         io.execute {
             try {
                 File(dir, "%04d_%s.png".format(n, tag)).outputStream().use {
@@ -118,7 +119,7 @@ class SentryLogger(context: Context) {
         }
         events = null
         sessionDir = null
-        seq = 0
+        seq.set(0)
     }
 
     private fun prune() {
