@@ -43,3 +43,19 @@ data class FramingAssessment(
     val driftY: Float,
     val satisfied: Boolean,
 )
+
+/**
+ * Coarse head yaw from BlazeFace keypoints. When the head turns, the nose tip shifts toward the
+ * eye on the side being turned toward, relative to the eye midpoint. We normalize that horizontal
+ * offset by the inter-eye distance (a scale-invariant proxy for sin(yaw)) and map to degrees.
+ * + = facing image-right, - = facing image-left. Clamped to ±60° (coarse; good for a binary cue).
+ */
+fun estimateYawDeg(rightEye: PointF, leftEye: PointF, nose: PointF): Float? {
+    val eyeMidX = (rightEye.x + leftEye.x) / 2f
+    val eyeDist = kotlin.math.abs(leftEye.x - rightEye.x)
+    if (eyeDist < 1e-4f) return null
+    // offset>0 when nose is toward the (larger-x) left-eye side = facing image-right.
+    val offset = (nose.x - eyeMidX) / eyeDist            // ~[-0.5,0.5] frontal..profile
+    val deg = (offset / 0.5f) * 60f                       // scale: half-eye-span ≈ 60°
+    return deg.coerceIn(-60f, 60f)
+}
