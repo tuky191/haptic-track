@@ -141,5 +141,9 @@ data class TrackingUiState(
     /** Default search: women, teen/adult (15-45). */
     val sentryCriteria: SentryCriteria = SentryCriteria(GenderFilter.FEMALE, 15, 45),
     /** Live sentry phase for UI display. */
-    val sentryPhase: SentryPhase = SentryPhase.OFF
+    val sentryPhase: SentryPhase = SentryPhase.OFF,
+    /** Active guidance channel(s). */
+    val guidanceMode: GuidanceMode = GuidanceMode.OFF,
+    /** What the framing coach composes around. */
+    val framingTarget: FramingTarget = FramingTarget.FULL_BODY,
 )

@@ -503,7 +503,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         sentry?.onLockCleared()  // re-arm scanning if sentry still on
         hapticManager.updateTrackingStatus(TrackingStatus.IDLE)
         _uiState.update {
-            TrackingUiState(status = TrackingStatus.IDLE, isRecording = false, captureMode = it.captureMode, stealthMode = it.stealthMode, isReady = it.isReady, ispStabilization = it.ispStabilization, gyroEis = it.gyroEis, gyroStrength = it.gyroStrength, adaptiveEis = it.adaptiveEis, leashEnabled = it.leashEnabled, oisCompensation = it.oisCompensation, translationEis = it.translationEis, horizonLock = it.horizonLock, fhd60Vdis = it.fhd60Vdis, trackingFilter = it.trackingFilter, hapticStrength = it.hapticStrength, sentryEnabled = it.sentryEnabled, sentryCriteria = it.sentryCriteria, sentryPhase = sentry?.phase ?: com.haptictrack.tracking.SentryPhase.OFF)
+            TrackingUiState(status = TrackingStatus.IDLE, isRecording = false, captureMode = it.captureMode, stealthMode = it.stealthMode, isReady = it.isReady, ispStabilization = it.ispStabilization, gyroEis = it.gyroEis, gyroStrength = it.gyroStrength, adaptiveEis = it.adaptiveEis, leashEnabled = it.leashEnabled, oisCompensation = it.oisCompensation, translationEis = it.translationEis, horizonLock = it.horizonLock, fhd60Vdis = it.fhd60Vdis, trackingFilter = it.trackingFilter, hapticStrength = it.hapticStrength, sentryEnabled = it.sentryEnabled, sentryCriteria = it.sentryCriteria, sentryPhase = sentry?.phase ?: com.haptictrack.tracking.SentryPhase.OFF, guidanceMode = it.guidanceMode, framingTarget = it.framingTarget)
         }
     }
 
