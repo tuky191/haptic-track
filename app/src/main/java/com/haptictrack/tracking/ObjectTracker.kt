@@ -246,15 +246,11 @@ class ObjectTracker(
      *  Lets the owner reset to IDLE and re-arm the sentry — a dead lock otherwise pins status
      *  in LOST forever and the sentry never rescans. */
     var onGiveUp: (() -> Unit)? = null
-    private var gaveUpFired = false
+    private val giveUpLatch = GiveUpLatch()
 
     /** Emit a one-shot give-up signal when the engine has timed out with no live lock. */
     private fun emitGiveUpIfNeeded(locked: TrackedObject?) {
-        if (locked != null) { gaveUpFired = false; return }
-        if (reacquisition.hasTimedOut && !gaveUpFired) {
-            gaveUpFired = true
-            onGiveUp?.invoke()
-        }
+        if (giveUpLatch.update(locked != null, reacquisition.hasTimedOut)) onGiveUp?.invoke()
     }
 
     // Contour extraction — disabled until the UI uses it (saves CPU/battery).

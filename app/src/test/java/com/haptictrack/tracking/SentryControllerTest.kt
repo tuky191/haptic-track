@@ -124,6 +124,44 @@ class SentryControllerTest {
     }
 
     @Test
+    fun `matched is terminal until the lock is cleared`() {
+        val h = Harness(criteria = SentryCriteria(GenderFilter.MALE))
+        h.classifyResult = { FaceAttributes(isMale = true, age = 30, genderConfidence = 5f) }
+        h.ctrl.setEnabled(true)
+        h.feed(person(1, 0.5f, 0.5f), CONFIRM + 2)
+        assertEquals(SentryController.State.MATCHED, h.ctrl.state)
+        // Further frames must not re-inspect/re-lock while MATCHED — it owns the lock.
+        h.feed(person(2, 0.8f, 0.5f), 10)
+        assertEquals(SentryController.State.MATCHED, h.ctrl.state)
+    }
+
+    @Test
+    fun `onLockCleared re-arms scanning so the sentry resumes after a lost lock`() {
+        // This is the controller half of the auto-rearm fix: when the lock is given up,
+        // the owner calls onLockCleared() and scanning must resume (and be able to re-lock).
+        val h = Harness(criteria = SentryCriteria(GenderFilter.MALE))
+        h.classifyResult = { FaceAttributes(isMale = true, age = 30, genderConfidence = 5f) }
+        h.ctrl.setEnabled(true)
+        h.feed(person(1, 0.5f, 0.5f), CONFIRM + 2)
+        assertEquals(SentryController.State.MATCHED, h.ctrl.state)
+
+        h.ctrl.onLockCleared()
+        assertEquals(SentryController.State.SCANNING, h.ctrl.state)
+
+        // Scanning genuinely resumed — a fresh candidate is inspected and re-locked.
+        h.feed(person(1, 0.5f, 0.5f), CONFIRM + 2)
+        assertEquals(SentryController.State.MATCHED, h.ctrl.state)
+    }
+
+    @Test
+    fun `onLockCleared is a no-op when not matched`() {
+        val h = Harness()
+        h.ctrl.setEnabled(true)
+        h.ctrl.onLockCleared()  // scanning, no lock — must not throw or change state
+        assertEquals(SentryController.State.SCANNING, h.ctrl.state)
+    }
+
+    @Test
     fun `disabling stops the machine`() {
         val h = Harness()
         h.ctrl.setEnabled(true)
