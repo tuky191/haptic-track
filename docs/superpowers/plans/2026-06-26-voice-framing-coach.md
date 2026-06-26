@@ -684,7 +684,7 @@ class ZoomOccupancyTargetTest {
         val box = RectF(0.45f, 0.45f, 0.55f, 0.55f)  // small subject
         val small = ZoomController().apply { occupancyTarget = 0.10f }.calculateZoom(box, 1f, 10f)
         val large = ZoomController().apply { occupancyTarget = 0.40f }.calculateZoom(box, 1f, 10f)
-        assertTrue("bigger target -> more zoom", large >= small)
+        assertTrue("bigger target -> more zoom", large > small)  // strict: == would false-pass if the field were ignored
     }
 }
 ```

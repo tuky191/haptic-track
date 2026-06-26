@@ -10,6 +10,9 @@ class ZoomController(
 
     private var currentZoom = 1f
 
+    /** Runtime-adjustable occupancy target (framing coach overrides per target). */
+    @Volatile var occupancyTarget: Float = targetFrameOccupancy
+
     /** When true, [calculateZoom] returns the current zoom unchanged (manual pinch active). */
     var manualOverride: Boolean = false
         private set
@@ -82,7 +85,7 @@ class ZoomController(
                        boundingBox.right > 1f - EDGE_MARGIN || boundingBox.bottom > 1f - EDGE_MARGIN
 
         // Dead zone: if the smoothed area is within ±30% of target, hold steady.
-        val areaRatio = if (boxArea > 1e-6f) targetFrameOccupancy / boxArea else 1f
+        val areaRatio = if (boxArea > 1e-6f) occupancyTarget / boxArea else 1f
         val idealZoom = if (areaRatio in DEAD_ZONE_LOW..DEAD_ZONE_HIGH) {
             currentZoom
         } else if (boxArea > 1e-6f) {
